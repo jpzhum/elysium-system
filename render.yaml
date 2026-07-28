@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: elysium-system
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: HABITANTE_ROLE_ID
+        sync: false
+      - key: VISITANTE_ROLE_ID
+        sync: false
+      - key: PANEL_CHANNEL_ID
+        sync: false
