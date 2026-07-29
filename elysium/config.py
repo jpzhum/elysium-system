@@ -26,6 +26,21 @@ def _required_int(environment: Mapping[str, str], name: str) -> int:
         raise ConfigError(f"A variável {name} precisa conter somente números.") from error
 
 
+def _snowflake(environment: Mapping[str, str], name: str, *, required: bool) -> int | None:
+    raw_value = environment.get(name, "").strip()
+    if not raw_value and not required:
+        return None
+    if not raw_value:
+        raise ConfigError(f"A variável {name} não foi preenchida.")
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ConfigError(f"A variável {name} precisa conter um snowflake válido.") from error
+    if not 0 < value < 2**64:
+        raise ConfigError(f"A variável {name} precisa conter um snowflake válido.")
+    return value
+
+
 def _port(environment: Mapping[str, str]) -> int:
     value = environment.get("PORT", "10000").strip()
     try:
@@ -45,6 +60,7 @@ class ElysiumConfig:
     visitante_role_id: int
     panel_channel_id: int
     port: int
+    log_channel_id: int | None = None
 
     @classmethod
     def from_env(
@@ -58,9 +74,10 @@ class ElysiumConfig:
         source = os.environ if environment is None else environment
         return cls(
             discord_token=_required_string(source, "DISCORD_TOKEN"),
-            guild_id=_required_int(source, "GUILD_ID"),
-            habitante_role_id=_required_int(source, "HABITANTE_ROLE_ID"),
-            visitante_role_id=_required_int(source, "VISITANTE_ROLE_ID"),
-            panel_channel_id=_required_int(source, "PANEL_CHANNEL_ID"),
+            guild_id=_snowflake(source, "GUILD_ID", required=True),
+            habitante_role_id=_snowflake(source, "HABITANTE_ROLE_ID", required=True),
+            visitante_role_id=_snowflake(source, "VISITANTE_ROLE_ID", required=True),
+            panel_channel_id=_snowflake(source, "PANEL_CHANNEL_ID", required=True),
             port=_port(source),
+            log_channel_id=_snowflake(source, "LOG_CHANNEL_ID", required=False),
         )
