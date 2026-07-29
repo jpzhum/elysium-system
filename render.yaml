@@ -18,3 +18,5 @@ services:
         sync: false
       - key: PANEL_CHANNEL_ID
         sync: false
+      - key: LOG_CHANNEL_ID
+        sync: false

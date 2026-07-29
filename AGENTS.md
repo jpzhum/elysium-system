@@ -46,3 +46,15 @@ quando novas configurações forem deliberadamente introduzidas.
 `custom_id` é uma interface persistente e não pode ser alterada após publicação.
 Preserve exatamente `elysium:portal:concluir_entrada:v1` enquanto os painéis
 existentes precisarem continuar funcionando após reinicializações.
+
+## Observabilidade e erros
+
+- IDs de incidente usam oito caracteres hexadecimais maiúsculos e não carregam dados
+  do usuário.
+- Registre tracebacks somente no stdout; embeds recebem apenas contexto resumido e
+  sanitizado, com menções desativadas.
+- Nunca registre tokens, valores completos do ambiente ou outros dados sensíveis.
+- `on_ready` pode ocorrer mais de uma vez; logs de inicialização devem ser emitidos
+  somente uma vez por processo.
+- Antes de responder uma interação, verifique `interaction.response.is_done()`;
+  use `followup.send` quando a resposta inicial já tiver sido consumida.
