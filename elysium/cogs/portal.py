@@ -1,23 +1,25 @@
 from __future__ import annotations
 
-import logging
-
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from elysium.config import ElysiumConfig
 from elysium.constants import BRAND_COLOR
+from elysium.services.audit_service import AuditService
 from elysium.services.role_service import RoleService
 from elysium.views.concluir_entrada import ConcluirEntradaView
 
-logger = logging.getLogger("elysium.portal")
-
-
 class PortalCog(commands.Cog):
-    def __init__(self, config: ElysiumConfig, role_service: RoleService) -> None:
+    def __init__(
+        self,
+        config: ElysiumConfig,
+        role_service: RoleService,
+        audit_service: AuditService,
+    ) -> None:
         self._config = config
         self._role_service = role_service
+        self._audit_service = audit_service
 
     @app_commands.command(
         name="publicar_entrada",
@@ -58,18 +60,5 @@ class PortalCog(commands.Cog):
         embed.set_footer(text="Elysium • Sua jornada começa aqui.")
         await interaction.response.send_message(
             embed=embed,
-            view=ConcluirEntradaView(self._role_service),
+            view=ConcluirEntradaView(self._role_service, self._audit_service),
         )
-
-    @publicar_entrada.error
-    async def publicar_entrada_error(
-        self,
-        interaction: discord.Interaction,
-        error: app_commands.AppCommandError,
-    ) -> None:
-        logger.exception("Erro no comando /publicar_entrada", exc_info=error)
-        message = "Não foi possível publicar o painel. Consulte os logs do serviço."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
