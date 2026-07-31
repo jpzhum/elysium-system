@@ -52,6 +52,13 @@ def _port(environment: Mapping[str, str]) -> int:
     return port
 
 
+def _optional_url(environment: Mapping[str, str], name: str) -> str:
+    value = environment.get(name, "").strip()
+    if value and not value.startswith(("http://", "https://")):
+        raise ConfigError(f"A variável {name} precisa começar com http:// ou https://.")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ElysiumConfig:
     discord_token: str
@@ -61,6 +68,8 @@ class ElysiumConfig:
     panel_channel_id: int
     port: int
     log_channel_id: int | None = None
+    presentation_channel_id: int | None = None
+    presentation_banner_url: str = ""
 
     @classmethod
     def from_env(
@@ -80,4 +89,8 @@ class ElysiumConfig:
             panel_channel_id=_snowflake(source, "PANEL_CHANNEL_ID", required=True),
             port=_port(source),
             log_channel_id=_snowflake(source, "LOG_CHANNEL_ID", required=False),
+            presentation_channel_id=_snowflake(
+                source, "PRESENTATION_CHANNEL_ID", required=False
+            ),
+            presentation_banner_url=_optional_url(source, "PRESENTATION_BANNER_URL"),
         )

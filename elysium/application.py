@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from elysium.cogs.portal import PortalCog
+from elysium.cogs.presentations import PresentationsCog
 from elysium.cogs.system import SystemCog
 from elysium.config import ElysiumConfig
 from elysium.constants import VERSION
@@ -17,7 +18,9 @@ from elysium.errors import InteractionErrorHandler
 from elysium.runtime import RuntimeState
 from elysium.services.audit_service import AuditService
 from elysium.services.role_service import RoleService
+from elysium.services.presentation_service import PresentationService
 from elysium.views.concluir_entrada import ConcluirEntradaView
+from elysium.views.presentation_panel import PresentationPanelView
 from elysium.web.health import HealthServer
 
 logger = logging.getLogger("elysium")
@@ -51,6 +54,9 @@ class ElysiumBot(commands.Bot):
             config.visitante_role_id,
         )
         self.audit_service = AuditService(self, config.log_channel_id)
+        self.presentation_service = PresentationService(
+            self, config.presentation_channel_id, self.audit_service
+        )
         self.interaction_error_handler = InteractionErrorHandler(self.audit_service)
         self.health_server = HealthServer(
             config.port,
@@ -59,6 +65,7 @@ class ElysiumBot(commands.Bot):
             self._latency_ms,
             lambda: self.get_guild(config.guild_id) is not None,
             config.log_channel_id is not None,
+            config.presentation_channel_id is not None,
         )
         self.guild_object = discord.Object(id=config.guild_id)
         self._lifecycle_lock = Lock()
@@ -71,7 +78,23 @@ class ElysiumBot(commands.Bot):
                 "LOG_CHANNEL_ID não configurado; auditoria disponível somente no stdout.",
                 extra={"event": "audit_channel_not_configured"},
             )
+        if not self.presentation_service.configured:
+            logger.warning(
+                "PRESENTATION_CHANNEL_ID não configurado; apresentações indisponíveis.",
+                extra={"event": "presentations_not_configured"},
+            )
         self.add_view(ConcluirEntradaView(self.role_service, self.audit_service))
+        self.add_view(
+            PresentationPanelView(
+                self.config, self.presentation_service, self.audit_service
+            )
+        )
+        await self.add_cog(
+            PresentationsCog(
+                self.config, self.presentation_service, self.audit_service
+            ),
+            guild=self.guild_object,
+        )
         await self.add_cog(
             PortalCog(self.config, self.role_service, self.audit_service),
             guild=self.guild_object,
