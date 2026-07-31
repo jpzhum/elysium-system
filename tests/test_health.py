@@ -14,6 +14,7 @@ class HealthPayloadTests(unittest.TestCase):
             latency_ms=lambda: None,
             is_guild_ready=lambda: False,
             log_channel_configured=False,
+            presentations_configured=False,
         )
         self.assertFalse(payload["discord_ready"])
         self.assertIsNone(payload["latency_ms"])
@@ -28,6 +29,7 @@ class HealthPayloadTests(unittest.TestCase):
             latency_ms=lambda: 74,
             is_guild_ready=lambda: True,
             log_channel_configured=True,
+            presentations_configured=True,
         )
         self.assertEqual(
             payload,
@@ -40,5 +42,6 @@ class HealthPayloadTests(unittest.TestCase):
                 "latency_ms": 74,
                 "guild_ready": True,
                 "log_channel_configured": True,
+                "presentations_configured": True,
             },
         )

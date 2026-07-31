@@ -43,6 +43,14 @@ quando novas configurações forem deliberadamente introduzidas.
 
 ## Componentes persistentes
 
+Os custom IDs `elysium:presentation:create:v1`,
+`elysium:presentation:edit:v1` e `elysium:presentation:delete:v1` também são
+interfaces persistentes. `embed.author.url` identifica o proprietário; edição e
+exclusão devem preservar e validar essa propriedade. Use locks por usuário contra
+duplicidade. Rejeite links, convites e menções e nunca registre descrição,
+interesses, atividade, expectativas ou conteúdo do modal. Use response/followup
+conforme o estado da interação.
+
 `custom_id` é uma interface persistente e não pode ser alterada após publicação.
 Preserve exatamente `elysium:portal:concluir_entrada:v1` enquanto os painéis
 existentes precisarem continuar funcionando após reinicializações.
