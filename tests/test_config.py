@@ -15,6 +15,34 @@ BASE_ENVIRONMENT = {
 
 
 class ConfigTests(unittest.TestCase):
+    def test_valid_presentation_settings(self) -> None:
+        environment = {
+            **BASE_ENVIRONMENT,
+            "PRESENTATION_CHANNEL_ID": "100000000000000006",
+            "PRESENTATION_BANNER_URL": "https://example.com/banner.png",
+        }
+        config = ElysiumConfig.from_env(environment, load_dotenv_file=False)
+        self.assertEqual(config.presentation_channel_id, 100000000000000006)
+        self.assertEqual(config.presentation_banner_url, "https://example.com/banner.png")
+
+    def test_missing_presentation_channel_and_empty_url_are_allowed(self) -> None:
+        config = ElysiumConfig.from_env(BASE_ENVIRONMENT, load_dotenv_file=False)
+        self.assertIsNone(config.presentation_channel_id)
+        self.assertEqual(config.presentation_banner_url, "")
+
+    def test_invalid_presentation_channel_is_rejected(self) -> None:
+        with self.assertRaises(ConfigError):
+            ElysiumConfig.from_env(
+                {**BASE_ENVIRONMENT, "PRESENTATION_CHANNEL_ID": "invalid"},
+                load_dotenv_file=False,
+            )
+
+    def test_invalid_presentation_url_is_rejected(self) -> None:
+        with self.assertRaises(ConfigError):
+            ElysiumConfig.from_env(
+                {**BASE_ENVIRONMENT, "PRESENTATION_BANNER_URL": "ftp://example.com"},
+                load_dotenv_file=False,
+            )
     def test_valid_log_channel(self) -> None:
         environment = {**BASE_ENVIRONMENT, "LOG_CHANNEL_ID": "100000000000000005"}
         config = ElysiumConfig.from_env(environment, load_dotenv_file=False)
