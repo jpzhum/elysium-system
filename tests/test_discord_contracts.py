@@ -6,9 +6,15 @@ from unittest.mock import AsyncMock
 from elysium.application import create_bot
 from elysium.config import ElysiumConfig
 from elysium.constants import CONCLUIR_ENTRADA_CUSTOM_ID
+from elysium.constants import (
+    PRESENTATION_CREATE_CUSTOM_ID,
+    PRESENTATION_DELETE_CUSTOM_ID,
+    PRESENTATION_EDIT_CUSTOM_ID,
+)
 from elysium.errors import send_ephemeral
 from elysium.services.role_service import RoleService
 from elysium.views.concluir_entrada import ConcluirEntradaView
+from elysium.views.presentation_panel import PresentationPanelView
 
 
 def create_config() -> ElysiumConfig:
@@ -42,9 +48,25 @@ class DiscordContractTests(unittest.IsolatedAsyncioTestCase):
         names = {command.name for command in bot.tree.get_commands(guild=bot.guild_object)}
         self.assertIn("publicar_entrada", names)
         self.assertIn("status", names)
+        self.assertIn("publicar_apresentacoes", names)
         self.assertFalse(bot.intents.members)
         self.assertFalse(bot.intents.presences)
         self.assertFalse(bot.intents.message_content)
+        await bot.close()
+
+    async def test_presentation_persistent_view_contract(self) -> None:
+        bot = create_bot(create_config())
+        view = PresentationPanelView(bot.config, bot.presentation_service, bot.audit_service)
+        self.assertIsNone(view.timeout)
+        self.assertEqual(
+            [item.custom_id for item in view.children],
+            [
+                PRESENTATION_CREATE_CUSTOM_ID,
+                PRESENTATION_EDIT_CUSTOM_ID,
+                PRESENTATION_DELETE_CUSTOM_ID,
+            ],
+        )
+        view.stop()
         await bot.close()
 
     async def test_ephemeral_response_uses_initial_response(self) -> None:

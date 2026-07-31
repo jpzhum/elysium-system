@@ -1,4 +1,4 @@
-# Elysium System 1.1.0 — Render
+# Elysium System 1.2.0 — Render
 
 Bot do Portal do Elysium preparado para execução contínua no Render.
 
@@ -37,6 +37,22 @@ elysium/
 
 ## Execução local
 
+## Apresentações premium
+
+Configure `PRESENTATION_CHANNEL_ID` para habilitar o recurso e, opcionalmente,
+`PRESENTATION_BANNER_URL` com uma URL HTTP(S) para a imagem grande do painel. Um
+administrador publica o painel com `/publicar_apresentacoes` no canal configurado.
+Membros Visitante ou Habitante podem criar uma apresentação pelo modal, editar a
+mesma mensagem e excluí-la mediante confirmação.
+
+O bot precisa de Ver canal, Ler histórico, Enviar mensagens, Inserir links e
+Gerenciar mensagens no canal de apresentações. Não precisa de Administrador nem de
+intents privilegiados. Nesta versão não há banco de dados: o índice em memória é
+reconstruído de forma lazy na primeira operação após reiniciar. Duplicatas
+pré-existentes são auditadas, mas não removidas automaticamente.
+
+## Execução local
+
 1. Execute `instalar.bat`.
 2. Copie `.env.example` para `.env` e preencha os valores.
 3. Execute `iniciar.bat`.
@@ -62,6 +78,8 @@ python bot.py
    - `VISITANTE_ROLE_ID`
    - `PANEL_CHANNEL_ID`
    - `LOG_CHANNEL_ID` (opcional)
+   - `PRESENTATION_CHANNEL_ID` (opcional)
+   - `PRESENTATION_BANNER_URL` (opcional)
 8. Faça o deploy.
 
 O Render fornece `PORT` ao Web Service. Localmente, quando ela não é definida, o
@@ -84,11 +102,17 @@ disponibilidade do canal de logs, sem expor IDs ou segredos.
 
 ## Health check
 
+Além das chaves existentes, o payload inclui `presentations_configured` sem expor
+o ID do canal.
+
 `GET /` e `GET /health` retornam o mesmo JSON. Além de `status`, `service` e
 `discord_ready`, a resposta inclui `version`, `uptime_seconds`, `latency_ms`,
 `guild_ready` e `log_channel_configured`. A latência é `null` antes da conexão.
 
 ## Validação
+
+Os testes não conectam ao Discord e cobrem configuração, contratos persistentes,
+validação, embeds, comandos, health check e propriedade das apresentações.
 
 ```console
 python -m compileall bot.py elysium tests

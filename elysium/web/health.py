@@ -18,6 +18,7 @@ def build_health_payload(
     latency_ms: Callable[[], int | None],
     is_guild_ready: Callable[[], bool],
     log_channel_configured: bool,
+    presentations_configured: bool,
 ) -> dict[str, Any]:
     return {
         "status": "ok",
@@ -28,6 +29,7 @@ def build_health_payload(
         "latency_ms": latency_ms(),
         "guild_ready": is_guild_ready(),
         "log_channel_configured": log_channel_configured,
+        "presentations_configured": presentations_configured,
     }
 
 
@@ -37,6 +39,7 @@ def create_health_application(
     latency_ms: Callable[[], int | None],
     is_guild_ready: Callable[[], bool],
     log_channel_configured: bool,
+    presentations_configured: bool,
 ) -> web.Application:
     async def health_check(request: web.Request) -> web.Response:
         del request
@@ -47,6 +50,7 @@ def create_health_application(
                 latency_ms=latency_ms,
                 is_guild_ready=is_guild_ready,
                 log_channel_configured=log_channel_configured,
+                presentations_configured=presentations_configured,
             )
         )
 
@@ -65,6 +69,7 @@ class HealthServer:
         latency_ms: Callable[[], int | None],
         is_guild_ready: Callable[[], bool],
         log_channel_configured: bool,
+        presentations_configured: bool,
     ) -> None:
         self._port = port
         self._application = create_health_application(
@@ -73,6 +78,7 @@ class HealthServer:
             latency_ms,
             is_guild_ready,
             log_channel_configured,
+            presentations_configured,
         )
         self._runner: web.AppRunner | None = None
 
