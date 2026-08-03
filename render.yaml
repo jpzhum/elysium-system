@@ -26,3 +26,11 @@ services:
         sync: false
       - key: HOST_ROLE_ID
         sync: false
+      - key: BOLETIM_CHANNEL_ID
+        sync: false
+      - key: EVENTOS_ROLE_ID
+        sync: false
+      - key: BOLETIM_MANAGER_ROLE_IDS
+        sync: false
+      - key: EXPEDICOES_CHANNEL_ID
+        sync: false

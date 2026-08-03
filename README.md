@@ -57,6 +57,24 @@ reconstruído de modo lazy examinando no máximo as 1000 mensagens recentes do b
 Cartões fora dessa janela podem não ser encontrados; duplicatas e cartões inválidos
 são auditados e nunca removidos automaticamente.
 
+## Boletim institucional
+
+O grupo `/boletim criar` abre um formulário e apresenta uma prévia ephemeral antes
+de qualquer publicação. O administrador escolhe entre nenhuma menção, o cargo
+Eventos ou `@everyone`, além de poder substituir o canal padrão. Somente a
+confirmação em **Publicar** envia a mensagem; a prévia usa menções desativadas.
+
+Podem criar boletins membros com `Gerenciar servidor` ou cargos presentes em
+`BOLETIM_MANAGER_ROLE_IDS`. Como as permissões padrão do slash command usam
+`manage_guild`, cargos gerenciais sem essa permissão devem receber acesso ao comando
+nas configurações de integrações do Discord. A autorização também é sempre
+revalidada em tempo de execução.
+
+O bot precisa de Ver canal, Enviar mensagens e Inserir links no destino. Para
+`eventos` ou `everyone`, também precisa da permissão de mencionar `@everyone`,
+`@here` e todos os cargos. `EXPEDICOES_CHANNEL_ID` fica disponível como referência
+de configuração para recursos futuros e não é inserido automaticamente no boletim.
+
 ## Apresentações premium
 
 Configure `PRESENTATION_CHANNEL_ID` para habilitar o recurso e, opcionalmente,
@@ -103,6 +121,10 @@ python bot.py
    - `EXPEDITION_CHANNEL_ID` (opcional)
    - `EXPEDITION_BANNER_URL` (opcional)
    - `HOST_ROLE_ID` (opcional)
+   - `BOLETIM_CHANNEL_ID` (opcional; canal padrão)
+   - `EVENTOS_ROLE_ID` (opcional; necessário para a menção Eventos)
+   - `BOLETIM_MANAGER_ROLE_IDS` (opcional; IDs separados por vírgula)
+   - `EXPEDICOES_CHANNEL_ID` (opcional; uso futuro)
 8. Faça o deploy.
 
 O Render fornece `PORT` ao Web Service. Localmente, quando ela não é definida, o
