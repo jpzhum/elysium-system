@@ -59,6 +59,27 @@ def _optional_url(environment: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _snowflake_list(environment: Mapping[str, str], name: str) -> tuple[int, ...]:
+    raw_value = environment.get(name, "").strip()
+    if not raw_value:
+        return ()
+    values: list[int] = []
+    for part in raw_value.split(","):
+        item = part.strip()
+        try:
+            value = int(item)
+        except ValueError as error:
+            raise ConfigError(
+                f"A variável {name} precisa conter snowflakes válidos separados por vírgula."
+            ) from error
+        if not item or not 0 < value < 2**64:
+            raise ConfigError(
+                f"A variável {name} precisa conter snowflakes válidos separados por vírgula."
+            )
+        values.append(value)
+    return tuple(dict.fromkeys(values))
+
+
 @dataclass(frozen=True, slots=True)
 class ElysiumConfig:
     discord_token: str
@@ -73,6 +94,10 @@ class ElysiumConfig:
     expedition_channel_id: int | None = None
     expedition_banner_url: str = ""
     host_role_id: int | None = None
+    boletim_channel_id: int | None = None
+    eventos_role_id: int | None = None
+    boletim_manager_role_ids: tuple[int, ...] = ()
+    expedicoes_channel_id: int | None = None
 
     @classmethod
     def from_env(
@@ -99,4 +124,8 @@ class ElysiumConfig:
             expedition_channel_id=_snowflake(source, "EXPEDITION_CHANNEL_ID", required=False),
             expedition_banner_url=_optional_url(source, "EXPEDITION_BANNER_URL"),
             host_role_id=_snowflake(source, "HOST_ROLE_ID", required=False),
+            boletim_channel_id=_snowflake(source, "BOLETIM_CHANNEL_ID", required=False),
+            eventos_role_id=_snowflake(source, "EVENTOS_ROLE_ID", required=False),
+            boletim_manager_role_ids=_snowflake_list(source, "BOLETIM_MANAGER_ROLE_IDS"),
+            expedicoes_channel_id=_snowflake(source, "EXPEDICOES_CHANNEL_ID", required=False),
         )
