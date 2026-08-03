@@ -19,6 +19,7 @@ def build_health_payload(
     is_guild_ready: Callable[[], bool],
     log_channel_configured: bool,
     presentations_configured: bool,
+    expeditions_configured: bool,
 ) -> dict[str, Any]:
     return {
         "status": "ok",
@@ -30,6 +31,7 @@ def build_health_payload(
         "guild_ready": is_guild_ready(),
         "log_channel_configured": log_channel_configured,
         "presentations_configured": presentations_configured,
+        "expeditions_configured": expeditions_configured,
     }
 
 
@@ -40,6 +42,7 @@ def create_health_application(
     is_guild_ready: Callable[[], bool],
     log_channel_configured: bool,
     presentations_configured: bool,
+    expeditions_configured: bool,
 ) -> web.Application:
     async def health_check(request: web.Request) -> web.Response:
         del request
@@ -51,6 +54,7 @@ def create_health_application(
                 is_guild_ready=is_guild_ready,
                 log_channel_configured=log_channel_configured,
                 presentations_configured=presentations_configured,
+                expeditions_configured=expeditions_configured,
             )
         )
 
@@ -70,6 +74,7 @@ class HealthServer:
         is_guild_ready: Callable[[], bool],
         log_channel_configured: bool,
         presentations_configured: bool,
+        expeditions_configured: bool,
     ) -> None:
         self._port = port
         self._application = create_health_application(
@@ -79,6 +84,7 @@ class HealthServer:
             is_guild_ready,
             log_channel_configured,
             presentations_configured,
+            expeditions_configured,
         )
         self._runner: web.AppRunner | None = None
 
