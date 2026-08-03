@@ -55,6 +55,17 @@ conforme o estado da interação.
 Preserve exatamente `elysium:portal:concluir_entrada:v1` enquanto os painéis
 existentes precisarem continuar funcionando após reinicializações.
 
+Os cartões de expedição usam exclusivamente os custom IDs dinâmicos
+`elysium:expedition:{join|leave|edit|close}:{expedition_id}`. O ID deve obedecer
+`[a-f0-9]{8}` e esses contratos não podem ser alterados enquanto houver cartões
+publicados. `DynamicItem` exige tratamento explícito de erro no próprio callback.
+
+A mensagem e seu embed são a fonte persistente do estado das expedições; não
+registre views individuais nem crie estado permanente paralelo. Use locks por
+usuário na criação e por `expedition_id` nas mutações. Nunca registre jogo,
+descrição, plataforma, horário informado, lista de participantes ou conteúdo dos
+modais. Preserve todos os custom IDs estáticos e dinâmicos já publicados.
+
 ## Observabilidade e erros
 
 - IDs de incidente usam oito caracteres hexadecimais maiúsculos e não carregam dados

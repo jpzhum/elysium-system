@@ -15,6 +15,8 @@ from elysium.errors import send_ephemeral
 from elysium.services.role_service import RoleService
 from elysium.views.concluir_entrada import ConcluirEntradaView
 from elysium.views.presentation_panel import PresentationPanelView
+from elysium.views.expedition_panel import ExpeditionPanelView
+from elysium.constants import EXPEDITION_CREATE_CUSTOM_ID, EXPEDITION_MINE_CUSTOM_ID
 
 
 def create_config() -> ElysiumConfig:
@@ -49,9 +51,21 @@ class DiscordContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("publicar_entrada", names)
         self.assertIn("status", names)
         self.assertIn("publicar_apresentacoes", names)
+        self.assertIn("publicar_expedicoes", names)
         self.assertFalse(bot.intents.members)
         self.assertFalse(bot.intents.presences)
         self.assertFalse(bot.intents.message_content)
+        await bot.close()
+
+    async def test_expedition_panel_contract(self) -> None:
+        bot = create_bot(create_config())
+        view = ExpeditionPanelView(bot.config, bot.expedition_service, bot.audit_service)
+        self.assertIsNone(view.timeout)
+        self.assertEqual(
+            [item.custom_id for item in view.children],
+            [EXPEDITION_CREATE_CUSTOM_ID, EXPEDITION_MINE_CUSTOM_ID],
+        )
+        view.stop()
         await bot.close()
 
     async def test_presentation_persistent_view_contract(self) -> None:

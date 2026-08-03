@@ -1,4 +1,4 @@
-# Elysium System 1.2.0 — Render
+# Elysium System 1.3.0 — Render
 
 Bot do Portal do Elysium preparado para execução contínua no Render.
 
@@ -36,6 +36,26 @@ elysium/
 ```
 
 ## Execução local
+
+## Expedições premium
+
+Configure `EXPEDITION_CHANNEL_ID` para habilitar o recurso. Um administrador usa
+`/publicar_expedicoes` no canal configurado para publicar o painel; o banner
+opcional vem de `EXPEDITION_BANNER_URL`. Habitantes e administradores podem criar,
+participar e sair. O proprietário e administradores podem editar e encerrar;
+quando `HOST_ROLE_ID` está configurado, o Anfitrião também pode encerrar cartões de
+terceiros, mas não editá-los.
+
+O bot precisa de Ver canal, Ler histórico, Enviar mensagens e Inserir links no
+canal. Não requer Administrador nem intents privilegiados. Cada usuário mantém no
+máximo uma expedição ativa, e o organizador integra automaticamente a lista de
+participantes.
+
+Não há banco de dados: cada embed é a fonte do estado. Após restart, os botões
+dinâmicos continuam operando sem registrar uma view por mensagem, e o índice é
+reconstruído de modo lazy examinando no máximo as 1000 mensagens recentes do bot.
+Cartões fora dessa janela podem não ser encontrados; duplicatas e cartões inválidos
+são auditados e nunca removidos automaticamente.
 
 ## Apresentações premium
 
@@ -80,6 +100,9 @@ python bot.py
    - `LOG_CHANNEL_ID` (opcional)
    - `PRESENTATION_CHANNEL_ID` (opcional)
    - `PRESENTATION_BANNER_URL` (opcional)
+   - `EXPEDITION_CHANNEL_ID` (opcional)
+   - `EXPEDITION_BANNER_URL` (opcional)
+   - `HOST_ROLE_ID` (opcional)
 8. Faça o deploy.
 
 O Render fornece `PORT` ao Web Service. Localmente, quando ela não é definida, o
@@ -95,6 +118,8 @@ variável de ambiente secreta.
 `LOG_CHANNEL_ID` também é opcional: quando preenchida, deve apontar para um canal
 privado onde o bot possa enviar mensagens e embeds. Se estiver vazia ou o canal
 estiver inacessível, o bot continua operando e mantém a auditoria no stdout.
+`EXPEDITION_CHANNEL_ID` e `HOST_ROLE_ID` aceitam snowflakes válidos ou vazio.
+`EXPEDITION_BANNER_URL` aceita vazio ou URL iniciada por HTTP(S).
 
 O `/status` é restrito a administradores do servidor configurado e sempre responde
 de forma ephemeral. Ele mostra versão, latência, uptime, servidor, comandos e
@@ -102,8 +127,8 @@ disponibilidade do canal de logs, sem expor IDs ou segredos.
 
 ## Health check
 
-Além das chaves existentes, o payload inclui `presentations_configured` sem expor
-o ID do canal.
+Além das chaves existentes, o payload inclui `presentations_configured` e
+`expeditions_configured` sem expor IDs.
 
 `GET /` e `GET /health` retornam o mesmo JSON. Além de `status`, `service` e
 `discord_ready`, a resposta inclui `version`, `uptime_seconds`, `latency_ms`,

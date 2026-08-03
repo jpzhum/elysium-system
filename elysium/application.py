@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from elysium.cogs.portal import PortalCog
+from elysium.cogs.expeditions import ExpeditionsCog
 from elysium.cogs.presentations import PresentationsCog
 from elysium.cogs.system import SystemCog
 from elysium.config import ElysiumConfig
@@ -19,8 +20,11 @@ from elysium.runtime import RuntimeState
 from elysium.services.audit_service import AuditService
 from elysium.services.role_service import RoleService
 from elysium.services.presentation_service import PresentationService
+from elysium.services.expedition_service import ExpeditionService
 from elysium.views.concluir_entrada import ConcluirEntradaView
 from elysium.views.presentation_panel import PresentationPanelView
+from elysium.views.expedition_items import DYNAMIC_EXPEDITION_ITEMS
+from elysium.views.expedition_panel import ExpeditionPanelView
 from elysium.web.health import HealthServer
 
 logger = logging.getLogger("elysium")
@@ -57,6 +61,9 @@ class ElysiumBot(commands.Bot):
         self.presentation_service = PresentationService(
             self, config.presentation_channel_id, self.audit_service
         )
+        self.expedition_service = ExpeditionService(
+            self, config.expedition_channel_id, self.audit_service
+        )
         self.interaction_error_handler = InteractionErrorHandler(self.audit_service)
         self.health_server = HealthServer(
             config.port,
@@ -66,6 +73,7 @@ class ElysiumBot(commands.Bot):
             lambda: self.get_guild(config.guild_id) is not None,
             config.log_channel_id is not None,
             config.presentation_channel_id is not None,
+            config.expedition_channel_id is not None,
         )
         self.guild_object = discord.Object(id=config.guild_id)
         self._lifecycle_lock = Lock()
@@ -83,11 +91,22 @@ class ElysiumBot(commands.Bot):
                 "PRESENTATION_CHANNEL_ID não configurado; apresentações indisponíveis.",
                 extra={"event": "presentations_not_configured"},
             )
+        if not self.expedition_service.configured:
+            logger.warning(
+                "EXPEDITION_CHANNEL_ID não configurado; expedições indisponíveis.",
+                extra={"event": "expeditions_not_configured"},
+            )
         self.add_view(ConcluirEntradaView(self.role_service, self.audit_service))
         self.add_view(
             PresentationPanelView(
                 self.config, self.presentation_service, self.audit_service
             )
+        )
+        self.add_view(ExpeditionPanelView(self.config, self.expedition_service, self.audit_service))
+        self.add_dynamic_items(*DYNAMIC_EXPEDITION_ITEMS)
+        await self.add_cog(
+            ExpeditionsCog(self.config, self.expedition_service, self.audit_service),
+            guild=self.guild_object,
         )
         await self.add_cog(
             PresentationsCog(
@@ -145,6 +164,10 @@ class ElysiumBot(commands.Bot):
             "Conexão com o Discord interrompida.",
             extra={"event": "discord_disconnected"},
         )
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        if payload.channel_id == self.config.expedition_channel_id:
+            self.expedition_service.invalidate_message(payload.message_id)
 
     async def on_resumed(self) -> None:
         async with self._lifecycle_lock:

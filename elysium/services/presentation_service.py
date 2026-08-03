@@ -13,16 +13,11 @@ import discord
 from elysium.constants import BRAND_COLOR, PRESENTATION_EMBED_TITLE
 from elysium.models.presentation import Presentation
 from elysium.services.audit_service import AuditService
+from elysium.utils.content_validation import contains_forbidden_content, normalize_text
 
 logger = logging.getLogger("elysium.presentations")
 
 _OWNER_URL = re.compile(r"https://discord\.com/users/(\d+)$")
-_FORBIDDEN = re.compile(
-    r"discord\.gg/|discord\.com/invite/|https?://|www\.|@everyone|@here|"
-    r"<@!?\d+>|<@&\d+>|<#\d+>",
-    re.IGNORECASE,
-)
-_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 class PresentationOutcome(Enum):
@@ -45,18 +40,6 @@ class PresentationValidationError(ValueError):
     pass
 
 
-def normalize_text(value: str) -> str:
-    value = _CONTROLS.sub("", value).strip()
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in value.splitlines()]
-    normalized: list[str] = []
-    for line in lines:
-        if line or (normalized and normalized[-1]):
-            normalized.append(line)
-    while normalized and not normalized[-1]:
-        normalized.pop()
-    return "\n".join(normalized)
-
-
 def validate_presentation(presentation: Presentation) -> Presentation:
     values = {
         "preferred_name": (presentation.preferred_name, 2, 32, True),
@@ -70,7 +53,7 @@ def validate_presentation(presentation: Presentation) -> Presentation:
         value = normalize_text(raw)
         if (required and len(value) < minimum) or len(value) > maximum:
             raise PresentationValidationError("Campos fora dos limites permitidos.")
-        if value and _FORBIDDEN.search(value):
+        if value and contains_forbidden_content(value):
             raise PresentationValidationError(
                 "Sua apresentação não pode conter links, convites ou menções."
             )
