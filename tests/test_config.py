@@ -15,6 +15,31 @@ BASE_ENVIRONMENT = {
 
 
 class ConfigTests(unittest.TestCase):
+    def test_bulletin_settings(self) -> None:
+        config = ElysiumConfig.from_env(
+            {
+                **BASE_ENVIRONMENT,
+                "BOLETIM_CHANNEL_ID": "100000000000000009",
+                "EVENTOS_ROLE_ID": "100000000000000010",
+                "BOLETIM_MANAGER_ROLE_IDS": "100000000000000011,100000000000000012",
+                "EXPEDICOES_CHANNEL_ID": "100000000000000013",
+            },
+            load_dotenv_file=False,
+        )
+        self.assertEqual(config.boletim_channel_id, 100000000000000009)
+        self.assertEqual(config.eventos_role_id, 100000000000000010)
+        self.assertEqual(
+            config.boletim_manager_role_ids,
+            (100000000000000011, 100000000000000012),
+        )
+        self.assertEqual(config.expedicoes_channel_id, 100000000000000013)
+
+    def test_invalid_bulletin_snowflakes(self) -> None:
+        for name in ("BOLETIM_CHANNEL_ID", "EVENTOS_ROLE_ID", "EXPEDICOES_CHANNEL_ID"):
+            with self.subTest(name=name), self.assertRaises(ConfigError):
+                ElysiumConfig.from_env(
+                    {**BASE_ENVIRONMENT, name: "invalid"}, load_dotenv_file=False
+                )
     def test_expedition_settings(self) -> None:
         config = ElysiumConfig.from_env(
             {
