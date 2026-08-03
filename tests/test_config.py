@@ -15,6 +15,34 @@ BASE_ENVIRONMENT = {
 
 
 class ConfigTests(unittest.TestCase):
+    def test_expedition_settings(self) -> None:
+        config = ElysiumConfig.from_env(
+            {
+                **BASE_ENVIRONMENT,
+                "EXPEDITION_CHANNEL_ID": "100000000000000007",
+                "EXPEDITION_BANNER_URL": "https://example.com/expedition.png",
+                "HOST_ROLE_ID": "100000000000000008",
+            },
+            load_dotenv_file=False,
+        )
+        self.assertEqual(config.expedition_channel_id, 100000000000000007)
+        self.assertEqual(config.expedition_banner_url, "https://example.com/expedition.png")
+        self.assertEqual(config.host_role_id, 100000000000000008)
+
+    def test_optional_expedition_settings(self) -> None:
+        config = ElysiumConfig.from_env(BASE_ENVIRONMENT, load_dotenv_file=False)
+        self.assertIsNone(config.expedition_channel_id)
+        self.assertEqual(config.expedition_banner_url, "")
+        self.assertIsNone(config.host_role_id)
+
+    def test_invalid_expedition_settings(self) -> None:
+        for key, value in (
+            ("EXPEDITION_CHANNEL_ID", "invalid"),
+            ("EXPEDITION_BANNER_URL", "ftp://invalid"),
+            ("HOST_ROLE_ID", "0"),
+        ):
+            with self.subTest(key=key), self.assertRaises(ConfigError):
+                ElysiumConfig.from_env({**BASE_ENVIRONMENT, key: value}, load_dotenv_file=False)
     def test_valid_presentation_settings(self) -> None:
         environment = {
             **BASE_ENVIRONMENT,

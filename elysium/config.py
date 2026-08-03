@@ -70,6 +70,9 @@ class ElysiumConfig:
     log_channel_id: int | None = None
     presentation_channel_id: int | None = None
     presentation_banner_url: str = ""
+    expedition_channel_id: int | None = None
+    expedition_banner_url: str = ""
+    host_role_id: int | None = None
 
     @classmethod
     def from_env(
@@ -93,4 +96,7 @@ class ElysiumConfig:
                 source, "PRESENTATION_CHANNEL_ID", required=False
             ),
             presentation_banner_url=_optional_url(source, "PRESENTATION_BANNER_URL"),
+            expedition_channel_id=_snowflake(source, "EXPEDITION_CHANNEL_ID", required=False),
+            expedition_banner_url=_optional_url(source, "EXPEDITION_BANNER_URL"),
+            host_role_id=_snowflake(source, "HOST_ROLE_ID", required=False),
         )

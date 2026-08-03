@@ -20,3 +20,9 @@ services:
         sync: false
       - key: LOG_CHANNEL_ID
         sync: false
+      - key: EXPEDITION_CHANNEL_ID
+        sync: false
+      - key: EXPEDITION_BANNER_URL
+        sync: false
+      - key: HOST_ROLE_ID
+        sync: false
