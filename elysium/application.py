@@ -11,6 +11,7 @@ from discord.ext import commands
 
 from elysium.cogs.portal import PortalCog
 from elysium.cogs.expeditions import ExpeditionsCog
+from elysium.cogs.boletim import BoletimCog
 from elysium.cogs.presentations import PresentationsCog
 from elysium.cogs.system import SystemCog
 from elysium.config import ElysiumConfig
@@ -106,6 +107,10 @@ class ElysiumBot(commands.Bot):
         self.add_dynamic_items(*DYNAMIC_EXPEDITION_ITEMS)
         await self.add_cog(
             ExpeditionsCog(self.config, self.expedition_service, self.audit_service),
+            guild=self.guild_object,
+        )
+        await self.add_cog(
+            BoletimCog(self, self.config, self.audit_service),
             guild=self.guild_object,
         )
         await self.add_cog(

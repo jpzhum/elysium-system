@@ -52,6 +52,7 @@ class DiscordContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("status", names)
         self.assertIn("publicar_apresentacoes", names)
         self.assertIn("publicar_expedicoes", names)
+        self.assertIn("boletim", names)
         self.assertFalse(bot.intents.members)
         self.assertFalse(bot.intents.presences)
         self.assertFalse(bot.intents.message_content)
