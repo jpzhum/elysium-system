@@ -4,12 +4,13 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any
 
 import discord
 
 from elysium.config import ElysiumConfig
-from elysium.errors import send_ephemeral
+from elysium.errors import create_incident_id, send_ephemeral
 from elysium.models.expedition import Expedition, ExpeditionStatus
 from elysium.services.audit_service import AuditService
 from elysium.services.expedition_service import ExpeditionOutcome, ExpeditionService
@@ -17,6 +18,66 @@ from elysium.utils.channel_name import expedition_voice_channel_name, limited_bi
 
 logger = logging.getLogger("elysium.expedition_voice")
 _ORPHAN_NAME = re.compile(r"-([a-f0-9]{8})$")
+REQUIRED_VOICE_PERMISSIONS = (
+    "view_channel",
+    "manage_channels",
+    "manage_roles",
+    "connect",
+    "speak",
+    "stream",
+    "use_voice_activation",
+    "move_members",
+)
+PERMISSION_LABELS = {
+    "view_channel": "Visualizar canal",
+    "manage_channels": "Gerenciar canais",
+    "manage_roles": "Gerenciar cargos",
+    "connect": "Conectar",
+    "speak": "Falar",
+    "stream": "Vídeo",
+    "use_voice_activation": "Usar detecção de voz",
+    "move_members": "Mover membros",
+}
+
+
+class VoiceRoomOutcome(Enum):
+    SUCCESS = auto()
+    NOT_FOUND = auto()
+    CATEGORY_UNAVAILABLE = auto()
+    CATEGORY_PUBLIC = auto()
+    PERMISSIONS_MISSING = auto()
+    CREATE_FAILED = auto()
+    OVERWRITE_FAILED = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionPreflight:
+    category_found: bool
+    category_private: bool
+    missing_permissions: tuple[str, ...] = ()
+
+    @property
+    def operational(self) -> bool:
+        return self.category_found and self.category_private and not self.missing_permissions
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceRoomResult:
+    outcome: VoiceRoomOutcome
+    channel: Any | None = None
+    missing_permissions: tuple[str, ...] = ()
+    incident_id: str | None = None
+
+
+def missing_voice_permissions(permissions: Any) -> tuple[str, ...]:
+    return tuple(
+        name for name in REQUIRED_VOICE_PERMISSIONS if not bool(getattr(permissions, name, False))
+    )
+
+
+def category_is_private(category: Any, default_role: Any) -> bool:
+    permissions = category.permissions_for(default_role)
+    return not permissions.view_channel and not permissions.connect
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,16 +170,26 @@ class ExpeditionVoiceService:
         channel = self._client.get_channel(channel_id)
         return channel if isinstance(channel, discord.VoiceChannel) else None
 
-    async def build_overwrites(
+    def permission_preflight(self, guild: Any) -> PermissionPreflight:
+        category = self.resolve_category(guild)
+        bot_member = guild.me
+        if category is None or bot_member is None:
+            return PermissionPreflight(False, False, REQUIRED_VOICE_PERMISSIONS)
+        return PermissionPreflight(
+            True,
+            category_is_private(category, guild.default_role),
+            missing_voice_permissions(category.permissions_for(bot_member)),
+        )
+
+    async def build_overwrite_targets(
         self, guild: Any, expedition: Expedition
-    ) -> dict[Any, discord.PermissionOverwrite]:
-        deny = discord.PermissionOverwrite(view_channel=False, connect=False)
+    ) -> list[tuple[str, Any, discord.PermissionOverwrite]]:
         bot = guild.me
-        overwrites: dict[Any, discord.PermissionOverwrite] = {guild.default_role: deny}
+        targets: list[tuple[str, Any, discord.PermissionOverwrite]] = []
         if bot is not None:
-            overwrites[bot] = discord.PermissionOverwrite(
+            targets.append(("bot", bot, discord.PermissionOverwrite(
                 view_channel=True, connect=True, manage_channels=True, move_members=True
-            )
+            )))
         access = discord.PermissionOverwrite(
             view_channel=True,
             connect=True,
@@ -126,6 +197,7 @@ class ExpeditionVoiceService:
             stream=True,
             use_voice_activation=True,
         )
+        resolved: dict[int, Any] = {}
         for user_id in expedition.participant_user_ids:
             member = guild.get_member(user_id)
             if member is None:
@@ -141,14 +213,19 @@ class ExpeditionVoiceService:
                         },
                     )
             if member is not None:
-                overwrites[member] = access
+                resolved[user_id] = member
+        owner = resolved.get(expedition.owner_user_id)
+        targets.append(("owner", owner, access))
+        for user_id in expedition.participant_user_ids:
+            if user_id != expedition.owner_user_id:
+                targets.append(("participant", resolved.get(user_id), access))
         host_id = self._config.host_role_id
         host = guild.get_role(host_id) if host_id is not None else None
         if host is not None:
-            overwrites[host] = discord.PermissionOverwrite(
+            targets.append(("host_role", host, discord.PermissionOverwrite(
                 view_channel=True, connect=True, move_members=True
-            )
-        return overwrites
+            )))
+        return targets
 
     async def handle_button(self, interaction: discord.Interaction, expedition_id: str) -> None:
         if not self.configured:
@@ -210,51 +287,217 @@ class ExpeditionVoiceService:
             )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        channel = await self.create_room(interaction.guild, expedition_id, member.id)
-        if channel is None:
+        result = await self.create_room(interaction.guild, expedition_id, member.id)
+        if result.outcome in {
+            VoiceRoomOutcome.PERMISSIONS_MISSING,
+            VoiceRoomOutcome.CATEGORY_PUBLIC,
+        }:
+            missing = result.missing_permissions
+            permission_lines = "\n".join(
+                f"• {PERMISSION_LABELS[name]}" for name in missing
+            ) or "• Privacidade da categoria"
             await interaction.followup.send(
-                "Não foi possível criar a sala de voz.", ephemeral=True
+                "Não foi possível criar a sala de voz.\n\n"
+                "O Elysium System não possui todas as permissões necessárias "
+                "na categoria de salas temporárias.\n\n"
+                f"Permissões ausentes:\n{permission_lines}\n\n"
+                "O incidente foi registrado com o código:\n"
+                f"`{result.incident_id}`",
+                ephemeral=True,
+            )
+            return
+        if result.outcome is not VoiceRoomOutcome.SUCCESS or result.channel is None:
+            await interaction.followup.send(
+                "Não foi possível criar a sala de voz."
+                + (f"\n\nIncidente: `{result.incident_id}`" if result.incident_id else ""),
+                ephemeral=True,
             )
             return
         await interaction.followup.send(
-            f"Sala de voz criada.\n\n[Acessar sala]({channel.jump_url})",
+            f"Sala de voz criada.\n\n[Acessar sala]({result.channel.jump_url})",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    async def create_room(self, guild: Any, expedition_id: str, actor_id: int) -> Any | None:
+    async def create_room(
+        self, guild: Any, expedition_id: str, actor_id: int
+    ) -> VoiceRoomResult:
         async with self._locks.setdefault(expedition_id, asyncio.Lock()):
             found = await self._expeditions.find(expedition_id)
             if found.outcome is not ExpeditionOutcome.SUCCESS or found.expedition is None:
-                return None
+                return VoiceRoomResult(VoiceRoomOutcome.NOT_FOUND)
             model = found.expedition
             existing_id = self.voice_channel_id(expedition_id) or model.voice_channel_id
             existing = self.resolve_voice_channel(existing_id)
             if existing is not None:
                 self._index(expedition_id, existing.id)
-                return existing
+                return VoiceRoomResult(VoiceRoomOutcome.SUCCESS, existing)
             category = self.resolve_category(guild)
             if category is None or guild.me is None:
                 self.degraded = True
-                return None
-            permissions = category.permissions_for(guild.me)
-            if not (permissions.manage_channels and permissions.view_channel and permissions.connect):
+                incident_id = create_incident_id()
+                await self._audit_failure(
+                    "Falha na criação da sala", model, actor_id, incident_id,
+                    "categoria indisponível",
+                )
+                return VoiceRoomResult(
+                    VoiceRoomOutcome.CATEGORY_UNAVAILABLE, incident_id=incident_id
+                )
+            preflight = self.permission_preflight(guild)
+            if not preflight.category_private:
                 self.degraded = True
-                return None
-            channel = await guild.create_voice_channel(
-                expedition_voice_channel_name(model.game, expedition_id),
-                category=category,
-                overwrites=await self.build_overwrites(guild, model),
-                user_limit=model.capacity,
-                bitrate=limited_bitrate(
-                    self._config.temp_voice_bitrate_kbps, guild.bitrate_limit
-                ),
-                reason=f"Sala temporária da expedição {expedition_id}",
-            )
+                incident_id = create_incident_id()
+                await self._audit_failure(
+                    "Falha na criação da sala", model, actor_id, incident_id,
+                    "categoria pública",
+                )
+                return VoiceRoomResult(
+                    VoiceRoomOutcome.CATEGORY_PUBLIC, incident_id=incident_id
+                )
+            if preflight.missing_permissions:
+                self.degraded = True
+                incident_id = create_incident_id()
+                await self._audit_failure(
+                    "Falha na criação da sala", model, actor_id, incident_id,
+                    "permissões efetivas ausentes",
+                )
+                return VoiceRoomResult(
+                    VoiceRoomOutcome.PERMISSIONS_MISSING,
+                    missing_permissions=preflight.missing_permissions,
+                    incident_id=incident_id,
+                )
+            try:
+                channel = await guild.create_voice_channel(
+                    expedition_voice_channel_name(model.game, expedition_id),
+                    category=category,
+                    user_limit=model.capacity,
+                    bitrate=limited_bitrate(
+                        self._config.temp_voice_bitrate_kbps, guild.bitrate_limit
+                    ),
+                    reason=f"Sala temporária da expedição {expedition_id}",
+                )
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound) as error:
+                incident_id = create_incident_id()
+                self.degraded = True
+                logger.exception(
+                    "Falha ao criar canal de voz temporário.",
+                    exc_info=(type(error), error, error.__traceback__),
+                    extra={"incident_id": incident_id, "expedition_id": expedition_id},
+                )
+                await self._audit_failure(
+                    "Falha na criação da sala", model, actor_id, incident_id,
+                    "Discord recusou a criação",
+                )
+                return VoiceRoomResult(
+                    VoiceRoomOutcome.CREATE_FAILED, incident_id=incident_id
+                )
+            targets = await self.build_overwrite_targets(guild, model)
+            failed_target = await self._apply_overwrites(channel, targets)
+            if failed_target is not None:
+                incident_id = create_incident_id()
+                self.degraded = True
+                await self._audit_failure(
+                    "Falha na sincronização", model, actor_id, incident_id,
+                    f"overwrite obrigatório: {failed_target}", channel.id,
+                )
+                await self._rollback_created_room(
+                    channel, model, actor_id, incident_id
+                )
+                return VoiceRoomResult(
+                    VoiceRoomOutcome.OVERWRITE_FAILED, incident_id=incident_id
+                )
             self._index(expedition_id, channel.id)
             await self._expeditions.update_voice_reference(expedition_id, channel.id)
             await self._audit_event("Sala de expedição criada", model, channel.id, actor_id)
-            return channel
+            self.degraded = False
+            return VoiceRoomResult(VoiceRoomOutcome.SUCCESS, channel)
+
+    async def _apply_overwrites(
+        self,
+        channel: Any,
+        targets: list[tuple[str, Any, discord.PermissionOverwrite]],
+    ) -> str | None:
+        for target_name, target, overwrite in targets:
+            if target is None:
+                logger.warning(
+                    "Alvo obrigatório indisponível para overwrite.",
+                    extra={"event": "voice_overwrite_target_unavailable", "target": target_name},
+                )
+                return target_name
+            try:
+                await channel.set_permissions(
+                    target,
+                    overwrite=overwrite,
+                    reason="Acesso à sala temporária de expedição",
+                )
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                logger.warning(
+                    "Falha ao aplicar overwrite obrigatório da sala temporária.",
+                    extra={
+                        "event": "voice_overwrite_failed",
+                        "target": target_name,
+                        "voice_channel_id": channel.id,
+                    },
+                    exc_info=True,
+                )
+                return target_name
+        return None
+
+    async def _rollback_created_room(
+        self,
+        channel: Any,
+        expedition: Expedition,
+        actor_id: int,
+        incident_id: str,
+    ) -> None:
+        self._unindex(channel.id)
+        try:
+            await channel.delete(reason="Rollback de sala temporária incompleta")
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound) as error:
+            logger.warning(
+                "Falha ao excluir canal durante rollback.",
+                extra={
+                    "event": "voice_rollback_failed",
+                    "voice_channel_id": channel.id,
+                    "incident_id": incident_id,
+                },
+                exc_info=True,
+            )
+            await self._audit_failure(
+                "Falha no rollback da sala",
+                expedition,
+                actor_id,
+                incident_id,
+                "Discord recusou a exclusão de rollback",
+                channel.id,
+                level=logging.WARNING,
+            )
+
+    async def _audit_failure(
+        self,
+        title: str,
+        expedition: Expedition,
+        actor_id: int,
+        incident_id: str,
+        reason: str,
+        channel_id: int | None = None,
+        *,
+        level: int = logging.WARNING,
+    ) -> None:
+        await self._audit.send(
+            title,
+            {
+                "Expedition ID": expedition.expedition_id,
+                "Voice Channel ID": channel_id or "indisponível",
+                "Owner User ID": expedition.owner_user_id,
+                "Actor User ID": actor_id,
+                "Quantidade de participantes": len(expedition.participant_user_ids),
+                "Motivo": reason,
+                "Horário UTC": discord.utils.utcnow().isoformat(),
+                "Incident ID": incident_id,
+            },
+            level=level,
+        )
 
     async def on_expedition_mutation(
         self, action: str, before: Expedition, after: Expedition, actor_id: int

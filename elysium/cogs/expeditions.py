@@ -8,7 +8,11 @@ from elysium.config import ElysiumConfig
 from elysium.constants import BRAND_COLOR, EXPEDITION_CREATE_CUSTOM_ID
 from elysium.services.audit_service import AuditService
 from elysium.services.expedition_service import ExpeditionService
-from elysium.services.expedition_voice_service import ExpeditionVoiceService
+from elysium.services.expedition_voice_service import (
+    PERMISSION_LABELS,
+    REQUIRED_VOICE_PERMISSIONS,
+    ExpeditionVoiceService,
+)
 from elysium.views.expedition_panel import ExpeditionPanelView
 
 
@@ -42,6 +46,55 @@ class ExpeditionsCog(commands.Cog):
         self._service = service
         self._audit = audit
         self._voice = voice
+
+    @app_commands.command(
+        name="diagnosticar_salas_expedicao",
+        description="Verifica as permissões necessárias para criar salas temporárias.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def diagnosticar_salas_expedicao(
+        self, interaction: discord.Interaction
+    ) -> None:
+        if interaction.guild_id != self._config.guild_id or interaction.guild is None:
+            await interaction.response.send_message(
+                "Este comando só está disponível no servidor configurado.", ephemeral=True
+            )
+            return
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "Somente administradores podem diagnosticar as salas.", ephemeral=True
+            )
+            return
+        preflight = self._voice.permission_preflight(interaction.guild)
+        missing = set(preflight.missing_permissions)
+        permission_text = "\n".join(
+            f"{'✗' if name in missing else '✓'} {PERMISSION_LABELS[name]}"
+            for name in REQUIRED_VOICE_PERMISSIONS
+        )
+        embed = discord.Embed(
+            title="Diagnóstico das salas temporárias",
+            color=BRAND_COLOR,
+        )
+        embed.add_field(
+            name="Categoria",
+            value="Encontrada" if preflight.category_found else "Indisponível",
+            inline=False,
+        )
+        embed.add_field(
+            name="Privacidade da categoria",
+            value="Segura" if preflight.category_private else "Pública",
+            inline=False,
+        )
+        embed.add_field(
+            name="Permissões efetivas do bot", value=permission_text, inline=False
+        )
+        embed.add_field(
+            name="Estado",
+            value="Operacional" if preflight.operational else "Permissões ausentes",
+            inline=False,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(
         name="sincronizar_salas_expedicao",
