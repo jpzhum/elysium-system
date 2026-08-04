@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added
+- Salas de voz temporárias vinculadas às expedições.
+- Sincronização automática de participantes.
+- Exclusão automática de salas vazias.
+- Reconciliação administrativa de salas.
+- Estado operacional de salas no health check e `/status`.
 - Painel persistente de expedições.
 - Criação e edição por modal.
 - Participação dinâmica por botões.
@@ -21,6 +26,8 @@
 - Informações de uptime, versão e latência no health check.
 
 ### Changed
+- Versão atualizada para 1.3.1.
+- Cartões de expedição ampliados com acesso à sala de voz.
 - Versão atualizada para 1.3.0.
 - Health check ampliado com estado das expedições.
 - Health check ampliado com estado da funcionalidade de apresentações.

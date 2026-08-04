@@ -20,6 +20,8 @@ def build_health_payload(
     log_channel_configured: bool,
     presentations_configured: bool,
     expeditions_configured: bool,
+    expedition_voice_configured: bool = False,
+    active_expedition_voice_rooms: Callable[[], int] = lambda: 0,
 ) -> dict[str, Any]:
     return {
         "status": "ok",
@@ -32,6 +34,8 @@ def build_health_payload(
         "log_channel_configured": log_channel_configured,
         "presentations_configured": presentations_configured,
         "expeditions_configured": expeditions_configured,
+        "expedition_voice_configured": expedition_voice_configured,
+        "active_expedition_voice_rooms": max(0, active_expedition_voice_rooms()),
     }
 
 
@@ -43,6 +47,8 @@ def create_health_application(
     log_channel_configured: bool,
     presentations_configured: bool,
     expeditions_configured: bool,
+    expedition_voice_configured: bool,
+    active_expedition_voice_rooms: Callable[[], int],
 ) -> web.Application:
     async def health_check(request: web.Request) -> web.Response:
         del request
@@ -55,6 +61,8 @@ def create_health_application(
                 log_channel_configured=log_channel_configured,
                 presentations_configured=presentations_configured,
                 expeditions_configured=expeditions_configured,
+                expedition_voice_configured=expedition_voice_configured,
+                active_expedition_voice_rooms=active_expedition_voice_rooms,
             )
         )
 
@@ -75,6 +83,8 @@ class HealthServer:
         log_channel_configured: bool,
         presentations_configured: bool,
         expeditions_configured: bool,
+        expedition_voice_configured: bool,
+        active_expedition_voice_rooms: Callable[[], int],
     ) -> None:
         self._port = port
         self._application = create_health_application(
@@ -85,6 +95,8 @@ class HealthServer:
             log_channel_configured,
             presentations_configured,
             expeditions_configured,
+            expedition_voice_configured,
+            active_expedition_voice_rooms,
         )
         self._runner: web.AppRunner | None = None
 

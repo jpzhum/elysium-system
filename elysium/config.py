@@ -52,6 +52,21 @@ def _port(environment: Mapping[str, str]) -> int:
     return port
 
 
+def _bounded_int(
+    environment: Mapping[str, str], name: str, default: int, minimum: int, maximum: int
+) -> int:
+    raw_value = environment.get(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ConfigError(f"A variável {name} precisa conter somente números.") from error
+    if not minimum <= value <= maximum:
+        raise ConfigError(
+            f"A variável {name} precisa estar entre {minimum} e {maximum}."
+        )
+    return value
+
+
 def _optional_url(environment: Mapping[str, str], name: str) -> str:
     value = environment.get(name, "").strip()
     if value and not value.startswith(("http://", "https://")):
@@ -98,6 +113,9 @@ class ElysiumConfig:
     eventos_role_id: int | None = None
     boletim_manager_role_ids: tuple[int, ...] = ()
     expedicoes_channel_id: int | None = None
+    expedition_voice_category_id: int | None = None
+    temp_voice_empty_timeout_seconds: int = 600
+    temp_voice_bitrate_kbps: int = 384
 
     @classmethod
     def from_env(
@@ -128,4 +146,13 @@ class ElysiumConfig:
             eventos_role_id=_snowflake(source, "EVENTOS_ROLE_ID", required=False),
             boletim_manager_role_ids=_snowflake_list(source, "BOLETIM_MANAGER_ROLE_IDS"),
             expedicoes_channel_id=_snowflake(source, "EXPEDICOES_CHANNEL_ID", required=False),
+            expedition_voice_category_id=_snowflake(
+                source, "EXPEDITION_VOICE_CATEGORY_ID", required=False
+            ),
+            temp_voice_empty_timeout_seconds=_bounded_int(
+                source, "TEMP_VOICE_EMPTY_TIMEOUT_SECONDS", 600, 60, 3600
+            ),
+            temp_voice_bitrate_kbps=_bounded_int(
+                source, "TEMP_VOICE_BITRATE_KBPS", 384, 8, 384
+            ),
         )

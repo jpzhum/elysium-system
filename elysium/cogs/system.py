@@ -11,6 +11,7 @@ from elysium.constants import BRAND_COLOR, VERSION
 from elysium.runtime import RuntimeState
 from elysium.services.audit_service import AuditService
 from elysium.utils.time_format import format_duration
+from elysium.services.expedition_voice_service import ExpeditionVoiceService
 
 
 class SystemCog(commands.Cog):
@@ -20,11 +21,13 @@ class SystemCog(commands.Cog):
         config: ElysiumConfig,
         state: RuntimeState,
         audit_service: AuditService,
+        voice_service: ExpeditionVoiceService,
     ) -> None:
         self._bot = bot
         self._config = config
         self._state = state
         self._audit = audit_service
+        self._voice = voice_service
 
     @app_commands.command(
         name="status",
@@ -84,6 +87,13 @@ class SystemCog(commands.Cog):
             "Servidor": guild.name if guild else "Indisponível",
             "Comandos": str(self._state.command_count),
             "Canal de logs": audit_text,
+            "Salas temporárias": (
+                "Não configurado"
+                if not self._voice.configured
+                else "Degradado"
+                if self._voice.degraded
+                else f"Operacional — {self._voice.active_room_count} ativa(s)"
+            ),
         }
         for name, value in fields.items():
             embed.add_field(name=name, value=value, inline=False)

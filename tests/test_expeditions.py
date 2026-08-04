@@ -20,6 +20,7 @@ from elysium.services.expedition_service import (
     expedition_id_from_embed,
     owner_user_id_from_embed,
     participant_user_ids_from_embed,
+    voice_channel_id_from_embed,
     validate_capacity,
     validate_expedition,
 )
@@ -46,7 +47,7 @@ def sample(**changes: object) -> Expedition:
 
 class ExpeditionTests(unittest.TestCase):
     def test_version_model_and_validation(self) -> None:
-        self.assertEqual(VERSION, "1.3.0")
+        self.assertEqual(VERSION, "1.3.1")
         model = validate_expedition(sample())
         self.assertEqual(model.participant_user_ids[0], model.owner_user_id)
         self.assertEqual(normalize_text("  Olá   mundo\n\n\n teste\x00 "), "Olá mundo\n\nteste")
@@ -74,6 +75,20 @@ class ExpeditionTests(unittest.TestCase):
         self.assertEqual(participant_user_ids_from_embed(embed), (123456789, 987654321))
         self.assertEqual(expedition_from_embed(embed), model)
 
+    def test_voice_field_and_round_trip(self) -> None:
+        model = sample(voice_channel_id=987654321)
+        embed = build_expedition_embed(model, "Ely")
+        field = next(item for item in embed.fields if item.name == "Sala de voz")
+        self.assertEqual(field.value, "<#987654321>")
+        self.assertFalse(field.inline)
+        self.assertEqual(voice_channel_id_from_embed(embed), 987654321)
+        self.assertEqual(expedition_from_embed(embed), model)
+
+    def test_invalid_voice_reference_is_rejected(self) -> None:
+        embed = build_expedition_embed(sample(), "Ely")
+        embed.add_field(name="Sala de voz", value="canal 123", inline=False)
+        self.assertIsNone(voice_channel_id_from_embed(embed))
+
     def test_closed_embed_and_buttons(self) -> None:
         model = replace(sample(), status=ExpeditionStatus.CLOSED)
         embed = build_expedition_embed(model, "Ely")
@@ -85,7 +100,8 @@ class ExpeditionTests(unittest.TestCase):
     def test_full_disables_only_join(self) -> None:
         model = sample(capacity=2, participant_user_ids=(123456789, 987654321))
         view = build_expedition_card_view(None, None, model)
-        self.assertEqual([item.item.disabled for item in view.children], [True, False, False, False])
+        self.assertEqual([item.item.disabled for item in view.children], [True, False, False, False, False])
+        self.assertEqual(view.children[4].item.custom_id, "elysium:expedition:voice:a84f19c2")
         view.stop()
 
     def test_dynamic_templates_are_strict(self) -> None:

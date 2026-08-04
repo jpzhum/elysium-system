@@ -16,6 +16,8 @@ class HealthPayloadTests(unittest.TestCase):
             log_channel_configured=False,
             presentations_configured=False,
             expeditions_configured=False,
+            expedition_voice_configured=False,
+            active_expedition_voice_rooms=lambda: 0,
         )
         self.assertFalse(payload["discord_ready"])
         self.assertIsNone(payload["latency_ms"])
@@ -32,6 +34,8 @@ class HealthPayloadTests(unittest.TestCase):
             log_channel_configured=True,
             presentations_configured=True,
             expeditions_configured=True,
+            expedition_voice_configured=True,
+            active_expedition_voice_rooms=lambda: 2,
         )
         self.assertEqual(
             payload,
@@ -46,5 +50,7 @@ class HealthPayloadTests(unittest.TestCase):
                 "log_channel_configured": True,
                 "presentations_configured": True,
                 "expeditions_configured": True,
+                "expedition_voice_configured": True,
+                "active_expedition_voice_rooms": 2,
             },
         )

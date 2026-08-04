@@ -26,6 +26,12 @@ services:
         sync: false
       - key: HOST_ROLE_ID
         sync: false
+      - key: EXPEDITION_VOICE_CATEGORY_ID
+        sync: false
+      - key: TEMP_VOICE_EMPTY_TIMEOUT_SECONDS
+        value: 600
+      - key: TEMP_VOICE_BITRATE_KBPS
+        value: 384
       - key: BOLETIM_CHANNEL_ID
         sync: false
       - key: EVENTOS_ROLE_ID

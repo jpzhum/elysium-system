@@ -53,9 +53,11 @@ class DiscordContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("publicar_apresentacoes", names)
         self.assertIn("publicar_expedicoes", names)
         self.assertIn("boletim", names)
+        self.assertIn("sincronizar_salas_expedicao", names)
         self.assertFalse(bot.intents.members)
         self.assertFalse(bot.intents.presences)
         self.assertFalse(bot.intents.message_content)
+        self.assertTrue(bot.intents.voice_states)
         await bot.close()
 
     async def test_expedition_panel_contract(self) -> None:
