@@ -15,6 +15,6 @@ EXPEDITION_CREATE_CUSTOM_ID: Final[str] = "elysium:expedition:create:v1"
 EXPEDITION_MINE_CUSTOM_ID: Final[str] = "elysium:expedition:mine:v1"
 EXPEDITION_ID_PATTERN: Final[str] = r"[a-f0-9]{8}"
 SERVICE_NAME: Final[str] = "elysium-system"
-VERSION: Final[str] = "1.3.0"
+VERSION: Final[str] = "1.3.1"
 WARNING_COLOR: Final[discord.Color] = discord.Color.from_str("#D4B978")
 ERROR_COLOR: Final[discord.Color] = discord.Color.from_str("#E5484D")

@@ -35,7 +35,7 @@ def sample(**changes: object) -> Presentation:
 
 class PresentationTests(unittest.IsolatedAsyncioTestCase):
     def test_version_and_normalization(self) -> None:
-        self.assertEqual(VERSION, "1.3.0")
+        self.assertEqual(VERSION, "1.3.1")
         self.assertEqual(normalize_text("  Olá   mundo\n\n\n teste\x00  "), "Olá mundo\n\nteste")
 
     def test_rejects_links_invites_and_mentions(self) -> None:

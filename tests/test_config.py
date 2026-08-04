@@ -15,6 +15,35 @@ BASE_ENVIRONMENT = {
 
 
 class ConfigTests(unittest.TestCase):
+    def test_voice_settings_and_defaults(self) -> None:
+        config = ElysiumConfig.from_env(BASE_ENVIRONMENT, load_dotenv_file=False)
+        self.assertIsNone(config.expedition_voice_category_id)
+        self.assertEqual(config.temp_voice_empty_timeout_seconds, 600)
+        self.assertEqual(config.temp_voice_bitrate_kbps, 384)
+        configured = ElysiumConfig.from_env(
+            {
+                **BASE_ENVIRONMENT,
+                "EXPEDITION_VOICE_CATEGORY_ID": "100000000000000014",
+                "TEMP_VOICE_EMPTY_TIMEOUT_SECONDS": "60",
+                "TEMP_VOICE_BITRATE_KBPS": "8",
+            },
+            load_dotenv_file=False,
+        )
+        self.assertEqual(configured.expedition_voice_category_id, 100000000000000014)
+        self.assertEqual(configured.temp_voice_empty_timeout_seconds, 60)
+        self.assertEqual(configured.temp_voice_bitrate_kbps, 8)
+
+    def test_voice_setting_limits_and_invalid_values(self) -> None:
+        for name, values in {
+            "TEMP_VOICE_EMPTY_TIMEOUT_SECONDS": ("59", "3601", "x"),
+            "TEMP_VOICE_BITRATE_KBPS": ("7", "385", "x"),
+            "EXPEDITION_VOICE_CATEGORY_ID": ("invalid", "0"),
+        }.items():
+            for value in values:
+                with self.subTest(name=name, value=value), self.assertRaises(ConfigError):
+                    ElysiumConfig.from_env(
+                        {**BASE_ENVIRONMENT, name: value}, load_dotenv_file=False
+                    )
     def test_bulletin_settings(self) -> None:
         config = ElysiumConfig.from_env(
             {

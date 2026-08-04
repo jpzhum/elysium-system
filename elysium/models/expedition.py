@@ -22,3 +22,4 @@ class Expedition:
     participant_user_ids: tuple[int, ...]
     created_at: datetime
     status: ExpeditionStatus = ExpeditionStatus.ACTIVE
+    voice_channel_id: int | None = None
