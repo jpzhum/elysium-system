@@ -75,6 +75,12 @@ O comando ephemeral `/sincronizar_salas_expedicao` reconcilia referências e ór
 Sem banco, o tempo vazio anterior e cartões além das 1000 mensagens recentes não
 são recuperados.
 
+A categoria temporária deve negar **Ver canal** e **Conectar** ao cargo
+`@everyone`. Antes da criação, o bot valida as permissões efetivas na categoria e
+aplica os acessos individuais somente depois que o canal privado foi criado. O
+comando administrativo `/diagnosticar_salas_expedicao` mostra a privacidade e cada
+permissão necessária sem revelar o ID da categoria.
+
 ## Boletim institucional
 
 O grupo `/boletim criar` abre um formulário e apresenta uma prévia ephemeral antes
