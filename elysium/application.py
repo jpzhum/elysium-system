@@ -22,6 +22,7 @@ from elysium.services.audit_service import AuditService
 from elysium.services.role_service import RoleService
 from elysium.services.presentation_service import PresentationService
 from elysium.services.expedition_service import ExpeditionService
+from elysium.services.expedition_voice_service import ExpeditionVoiceService
 from elysium.views.concluir_entrada import ConcluirEntradaView
 from elysium.views.presentation_panel import PresentationPanelView
 from elysium.views.expedition_items import DYNAMIC_EXPEDITION_ITEMS
@@ -47,6 +48,10 @@ class ElysiumCommandTree(app_commands.CommandTree):
 class ElysiumBot(commands.Bot):
     def __init__(self, config: ElysiumConfig) -> None:
         intents = discord.Intents.default()
+        intents.members = False
+        intents.presences = False
+        intents.message_content = False
+        intents.voice_states = True
         super().__init__(
             command_prefix="!",
             intents=intents,
@@ -65,6 +70,12 @@ class ElysiumBot(commands.Bot):
         self.expedition_service = ExpeditionService(
             self, config.expedition_channel_id, self.audit_service
         )
+        self.expedition_voice_service = ExpeditionVoiceService(
+            self, config, self.expedition_service, self.audit_service
+        )
+        self.expedition_service.set_mutation_callback(
+            self.expedition_voice_service.on_expedition_mutation
+        )
         self.interaction_error_handler = InteractionErrorHandler(self.audit_service)
         self.health_server = HealthServer(
             config.port,
@@ -75,6 +86,8 @@ class ElysiumBot(commands.Bot):
             config.log_channel_id is not None,
             config.presentation_channel_id is not None,
             config.expedition_channel_id is not None,
+            config.expedition_voice_category_id is not None,
+            lambda: self.expedition_voice_service.active_room_count,
         )
         self.guild_object = discord.Object(id=config.guild_id)
         self._lifecycle_lock = Lock()
@@ -97,6 +110,11 @@ class ElysiumBot(commands.Bot):
                 "EXPEDITION_CHANNEL_ID não configurado; expedições indisponíveis.",
                 extra={"event": "expeditions_not_configured"},
             )
+        if not self.expedition_voice_service.configured:
+            logger.warning(
+                "EXPEDITION_VOICE_CATEGORY_ID não configurado; salas temporárias desativadas.",
+                extra={"event": "expedition_voice_not_configured"},
+            )
         self.add_view(ConcluirEntradaView(self.role_service, self.audit_service))
         self.add_view(
             PresentationPanelView(
@@ -106,7 +124,12 @@ class ElysiumBot(commands.Bot):
         self.add_view(ExpeditionPanelView(self.config, self.expedition_service, self.audit_service))
         self.add_dynamic_items(*DYNAMIC_EXPEDITION_ITEMS)
         await self.add_cog(
-            ExpeditionsCog(self.config, self.expedition_service, self.audit_service),
+            ExpeditionsCog(
+                self.config,
+                self.expedition_service,
+                self.expedition_voice_service,
+                self.audit_service,
+            ),
             guild=self.guild_object,
         )
         await self.add_cog(
@@ -124,7 +147,13 @@ class ElysiumBot(commands.Bot):
             guild=self.guild_object,
         )
         await self.add_cog(
-            SystemCog(self, self.config, self.runtime_state, self.audit_service),
+            SystemCog(
+                self,
+                self.config,
+                self.runtime_state,
+                self.audit_service,
+                self.expedition_voice_service,
+            ),
             guild=self.guild_object,
         )
         synced = await self.tree.sync(guild=self.guild_object)
@@ -159,6 +188,10 @@ class ElysiumBot(commands.Bot):
                     },
                 )
                 self.runtime_state.log_channel_available = self.audit_service.available
+                if guild is not None and self.expedition_voice_service.configured:
+                    await self.expedition_voice_service.reconcile(
+                        guild, schedule_orphans=True
+                    )
                 return
             if self.runtime_state.disconnected_at is not None:
                 await self._log_reconnection()
@@ -173,6 +206,18 @@ class ElysiumBot(commands.Bot):
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         if payload.channel_id == self.config.expedition_channel_id:
             self.expedition_service.invalidate_message(payload.message_id)
+
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        del member
+        await self.expedition_voice_service.on_voice_state_update(before, after)
+
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        await self.expedition_voice_service.on_channel_delete(channel)
 
     async def on_resumed(self) -> None:
         async with self._lifecycle_lock:
@@ -214,6 +259,7 @@ class ElysiumBot(commands.Bot):
         return round(latency * 1000)
 
     async def close(self) -> None:
+        await self.expedition_voice_service.shutdown()
         await self.health_server.close()
         await super().close()
 

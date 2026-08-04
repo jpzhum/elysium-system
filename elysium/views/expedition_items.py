@@ -169,11 +169,46 @@ class CloseExpeditionItem(ExpeditionDynamicItem, template=rf"elysium:expedition:
         )
 
 
+class VoiceExpeditionItem(ExpeditionDynamicItem, template=rf"elysium:expedition:voice:(?P<expedition_id>{EXPEDITION_ID_PATTERN})"):
+    action, label, emoji, style = "voice", "Criar sala", "🔊", discord.ButtonStyle.secondary
+
+    def __init__(
+        self, expedition_id: str, *, disabled: bool = False, existing: bool = False
+    ) -> None:
+        self.label = "Abrir sala" if existing else "Criar sala"
+        super().__init__(expedition_id, disabled=disabled)
+
+    async def run(self, interaction: discord.Interaction) -> None:
+        config = interaction.client.config
+        member = interaction.user
+        allowed_context = (
+            interaction.guild_id == config.guild_id
+            and interaction.channel_id == config.expedition_channel_id
+            and isinstance(member, discord.Member)
+            and (
+                member.guild_permissions.administrator
+                or any(
+                    role.id in {config.habitante_role_id, config.host_role_id}
+                    for role in member.roles
+                )
+            )
+        )
+        if not allowed_context:
+            await send_ephemeral(
+                interaction, "Você não pode usar esta expedição neste contexto."
+            )
+            return
+        await interaction.client.expedition_voice_service.handle_button(
+            interaction, self.expedition_id
+        )
+
+
 DYNAMIC_EXPEDITION_ITEMS = (
     JoinExpeditionItem,
     LeaveExpeditionItem,
     EditExpeditionItem,
     CloseExpeditionItem,
+    VoiceExpeditionItem,
 )
 
 
@@ -188,4 +223,11 @@ def build_expedition_card_view(
     view.add_item(LeaveExpeditionItem(expedition.expedition_id, disabled=closed))
     view.add_item(EditExpeditionItem(expedition.expedition_id, disabled=closed))
     view.add_item(CloseExpeditionItem(expedition.expedition_id, disabled=closed))
+    view.add_item(
+        VoiceExpeditionItem(
+            expedition.expedition_id,
+            disabled=closed,
+            existing=expedition.voice_channel_id is not None,
+        )
+    )
     return view

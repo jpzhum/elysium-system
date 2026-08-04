@@ -8,6 +8,7 @@ from elysium.config import ElysiumConfig
 from elysium.constants import BRAND_COLOR, EXPEDITION_CREATE_CUSTOM_ID
 from elysium.services.audit_service import AuditService
 from elysium.services.expedition_service import ExpeditionService
+from elysium.services.expedition_voice_service import ExpeditionVoiceService
 from elysium.views.expedition_panel import ExpeditionPanelView
 
 
@@ -36,10 +37,47 @@ def build_expedition_panel_embed(config: ElysiumConfig) -> discord.Embed:
 
 
 class ExpeditionsCog(commands.Cog):
-    def __init__(self, config: ElysiumConfig, service: ExpeditionService, audit: AuditService) -> None:
+    def __init__(self, config: ElysiumConfig, service: ExpeditionService, voice: ExpeditionVoiceService, audit: AuditService) -> None:
         self._config = config
         self._service = service
         self._audit = audit
+        self._voice = voice
+
+    @app_commands.command(
+        name="sincronizar_salas_expedicao",
+        description="Reconcilia as salas temporárias das expedições.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def sincronizar_salas_expedicao(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id != self._config.guild_id or interaction.guild is None:
+            await interaction.response.send_message(
+                "Este comando só está disponível no servidor configurado.", ephemeral=True
+            )
+            return
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "Somente administradores podem sincronizar as salas.", ephemeral=True
+            )
+            return
+        if not self._voice.configured:
+            await interaction.response.send_message(
+                "As salas temporárias não estão configuradas.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        summary = await self._voice.reconcile(
+            interaction.guild, schedule_orphans=True, repair_cards=True
+        )
+        await interaction.followup.send(
+            "Sincronização concluída.\n\n"
+            f"Expedições verificadas: {summary.expeditions_checked}\n"
+            f"Salas ativas: {summary.active_rooms}\n"
+            f"Referências inválidas: {summary.invalid_references}\n"
+            f"Salas órfãs: {summary.orphan_rooms}\n"
+            f"Limpezas agendadas: {summary.cleanups_scheduled}",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="publicar_expedicoes",

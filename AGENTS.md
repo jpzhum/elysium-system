@@ -66,6 +66,15 @@ usuário na criação e por `expedition_id` nas mutações. Nunca registre jogo,
 descrição, plataforma, horário informado, lista de participantes ou conteúdo dos
 modais. Preserve todos os custom IDs estáticos e dinâmicos já publicados.
 
+## Salas temporárias de expedição
+
+As salas temporárias usam o field `Sala de voz` da mensagem da expedição como
+referência persistente. Mantenha índices bidirecionais `expedition_id ↔
+voice_channel_id`, reconstruíveis sem banco. Filtre `on_voice_state_update` pelos
+canais indexados, cancele e aguarde todas as tasks de limpeza no shutdown e nunca
+apague uma sala ocupada durante o startup. Não conecte o bot ao canal, não ative
+intents privilegiados e não registre listas de participantes.
+
 ## Observabilidade e erros
 
 - IDs de incidente usam oito caracteres hexadecimais maiúsculos e não carregam dados

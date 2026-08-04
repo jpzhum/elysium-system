@@ -1,4 +1,4 @@
-# Elysium System 1.3.0 — Render
+# Elysium System 1.3.1 — Render
 
 Bot do Portal do Elysium preparado para execução contínua no Render.
 
@@ -56,6 +56,24 @@ dinâmicos continuam operando sem registrar uma view por mensagem, e o índice �
 reconstruído de modo lazy examinando no máximo as 1000 mensagens recentes do bot.
 Cartões fora dessa janela podem não ser encontrados; duplicatas e cartões inválidos
 são auditados e nunca removidos automaticamente.
+
+### Salas de voz temporárias
+
+Com `EXPEDITION_VOICE_CATEGORY_ID` configurado, cada cartão ativo recebe o botão
+**Sala de voz**. O organizador, um administrador ou o cargo `HOST_ROLE_ID` cria no
+máximo uma sala privada; depois disso, participantes autorizados recebem um link
+ephemeral. Entradas e saídas sincronizam overwrites sem mover membros para a sala.
+
+O bot precisa de **Gerenciar canais**, **Ver canal**, **Conectar** e **Mover
+membros**, mas não de Administrador. `TEMP_VOICE_BITRATE_KBPS` (padrão `384`, de
+8 a 384) é limitado pelo servidor. `TEMP_VOICE_EMPTY_TIMEOUT_SECONDS` (padrão
+`600`, de 60 a 3600) controla a exclusão automática de salas vazias.
+
+Após restart, os índices são reconstruídos pelo field `Sala de voz`; salas vazias
+recebem um timeout completo novo e salas ocupadas nunca são apagadas no startup.
+O comando ephemeral `/sincronizar_salas_expedicao` reconcilia referências e órfãs.
+Sem banco, o tempo vazio anterior e cartões além das 1000 mensagens recentes não
+são recuperados.
 
 ## Boletim institucional
 
@@ -121,6 +139,9 @@ python bot.py
    - `EXPEDITION_CHANNEL_ID` (opcional)
    - `EXPEDITION_BANNER_URL` (opcional)
    - `HOST_ROLE_ID` (opcional)
+   - `EXPEDITION_VOICE_CATEGORY_ID` (opcional; vazio desativa as salas)
+   - `TEMP_VOICE_EMPTY_TIMEOUT_SECONDS` (opcional; padrão `600`)
+   - `TEMP_VOICE_BITRATE_KBPS` (opcional; padrão `384`)
    - `BOLETIM_CHANNEL_ID` (opcional; canal padrão)
    - `EVENTOS_ROLE_ID` (opcional; necessário para a menção Eventos)
    - `BOLETIM_MANAGER_ROLE_IDS` (opcional; IDs separados por vírgula)
@@ -149,8 +170,9 @@ disponibilidade do canal de logs, sem expor IDs ou segredos.
 
 ## Health check
 
-Além das chaves existentes, o payload inclui `presentations_configured` e
-`expeditions_configured` sem expor IDs.
+Além das chaves existentes, o payload inclui `presentations_configured`,
+`expeditions_configured`, `expedition_voice_configured` e
+`active_expedition_voice_rooms`, sem expor IDs.
 
 `GET /` e `GET /health` retornam o mesmo JSON. Além de `status`, `service` e
 `discord_ready`, a resposta inclui `version`, `uptime_seconds`, `latency_ms`,

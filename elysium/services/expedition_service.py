@@ -21,6 +21,7 @@ logger = logging.getLogger("elysium.expeditions")
 _OWNER_URL = re.compile(r"https://discord\.com/users/(\d+)$")
 _FOOTER = re.compile(rf"Elysium • Expedição ({EXPEDITION_ID_PATTERN})$")
 _PARTICIPANT = re.compile(r"<@(\d+)>")
+_VOICE_CHANNEL = re.compile(r"<#(\d+)>")
 INVALID_CONTENT_MESSAGE = "Os detalhes da expedição não podem conter links, convites ou menções."
 
 
@@ -101,6 +102,14 @@ def participant_user_ids_from_embed(embed: discord.Embed) -> tuple[int, ...]:
     return tuple(int(value) for value in _PARTICIPANT.findall(field.value)) if field else ()
 
 
+def voice_channel_id_from_embed(embed: discord.Embed) -> int | None:
+    fields = [item for item in embed.fields if item.name == "Sala de voz"]
+    if len(fields) != 1:
+        return None
+    match = _VOICE_CHANNEL.fullmatch(fields[0].value)
+    return int(match.group(1)) if match else None
+
+
 def expedition_from_embed(embed: discord.Embed) -> Expedition | None:
     owner_id = owner_user_id_from_embed(embed)
     expedition_id = expedition_id_from_embed(embed)
@@ -129,6 +138,7 @@ def expedition_from_embed(embed: discord.Embed) -> Expedition | None:
             participant_user_ids=participants,
             created_at=embed.timestamp or datetime.now(UTC),
             status=status,
+            voice_channel_id=voice_channel_id_from_embed(embed),
         )
         if int(vacancy.group(1)) != len(participants):
             return None
@@ -168,6 +178,10 @@ def build_expedition_embed(
     )
     participants = "\n".join(f"<@{user_id}>" for user_id in expedition.participant_user_ids)
     embed.add_field(name="Participantes", value=participants or "Nenhum participante.", inline=False)
+    if expedition.voice_channel_id is not None:
+        embed.add_field(
+            name="Sala de voz", value=f"<#{expedition.voice_channel_id}>", inline=False
+        )
     embed.set_footer(text=f"Elysium • Expedição {expedition.expedition_id}")
     return embed
 
@@ -190,6 +204,38 @@ class ExpeditionService:
         self._index_lock = asyncio.Lock()
         self._user_locks: dict[int, asyncio.Lock] = {}
         self._expedition_locks: dict[str, asyncio.Lock] = {}
+        self._mutation_callback: Any | None = None
+
+    def set_mutation_callback(self, callback: Any) -> None:
+        self._mutation_callback = callback
+
+    async def rebuild_index(self) -> bool:
+        self._index_ready = False
+        return await self.ensure_index()
+
+    async def update_voice_reference(
+        self, expedition_id: str, voice_channel_id: int | None
+    ) -> ExpeditionResult:
+        async with self._expedition_locks.setdefault(expedition_id, asyncio.Lock()):
+            return await self.update_voice_reference_locked(
+                expedition_id, voice_channel_id
+            )
+
+    async def update_voice_reference_locked(
+        self, expedition_id: str, voice_channel_id: int | None
+    ) -> ExpeditionResult:
+        """Atualiza o embed quando o chamador já detém o lock da expedição."""
+        found = await self.find(expedition_id)
+        if found.outcome is not ExpeditionOutcome.SUCCESS or found.expedition is None:
+            return found
+        model = replace(found.expedition, voice_channel_id=voice_channel_id)
+        author = found.message.embeds[0].author
+        await found.message.edit(
+            embed=build_expedition_embed(model, author.name or "Organizador", author.icon_url),
+            view=self.build_card_view(model),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return ExpeditionResult(ExpeditionOutcome.SUCCESS, found.message, model)
 
     @property
     def configured(self) -> bool:
@@ -332,6 +378,14 @@ class ExpeditionService:
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             await self._audit_event(audit_title, model, found.message, actor_id=actor_id)
+            if self._mutation_callback is not None:
+                try:
+                    await self._mutation_callback(action, found.expedition, model, actor_id)
+                except Exception:
+                    logger.exception(
+                        "Falha na sincronização da sala da expedição.",
+                        extra={"event": "expedition_voice_sync_failed", "expedition_id": expedition_id},
+                    )
             return ExpeditionResult(ExpeditionOutcome.SUCCESS, found.message, model)
 
     def build_card_view(self, expedition: Expedition) -> discord.ui.View:
