@@ -1,205 +1,224 @@
-# Elysium System 1.3.1 — Render
+# Elysium System
 
-Bot do Portal do Elysium preparado para execução contínua no Render.
+## Visão geral do projeto
 
-## O que esta versão inclui
+Elysium System é um bot de automação comunitária para Discord, desenvolvido em
+Python 3.13 com `discord.py` e `aiohttp`. O projeto organiza onboarding,
+publicações institucionais, apresentações e expedições em componentes modulares,
+com execução contínua como Web Service no Render.
 
-- botão persistente de conclusão da entrada;
-- troca de `Visitante` por `Habitante`;
-- resposta privada ao membro;
-- endpoints HTTP `/` e `/health` para o Render;
-- comando administrativo e privado `/status`;
-- auditoria opcional em canal privado, além dos logs estruturados no stdout;
-- códigos de incidente para erros inesperados;
-- configuração por variáveis de ambiente;
-- Python 3.13 definido por `.python-version`;
-- Blueprint opcional em `render.yaml`.
+A versão atual é `1.3.1`. O repositório não inclui credenciais, IDs de produção
+ou dados da comunidade.
 
-## Estrutura
+## Principais funcionalidades
+
+- portal persistente de onboarding, com troca controlada dos cargos Visitante e
+  Habitante e respostas privadas ao membro;
+- boletins institucionais com formulário, prévia privada, confirmação e controle
+  explícito de menções;
+- apresentações criadas e editadas por modal, com exclusão confirmada,
+  propriedade validada e uma apresentação por usuário;
+- expedições com criação e edição por modal, participação dinâmica, encerramento
+  controlado e uma expedição ativa por organizador;
+- salas de voz privadas e temporárias vinculadas a expedições, com sincronização
+  de participantes, limpeza de salas vazias e reconciliação administrativa;
+- views persistentes e itens dinâmicos que continuam atendendo mensagens
+  publicadas após reinicializações;
+- auditoria em stdout e, opcionalmente, em canal privado do Discord;
+- códigos aleatórios de incidente para erros inesperados;
+- comandos administrativos para publicar painéis, diagnosticar e reconciliar
+  salas e consultar o estado operacional em `/status`;
+- servidor HTTP mínimo para health checks do Render;
+- testes automatizados sem conexão com um servidor Discord real.
+
+## Arquitetura
+
+`bot.py` é apenas o entrypoint. `elysium.application` monta o cliente, registra
+cogs e views e coordena o ciclo de vida do servidor HTTP. Configuração,
+interações, regras de domínio e infraestrutura permanecem separadas.
 
 ```text
-bot.py                         # entrypoint
-elysium/
-├── application.py             # ciclo de vida do bot
-├── config.py                  # leitura e validação do ambiente
-├── constants.py               # identidade e IDs estáveis
-├── errors.py                  # tratamento central de interações
-├── logging_setup.py           # logging central
-├── runtime.py                 # uptime e estado de conexão
-├── cogs/portal.py             # comando /publicar_entrada
-├── cogs/system.py             # comando /status
-├── services/audit_service.py  # auditoria segura no Discord
-├── services/role_service.py   # regras para alteração de cargos
-├── utils/time_format.py       # duração legível
-├── views/concluir_entrada.py  # botão persistente
-└── web/health.py              # servidor HTTP de saúde
+.
+├── bot.py                         # entrypoint e tratamento de falhas fatais
+├── render.yaml                    # Blueprint do Web Service
+├── requirements.txt               # dependências Python
+├── elysium/
+│   ├── application.py             # composição e ciclo de vida do bot
+│   ├── config.py                  # leitura e validação do ambiente
+│   ├── constants.py               # identidade, versão e custom IDs estáveis
+│   ├── errors.py                  # erros de interação e incidentes
+│   ├── logging_setup.py           # configuração central de logs
+│   ├── runtime.py                 # estado operacional em memória
+│   ├── cogs/                      # slash commands
+│   ├── modals/                    # formulários de apresentação e expedição
+│   ├── models/                    # modelos serializáveis em embeds
+│   ├── services/                  # cargos, auditoria, apresentações e expedições
+│   ├── utils/                     # validação, nomes e formatação
+│   ├── views/                     # componentes persistentes e confirmações
+│   └── web/health.py              # endpoints públicos de saúde
+└── tests/                          # testes unitários e de contratos do Discord
 ```
 
-## Execução local
+As mensagens e os embeds do Discord são a fonte persistente do estado de
+apresentações e expedições. Não há banco de dados nem integração externa de
+persistência.
 
-## Expedições premium
+## Permissões do Discord
 
-Configure `EXPEDITION_CHANNEL_ID` para habilitar o recurso. Um administrador usa
-`/publicar_expedicoes` no canal configurado para publicar o painel; o banner
-opcional vem de `EXPEDITION_BANNER_URL`. Habitantes e administradores podem criar,
-participar e sair. O proprietário e administradores podem editar e encerrar;
-quando `HOST_ROLE_ID` está configurado, o Anfitrião também pode encerrar cartões de
-terceiros, mas não editá-los.
+O bot não solicita permissão de Administrador e desativa os intents privilegiados
+de membros, presenças e conteúdo de mensagens. O intent de estado de voz é usado
+para a limpeza das salas temporárias.
 
-O bot precisa de Ver canal, Ler histórico, Enviar mensagens e Inserir links no
-canal. Não requer Administrador nem intents privilegiados. Cada usuário mantém no
-máximo uma expedição ativa, e o organizador integra automaticamente a lista de
-participantes.
+Conceda somente as permissões exigidas pelos recursos habilitados:
 
-Não há banco de dados: cada embed é a fonte do estado. Após restart, os botões
-dinâmicos continuam operando sem registrar uma view por mensagem, e o índice é
-reconstruído de modo lazy examinando no máximo as 1000 mensagens recentes do bot.
-Cartões fora dessa janela podem não ser encontrados; duplicatas e cartões inválidos
-são auditados e nunca removidos automaticamente.
+- portal: Ver canal, Enviar mensagens, Inserir links e Gerenciar cargos; o cargo
+  do bot deve estar acima de Visitante e Habitante;
+- apresentações e expedições: Ver canal, Ler histórico, Enviar mensagens e
+  Inserir links; apresentações também exigem Gerenciar mensagens;
+- salas temporárias: Ver canal, Gerenciar canais, Gerenciar cargos, Conectar,
+  Falar, Vídeo, Usar detecção de voz e Mover membros na categoria configurada;
+- boletins: Ver canal, Enviar mensagens e Inserir links; menções a Eventos ou
+  `@everyone` também exigem a permissão correspondente de menção;
+- auditoria no Discord: Ver canal, Enviar mensagens e Inserir links no canal
+  privado configurado.
 
-### Salas de voz temporárias
+Os comandos de publicação, diagnóstico, reconciliação e `/status` revalidam
+acesso administrativo em tempo de execução. `/boletim criar` aceita Gerenciar
+servidor ou um cargo configurado em `BOLETIM_MANAGER_ROLE_IDS`.
 
-Com `EXPEDITION_VOICE_CATEGORY_ID` configurado, cada cartão ativo recebe o botão
-**Sala de voz**. O organizador, um administrador ou o cargo `HOST_ROLE_ID` cria no
-máximo uma sala privada; depois disso, participantes autorizados recebem um link
-ephemeral. Entradas e saídas sincronizam overwrites sem mover membros para a sala.
+## Variáveis de ambiente
 
-O bot precisa de **Gerenciar canais**, **Ver canal**, **Conectar** e **Mover
-membros**, mas não de Administrador. `TEMP_VOICE_BITRATE_KBPS` (padrão `384`, de
-8 a 384) é limitado pelo servidor. `TEMP_VOICE_EMPTY_TIMEOUT_SECONDS` (padrão
-`600`, de 60 a 3600) controla a exclusão automática de salas vazias.
+Copie `.env.example` para `.env` apenas no ambiente local. Nunca versione esse
+arquivo nem reutilize os valores fictícios do exemplo.
 
-Após restart, os índices são reconstruídos pelo field `Sala de voz`; salas vazias
-recebem um timeout completo novo e salas ocupadas nunca são apagadas no startup.
-O comando ephemeral `/sincronizar_salas_expedicao` reconcilia referências e órfãs.
-Sem banco, o tempo vazio anterior e cartões além das 1000 mensagens recentes não
-são recuperados.
+| Variável | Obrigatória | Finalidade |
+| --- | --- | --- |
+| `DISCORD_TOKEN` | sim | token secreto da aplicação Discord |
+| `GUILD_ID` | sim | servidor autorizado |
+| `HABITANTE_ROLE_ID` | sim | cargo concedido no onboarding |
+| `VISITANTE_ROLE_ID` | sim | cargo removido no onboarding |
+| `PANEL_CHANNEL_ID` | sim | canal do portal |
+| `PORT` | não | porta HTTP; padrão `10000` |
+| `LOG_CHANNEL_ID` | não | canal privado de auditoria |
+| `PRESENTATION_CHANNEL_ID` | não | habilita apresentações |
+| `PRESENTATION_BANNER_URL` | não | banner HTTP(S) do painel de apresentações |
+| `EXPEDITION_CHANNEL_ID` | não | habilita expedições |
+| `EXPEDITION_BANNER_URL` | não | banner HTTP(S) do painel de expedições |
+| `HOST_ROLE_ID` | não | cargo com ações adicionais em expedições |
+| `EXPEDITION_VOICE_CATEGORY_ID` | não | habilita salas temporárias |
+| `TEMP_VOICE_EMPTY_TIMEOUT_SECONDS` | não | limpeza de sala vazia; `60` a `3600`, padrão `600` |
+| `TEMP_VOICE_BITRATE_KBPS` | não | bitrate solicitado; `8` a `384`, padrão `384` |
+| `BOLETIM_CHANNEL_ID` | não | destino padrão de boletins |
+| `EVENTOS_ROLE_ID` | não | cargo usado pela opção de menção Eventos |
+| `BOLETIM_MANAGER_ROLE_IDS` | não | cargos autorizados, separados por vírgula |
+| `EXPEDICOES_CHANNEL_ID` | não | referência preservada por compatibilidade; sem uso operacional atual |
 
-A categoria temporária deve negar **Ver canal** e **Conectar** ao cargo
-`@everyone`. Antes da criação, o bot valida as permissões efetivas na categoria e
-aplica os acessos individuais somente depois que o canal privado foi criado. O
-comando administrativo `/diagnosticar_salas_expedicao` mostra a privacidade e cada
-permissão necessária sem revelar o ID da categoria.
+IDs devem ser snowflakes válidos. URLs opcionais aceitam apenas HTTP(S). Toda a
+leitura e validação ocorre em `elysium/config.py`.
 
-## Boletim institucional
+## Desenvolvimento local
 
-O grupo `/boletim criar` abre um formulário e apresenta uma prévia ephemeral antes
-de qualquer publicação. O administrador escolhe entre nenhuma menção, o cargo
-Eventos ou `@everyone`, além de poder substituir o canal padrão. Somente a
-confirmação em **Publicar** envia a mensagem; a prévia usa menções desativadas.
-
-Podem criar boletins membros com `Gerenciar servidor` ou cargos presentes em
-`BOLETIM_MANAGER_ROLE_IDS`. Como as permissões padrão do slash command usam
-`manage_guild`, cargos gerenciais sem essa permissão devem receber acesso ao comando
-nas configurações de integrações do Discord. A autorização também é sempre
-revalidada em tempo de execução.
-
-O bot precisa de Ver canal, Enviar mensagens e Inserir links no destino. Para
-`eventos` ou `everyone`, também precisa da permissão de mencionar `@everyone`,
-`@here` e todos os cargos. `EXPEDICOES_CHANNEL_ID` fica disponível como referência
-de configuração para recursos futuros e não é inserido automaticamente no boletim.
-
-## Apresentações premium
-
-Configure `PRESENTATION_CHANNEL_ID` para habilitar o recurso e, opcionalmente,
-`PRESENTATION_BANNER_URL` com uma URL HTTP(S) para a imagem grande do painel. Um
-administrador publica o painel com `/publicar_apresentacoes` no canal configurado.
-Membros Visitante ou Habitante podem criar uma apresentação pelo modal, editar a
-mesma mensagem e excluí-la mediante confirmação.
-
-O bot precisa de Ver canal, Ler histórico, Enviar mensagens, Inserir links e
-Gerenciar mensagens no canal de apresentações. Não precisa de Administrador nem de
-intents privilegiados. Nesta versão não há banco de dados: o índice em memória é
-reconstruído de forma lazy na primeira operação após reiniciar. Duplicatas
-pré-existentes são auditadas, mas não removidas automaticamente.
-
-## Execução local
-
-1. Execute `instalar.bat`.
-2. Copie `.env.example` para `.env` e preencha os valores.
-3. Execute `iniciar.bat`.
-
-Também é possível iniciar diretamente no ambiente configurado:
+Requer Python 3.13.
 
 ```console
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
+copy .env.example .env
 python bot.py
 ```
 
-## Deploy manual no Render
+No Windows, `instalar.bat` prepara o ambiente e `iniciar.bat` inicia o serviço.
+Mantenha somente uma instância usando o mesmo token.
 
-1. Publique esta pasta em um repositório privado no GitHub.
-2. No Render, crie um **Web Service** conectado ao repositório.
-3. Runtime: `Python 3`.
-4. Build Command: `pip install -r requirements.txt`.
-5. Start Command: `python bot.py`.
-6. Health Check Path: `/health`.
-7. Cadastre as variáveis:
-   - `DISCORD_TOKEN`
-   - `GUILD_ID`
-   - `HABITANTE_ROLE_ID`
-   - `VISITANTE_ROLE_ID`
-   - `PANEL_CHANNEL_ID`
-   - `LOG_CHANNEL_ID` (opcional)
-   - `PRESENTATION_CHANNEL_ID` (opcional)
-   - `PRESENTATION_BANNER_URL` (opcional)
-   - `EXPEDITION_CHANNEL_ID` (opcional)
-   - `EXPEDITION_BANNER_URL` (opcional)
-   - `HOST_ROLE_ID` (opcional)
-   - `EXPEDITION_VOICE_CATEGORY_ID` (opcional; vazio desativa as salas)
-   - `TEMP_VOICE_EMPTY_TIMEOUT_SECONDS` (opcional; padrão `600`)
-   - `TEMP_VOICE_BITRATE_KBPS` (opcional; padrão `384`)
-   - `BOLETIM_CHANNEL_ID` (opcional; canal padrão)
-   - `EVENTOS_ROLE_ID` (opcional; necessário para a menção Eventos)
-   - `BOLETIM_MANAGER_ROLE_IDS` (opcional; IDs separados por vírgula)
-   - `EXPEDICOES_CHANNEL_ID` (opcional; uso futuro)
-8. Faça o deploy.
-
-O Render fornece `PORT` ao Web Service. Localmente, quando ela não é definida, o
-servidor usa a porta `10000`.
-
-Nunca envie o arquivo `.env` ao GitHub. No Render, o token deve ser cadastrado como
-variável de ambiente secreta.
-
-## Configuração
-
-`DISCORD_TOKEN`, `GUILD_ID`, `HABITANTE_ROLE_ID`, `VISITANTE_ROLE_ID` e
-`PANEL_CHANNEL_ID` são obrigatórias. `PORT` é opcional e usa `10000` localmente.
-`LOG_CHANNEL_ID` também é opcional: quando preenchida, deve apontar para um canal
-privado onde o bot possa enviar mensagens e embeds. Se estiver vazia ou o canal
-estiver inacessível, o bot continua operando e mantém a auditoria no stdout.
-`EXPEDITION_CHANNEL_ID` e `HOST_ROLE_ID` aceitam snowflakes válidos ou vazio.
-`EXPEDITION_BANNER_URL` aceita vazio ou URL iniciada por HTTP(S).
-
-O `/status` é restrito a administradores do servidor configurado e sempre responde
-de forma ephemeral. Ele mostra versão, latência, uptime, servidor, comandos e
-disponibilidade do canal de logs, sem expor IDs ou segredos.
-
-## Health check
-
-Além das chaves existentes, o payload inclui `presentations_configured`,
-`expeditions_configured`, `expedition_voice_configured` e
-`active_expedition_voice_rooms`, sem expor IDs.
-
-`GET /` e `GET /health` retornam o mesmo JSON. Além de `status`, `service` e
-`discord_ready`, a resposta inclui `version`, `uptime_seconds`, `latency_ms`,
-`guild_ready` e `log_channel_configured`. A latência é `null` antes da conexão.
-
-## Validação
-
-Os testes não conectam ao Discord e cobrem configuração, contratos persistentes,
-validação, embeds, comandos, health check e propriedade das apresentações.
+## Testes
 
 ```console
 python -m compileall bot.py elysium tests
 python -m unittest discover -s tests -v
-python -c "import bot, elysium.application, elysium.config, elysium.constants, elysium.errors, elysium.logging_setup, elysium.runtime, elysium.cogs.portal, elysium.cogs.system, elysium.views.concluir_entrada, elysium.services.audit_service, elysium.services.role_service, elysium.utils.time_format, elysium.web.health"
+python -c "import bot, elysium.application, elysium.config, elysium.constants, elysium.errors, elysium.logging_setup, elysium.runtime, elysium.cogs.portal, elysium.cogs.system, elysium.views.concluir_entrada, elysium.services.audit_service, elysium.services.role_service, elysium.web.health"
 git diff --check
 ```
 
-Quando os logs mostrarem `Conectado como Elysium System`, acesse a URL do serviço.
-A resposta esperada em `/health` contém as chaves descritas acima. No Render,
-confirme também uma única auditoria de inicialização, teste `/status` e valide uma
-reconexão controlada. O stdout deve manter o formato
-`timestamp | level | logger | message`.
+Os testes cobrem configuração, contratos persistentes, validação de conteúdo,
+apresentações, boletins, expedições, salas temporárias e health check.
 
-Mantenha apenas uma instância do bot executando com o mesmo token.
+## Deploy no Render
+
+O repositório pode ser público desde que nenhum segredo seja commitado. Revise o
+histórico antes da publicação, mantenha `.env` ignorado e cadastre
+`DISCORD_TOKEN` como variável secreta no painel do Render.
+
+Para usar o Blueprint, conecte o repositório ao Render e aplique `render.yaml`.
+Para configuração manual, crie um Web Service com:
+
+- runtime: Python;
+- build command: `pip install -r requirements.txt`;
+- start command: `python bot.py`;
+- health check path: `/health`;
+- variáveis obrigatórias e opcionais definidas conforme a tabela acima.
+
+O Render fornece `PORT`; localmente, a aplicação usa `10000` quando a variável não
+está definida. O Blueprint não contém valores de produção e usa `sync: false` para
+configurações que devem ser preenchidas no ambiente.
+
+## Health checks
+
+`GET /` e `GET /health` são rotas somente de leitura e retornam HTTP 200 com o
+mesmo payload público mínimo:
+
+```json
+{
+  "status": "ok",
+  "service": "elysium-system",
+  "version": "1.3.1"
+}
+```
+
+O endpoint confirma que o processo HTTP responde, preservando compatibilidade com
+o Render sem expor latência, uptime, IDs, configuração de módulos ou contagens
+operacionais. Administradores consultam detalhes de Discord, latência, uptime,
+comandos, auditoria e salas temporárias pelo `/status`, cuja resposta é privada.
+
+## Modelo de segurança
+
+- segredos e configuração são recebidos exclusivamente por variáveis de ambiente;
+- `.env`, chaves privadas, bancos locais, logs e artefatos de execução são
+  ignorados pelo Git;
+- não há token, webhook, client secret, ID de produção ou domínio privado no
+  código versionado;
+- não há rota HTTP mutável nem painel administrativo público;
+- menções são desativadas em prévias, respostas e conteúdo gerado por usuários,
+  exceto na publicação de boletim explicitamente confirmada;
+- apresentações rejeitam links, convites e menções e validam a propriedade antes
+  de editar ou excluir;
+- locks por usuário e por expedição reduzem operações concorrentes duplicadas;
+- tracebacks ficam no stdout; respostas públicas recebem apenas um código de
+  incidente aleatório, sem incorporar dados do usuário;
+- a auditoria em canal é opcional e falhas nela não interrompem o bot.
+
+## Limitações operacionais
+
+- apresentações e expedições não usam banco; o estado depende das mensagens e
+  embeds existentes no Discord;
+- os índices são reconstruídos de forma lazy a partir de até 1000 mensagens
+  recentes do bot; itens fora dessa janela podem não ser encontrados;
+- duplicatas e cartões inválidos são auditados, mas não removidos automaticamente;
+- após reinício, o tempo já transcorrido de uma sala vazia não é recuperado; um
+  novo timeout completo é iniciado, e salas ocupadas não são apagadas no startup;
+- o bitrate efetivo das salas é limitado pelo nível de boost do servidor;
+- `EXPEDICOES_CHANNEL_ID` está validada por compatibilidade, mas não aciona uma
+  funcionalidade nesta versão;
+- o health check mede disponibilidade do processo HTTP, não prontidão detalhada
+  da conexão com o Discord; essa condição é observada pelo `/status` e pelos logs.
+
+## Status do projeto
+
+Versão `1.3.1`, mantida para operação real em uma única comunidade Discord. Os
+recursos opcionais permanecem desabilitados quando suas variáveis não são
+configuradas. Mudanças em custom IDs publicados exigem migração compatível, pois
+eles fazem parte do contrato persistente com mensagens existentes.
+
+## Changelog
+
+Consulte [CHANGELOG.md](CHANGELOG.md) para o histórico de alterações.

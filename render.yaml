@@ -20,6 +20,10 @@ services:
         sync: false
       - key: LOG_CHANNEL_ID
         sync: false
+      - key: PRESENTATION_CHANNEL_ID
+        sync: false
+      - key: PRESENTATION_BANNER_URL
+        sync: false
       - key: EXPEDITION_CHANNEL_ID
         sync: false
       - key: EXPEDITION_BANNER_URL

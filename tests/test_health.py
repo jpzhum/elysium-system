@@ -2,55 +2,37 @@ from __future__ import annotations
 
 import unittest
 
+from aiohttp.test_utils import TestClient, TestServer
+
 from elysium.constants import SERVICE_NAME, VERSION
-from elysium.web.health import build_health_payload
+from elysium.web.health import build_health_payload, create_health_application
 
 
 class HealthPayloadTests(unittest.TestCase):
-    def test_payload_before_ready(self) -> None:
-        payload = build_health_payload(
-            is_discord_ready=lambda: False,
-            uptime_seconds=lambda: 0,
-            latency_ms=lambda: None,
-            is_guild_ready=lambda: False,
-            log_channel_configured=False,
-            presentations_configured=False,
-            expeditions_configured=False,
-            expedition_voice_configured=False,
-            active_expedition_voice_rooms=lambda: 0,
-        )
-        self.assertFalse(payload["discord_ready"])
-        self.assertIsNone(payload["latency_ms"])
-        self.assertEqual(payload["version"], VERSION)
-        self.assertTrue({"status", "service", "discord_ready"} <= payload.keys())
-        self.assertEqual(payload["service"], SERVICE_NAME)
-
-    def test_payload_after_ready(self) -> None:
-        payload = build_health_payload(
-            is_discord_ready=lambda: True,
-            uptime_seconds=lambda: 842,
-            latency_ms=lambda: 74,
-            is_guild_ready=lambda: True,
-            log_channel_configured=True,
-            presentations_configured=True,
-            expeditions_configured=True,
-            expedition_voice_configured=True,
-            active_expedition_voice_rooms=lambda: 2,
-        )
+    def test_payload_exposes_only_public_service_identity(self) -> None:
+        payload = build_health_payload()
         self.assertEqual(
             payload,
             {
                 "status": "ok",
                 "service": SERVICE_NAME,
-                "discord_ready": True,
                 "version": VERSION,
-                "uptime_seconds": 842,
-                "latency_ms": 74,
-                "guild_ready": True,
-                "log_channel_configured": True,
-                "presentations_configured": True,
-                "expeditions_configured": True,
-                "expedition_voice_configured": True,
-                "active_expedition_voice_rooms": 2,
             },
         )
+
+
+class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.client = TestClient(TestServer(create_health_application()))
+        await self.client.start_server()
+
+    async def asyncTearDown(self) -> None:
+        await self.client.close()
+
+    async def test_public_routes_return_the_minimal_payload(self) -> None:
+        expected = build_health_payload()
+        for path in ("/", "/health"):
+            with self.subTest(path=path):
+                response = await self.client.get(path)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.json(), expected)
