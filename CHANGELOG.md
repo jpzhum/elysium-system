@@ -26,6 +26,10 @@
 - Informações de uptime, versão e latência no health check.
 
 ### Changed
+- Documentação reorganizada para publicação segura do repositório.
+- Health check público reduzido à identidade mínima do serviço; detalhes
+  operacionais permanecem no comando administrativo `/status`.
+- Blueprint do Render alinhado às configurações opcionais de apresentações.
 - Versão atualizada para 1.3.1.
 - Cartões de expedição ampliados com acesso à sala de voz.
 - Versão atualizada para 1.3.0.

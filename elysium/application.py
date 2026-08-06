@@ -77,18 +77,7 @@ class ElysiumBot(commands.Bot):
             self.expedition_voice_service.on_expedition_mutation
         )
         self.interaction_error_handler = InteractionErrorHandler(self.audit_service)
-        self.health_server = HealthServer(
-            config.port,
-            self.is_ready,
-            lambda: self.runtime_state.uptime_seconds,
-            self._latency_ms,
-            lambda: self.get_guild(config.guild_id) is not None,
-            config.log_channel_id is not None,
-            config.presentation_channel_id is not None,
-            config.expedition_channel_id is not None,
-            config.expedition_voice_category_id is not None,
-            lambda: self.expedition_voice_service.active_room_count,
-        )
+        self.health_server = HealthServer(config.port)
         self.guild_object = discord.Object(id=config.guild_id)
         self._lifecycle_lock = Lock()
         self._last_reconnect_log_at: float | None = None
