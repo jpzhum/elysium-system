@@ -5,7 +5,7 @@
 Elysium System é um bot de automação comunitária para Discord, desenvolvido em
 Python 3.13 com `discord.py` e `aiohttp`. O projeto organiza onboarding,
 publicações institucionais, apresentações e expedições em componentes modulares,
-com execução contínua como Web Service no Render.
+com implantação configurada como Web Service no Render.
 
 A versão atual é `1.3.1`. O repositório não inclui credenciais, IDs de produção
 ou dados da comunidade.
@@ -214,7 +214,7 @@ comandos, auditoria e salas temporárias pelo `/status`, cuja resposta é privad
 
 ## Status do projeto
 
-Versão `1.3.1`, mantida para operação real em uma única comunidade Discord. Os
+Versão `1.3.1`, preparada para operar em uma única comunidade Discord. Os
 recursos opcionais permanecem desabilitados quando suas variáveis não são
 configuradas. Mudanças em custom IDs publicados exigem migração compatível, pois
 eles fazem parte do contrato persistente com mensagens existentes.

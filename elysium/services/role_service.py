@@ -40,11 +40,7 @@ class RoleService:
         visitante = guild.get_role(self._visitante_role_id)
 
         if habitante is None or visitante is None:
-            logger.error(
-                "Cargo não encontrado. HABITANTE_ROLE_ID=%s VISITANTE_ROLE_ID=%s",
-                self._habitante_role_id,
-                self._visitante_role_id,
-            )
+            logger.error("Um ou mais cargos configurados não foram encontrados.")
             return RoleResult(RoleOutcome.ROLES_NOT_FOUND)
 
         bot_member = guild.me

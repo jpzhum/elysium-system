@@ -148,9 +148,8 @@ class ElysiumBot(commands.Bot):
         synced = await self.tree.sync(guild=self.guild_object)
         self.runtime_state.command_count = len(synced)
         logger.info(
-            "%s comando(s) sincronizado(s) no servidor %s.",
+            "%s comando(s) sincronizado(s) no servidor configurado.",
             len(synced),
-            self.config.guild_id,
         )
 
     async def on_ready(self) -> None:
@@ -163,7 +162,7 @@ class ElysiumBot(commands.Bot):
                     "Elysium System %s iniciado como %s.",
                     VERSION,
                     user_name,
-                    extra={"event": "startup_complete", "guild_id": self.config.guild_id},
+                    extra={"event": "startup_complete"},
                 )
                 await self.audit_service.send(
                     "Elysium System iniciado",
