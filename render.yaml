@@ -6,8 +6,6 @@ services:
     startCommand: python bot.py
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.13
       - key: DISCORD_TOKEN
         sync: false
       - key: GUILD_ID
