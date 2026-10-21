@@ -181,6 +181,39 @@ class ExpeditionVoiceService:
             missing_voice_permissions(category.permissions_for(bot_member)),
         )
 
+    def _is_jarvis_member(self, member: Any) -> bool:
+        return (
+            self._config.jarvis_bot_user_id is not None
+            and getattr(member, "id", None) == self._config.jarvis_bot_user_id
+            and getattr(member, "bot", False) is True
+        )
+
+    def _room_is_occupied(self, channel: Any) -> bool:
+        # Outros bots também preservam a sala; somente o Jarvis confirmado é ignorado.
+        return any(not self._is_jarvis_member(member) for member in channel.members)
+
+    async def _resolve_jarvis_member(self, guild: Any) -> Any | None:
+        user_id = self._config.jarvis_bot_user_id
+        if user_id is None:
+            return None
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                logger.warning(
+                    "Bot Jarvis indisponível para acesso à sala temporária.",
+                    extra={"event": "voice_jarvis_resolution_failed"},
+                )
+                return None
+        if not self._is_jarvis_member(member):
+            logger.warning(
+                "A integração de voz exige o ID de um membro bot Jarvis.",
+                extra={"event": "voice_jarvis_member_invalid"},
+            )
+            return None
+        return member
+
     async def build_overwrite_targets(
         self, guild: Any, expedition: Expedition
     ) -> list[tuple[str, Any, discord.PermissionOverwrite]]:
@@ -224,6 +257,11 @@ class ExpeditionVoiceService:
         if host is not None:
             targets.append(("host_role", host, discord.PermissionOverwrite(
                 view_channel=True, connect=True, move_members=True
+            )))
+        jarvis = await self._resolve_jarvis_member(guild)
+        if jarvis is not None:
+            targets.append(("jarvis_bot", jarvis, discord.PermissionOverwrite(
+                view_channel=True, connect=True, speak=True
             )))
         return targets
 
@@ -366,11 +404,13 @@ class ExpeditionVoiceService:
                     missing_permissions=preflight.missing_permissions,
                     incident_id=incident_id,
                 )
+            targets = await self.build_overwrite_targets(guild, model)
+            jarvis_slot = int(any(name == "jarvis_bot" for name, _, _ in targets))
             try:
                 channel = await guild.create_voice_channel(
                     expedition_voice_channel_name(model.game, expedition_id),
                     category=category,
-                    user_limit=model.capacity,
+                    user_limit=model.capacity + jarvis_slot,
                     bitrate=limited_bitrate(
                         self._config.temp_voice_bitrate_kbps, guild.bitrate_limit
                     ),
@@ -391,7 +431,6 @@ class ExpeditionVoiceService:
                 return VoiceRoomResult(
                     VoiceRoomOutcome.CREATE_FAILED, incident_id=incident_id
                 )
-            targets = await self.build_overwrite_targets(guild, model)
             failed_target = await self._apply_overwrites(channel, targets)
             if failed_target is not None:
                 incident_id = create_incident_id()
@@ -544,9 +583,10 @@ class ExpeditionVoiceService:
                         )
                 await self._audit_event("Participante removido da sala", after, channel.id, actor_id)
         elif action == "edit":
-            await channel.edit(user_limit=after.capacity)
+            jarvis = await self._resolve_jarvis_member(channel.guild)
+            await channel.edit(user_limit=after.capacity + int(jarvis is not None))
         elif action == "close":
-            if channel.members:
+            if self._room_is_occupied(channel):
                 await self.schedule_cleanup(channel.id, reason="expedição encerrada")
             else:
                 if await self.delete_room(
@@ -581,7 +621,11 @@ class ExpeditionVoiceService:
         try:
             await asyncio.sleep(self._config.temp_voice_empty_timeout_seconds)
             channel = self.resolve_voice_channel(channel_id)
-            if channel is not None and not channel.members and channel_id in self._expedition_by_voice:
+            if (
+                channel is not None
+                and not self._room_is_occupied(channel)
+                and channel_id in self._expedition_by_voice
+            ):
                 await self.delete_room(channel_id, reason="timeout de sala vazia")
         except asyncio.CancelledError:
             raise
@@ -593,7 +637,7 @@ class ExpeditionVoiceService:
         self, channel_id: int, *, reason: str, update_card: bool = True
     ) -> bool:
         channel = self.resolve_voice_channel(channel_id)
-        if channel is not None and channel.members:
+        if channel is not None and self._room_is_occupied(channel):
             return False
         expedition_id = self._expedition_by_voice.get(channel_id)
         if channel is not None:
@@ -617,10 +661,14 @@ class ExpeditionVoiceService:
         before_id = getattr(getattr(before, "channel", None), "id", None)
         after_id = getattr(getattr(after, "channel", None), "id", None)
         if after_id in self._expedition_by_voice:
-            await self.cancel_cleanup(after_id)
+            channel = self.resolve_voice_channel(after_id)
+            if channel is None or self._room_is_occupied(channel):
+                await self.cancel_cleanup(after_id)
+            else:
+                await self.schedule_cleanup(after_id)
         if before_id in self._expedition_by_voice and before_id != after_id:
             channel = self.resolve_voice_channel(before_id)
-            if channel is not None and not channel.members:
+            if channel is not None and not self._room_is_occupied(channel):
                 await self.schedule_cleanup(before_id)
 
     async def on_channel_delete(self, channel: Any) -> None:
@@ -672,7 +720,10 @@ class ExpeditionVoiceService:
                     )
                     if valid:
                         self._index(model.expedition_id, voice.id)
-                        if not voice.members and await self.schedule_cleanup(voice.id, reason="restart"):
+                        if (
+                            not self._room_is_occupied(voice)
+                            and await self.schedule_cleanup(voice.id, reason="restart")
+                        ):
                             scheduled += 1
                     else:
                         invalid += 1
@@ -688,7 +739,7 @@ class ExpeditionVoiceService:
                 await self._audit_event("Sala órfã encontrada", None, voice.id, level=logging.WARNING)
                 self._expedition_by_voice[voice.id] = match.group(1)
                 self._voice_by_expedition[match.group(1)] = voice.id
-                if schedule_orphans and not voice.members:
+                if schedule_orphans and not self._room_is_occupied(voice):
                     if await self.schedule_cleanup(voice.id, reason="sala órfã"):
                         scheduled += 1
         self.degraded = invalid > 0

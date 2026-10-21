@@ -222,3 +222,10 @@ eles fazem parte do contrato persistente com mensagens existentes.
 ## Changelog
 
 Consulte [CHANGELOG.md](CHANGELOG.md) para o histórico de alterações.
+
+## Jarvis Voice opcional
+
+O novo bot Jarvis fica isolado em [`jarvis/`](jarvis/README.md), com token próprio
+e worker Node separado do Elysium. Consulte o guia de configuração e o
+[estado dos gates de aceitação](jarvis/IMPLEMENTATION_STATUS.md). Voz real e deploy
+ainda exigem validação; não são comprovados pelos testes locais.

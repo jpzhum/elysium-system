@@ -42,3 +42,43 @@ services:
         sync: false
       - key: EXPEDICOES_CHANNEL_ID
         sync: false
+
+  # Preparação somente. Criar/sincronizar este worker é uma ação paga no Render.
+  # Validar os gates de voz e obter autorização antes de criar o serviço.
+  - type: worker
+    name: jarvis-voice
+    runtime: node
+    rootDir: jarvis
+    numInstances: 1
+    autoDeployTrigger: "off"
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_VERSION
+        value: 24.19.0
+      - key: JARVIS_DISCORD_TOKEN
+        sync: false
+      - key: JARVIS_OWNER_USER_ID
+        sync: false
+      - key: JARVIS_GUILD_ID
+        sync: false
+      - key: ELEVENLABS_AGENT_ID
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: JARVIS_VOICE_INPUT
+        value: disabled
+      - key: JARVIS_WAKE_WORD
+        value: Jarvis
+      - key: JARVIS_FOLLOWUP_SECONDS
+        value: 18
+      - key: JARVIS_MAX_ACTIVE_SESSIONS
+        value: 2
+      - key: JARVIS_MAX_AUDIO_SECONDS_PER_TURN
+        value: 12
+      - key: JARVIS_MAX_TURNS_PER_HOUR
+        value: 120
+      - key: JARVIS_MAX_WAKE_CHECKS_PER_MINUTE
+        value: 6
+      - key: JARVIS_LOG_LEVEL
+        value: info

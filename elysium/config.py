@@ -116,6 +116,7 @@ class ElysiumConfig:
     expedition_voice_category_id: int | None = None
     temp_voice_empty_timeout_seconds: int = 600
     temp_voice_bitrate_kbps: int = 384
+    jarvis_bot_user_id: int | None = None
 
     @classmethod
     def from_env(
@@ -155,4 +156,5 @@ class ElysiumConfig:
             temp_voice_bitrate_kbps=_bounded_int(
                 source, "TEMP_VOICE_BITRATE_KBPS", 384, 8, 384
             ),
+            jarvis_bot_user_id=_snowflake(source, "JARVIS_BOT_USER_ID", required=False),
         )

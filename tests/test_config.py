@@ -15,6 +15,31 @@ BASE_ENVIRONMENT = {
 
 
 class ConfigTests(unittest.TestCase):
+    def test_jarvis_bot_id_is_optional_and_accepts_a_snowflake(self) -> None:
+        for value in (None, "", "  "):
+            environment = dict(BASE_ENVIRONMENT)
+            if value is not None:
+                environment["JARVIS_BOT_USER_ID"] = value
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    ElysiumConfig.from_env(
+                        environment, load_dotenv_file=False
+                    ).jarvis_bot_user_id
+                )
+        configured = ElysiumConfig.from_env(
+            {**BASE_ENVIRONMENT, "JARVIS_BOT_USER_ID": " 100000000000000015 "},
+            load_dotenv_file=False,
+        )
+        self.assertEqual(configured.jarvis_bot_user_id, 100000000000000015)
+
+    def test_invalid_jarvis_bot_ids_are_rejected(self) -> None:
+        for value in ("invalid", "0", "-1", str(2**64)):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                ElysiumConfig.from_env(
+                    {**BASE_ENVIRONMENT, "JARVIS_BOT_USER_ID": value},
+                    load_dotenv_file=False,
+                )
+
     def test_voice_settings_and_defaults(self) -> None:
         config = ElysiumConfig.from_env(BASE_ENVIRONMENT, load_dotenv_file=False)
         self.assertIsNone(config.expedition_voice_category_id)
