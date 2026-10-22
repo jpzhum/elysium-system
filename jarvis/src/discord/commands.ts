@@ -13,9 +13,13 @@ export const jarvisCommand = new SlashCommandBuilder()
   .addSubcommand((c) => c.setName('cancel').setDescription('Cancelar suas perguntas na fila, sessão e resposta atual.'))
   .addSubcommand((c) => c.setName('ask').setDescription('Enviar pergunta escrita e receber resposta falada na chamada.')
     .addStringOption((o) => o.setName('texto').setDescription('Sua pergunta para Jarvis (enviada à ElevenLabs).')
-      .setRequired(true).setMaxLength(1800)));
+      .setRequired(true).setMaxLength(1800)))
+  .addSubcommandGroup(g => g.setName('context').setDescription('Gerenciar seu contexto recente temporário desta chamada.')
+    .addSubcommand(c => c.setName('status').setDescription('Ver quantidade e prazo do seu contexto curto, sem exibir conteúdo.'))
+    .addSubcommand(c => c.setName('clear').setDescription('Apagar seu contexto curto e cancelar suas perguntas em andamento.')));
 
-export function privacyNotice(voiceMode: string, smoke = false, followupSeconds = 18, bargeInEnabled = false): string {
+export function privacyNotice(voiceMode: string, smoke = false, followupSeconds = 18, bargeInEnabled = false,
+  shortMemorySeconds = 600): string {
   if (smoke) return 'Modo de diagnóstico DAVE: com /jarvis consent audio:true, seu áudio será decodificado '
     + 'somente em memória para medir duração e RMS. Não é enviado à ElevenLabs nem salvo. '
     + '/jarvis revoke interrompe imediatamente. Reiniciar, sair da chamada ou desconectar apaga o aceite.';
@@ -28,7 +32,9 @@ export function privacyNotice(voiceMode: string, smoke = false, followupSeconds 
           + 'trechos de até 4 s para reconhecer os comandos exatos “Jarvis, parar” ou “Jarvis, cancela”. '
           + 'Use fones para reduzir eco. A identidade vem do Discord, nunca do texto reconhecido. ' : '')
       : 'A captura de voz está desativada nesta configuração. Use /jarvis consent e /jarvis ask. ')
-    + 'O worker não salva áudio ou transcrições; a retenção no provedor depende das configurações da conta. '
+    + 'O worker não grava áudio nem transcrição integral da sala; a retenção na ElevenLabs depende da conta. '
+    + (shortMemorySeconds > 0 ? `Até 10 interações ativadas ficam em RAM por ${shortMemorySeconds} s, isoladas por conta; `
+      + '/jarvis context clear apaga as suas. ' : 'Contexto curto em RAM desativado. ')
     + 'A resposta é audível para quem está na chamada. /jarvis cancel cancela suas perguntas e resposta; '
     + 'Uma ferramenta pode informar ao agente nomes de exibição e presença na sala, sem autorizar captura de áudio de outras pessoas. '
     + '/jarvis revoke para captura/sessão/reprodução imediatamente. '

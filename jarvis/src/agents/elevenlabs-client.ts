@@ -16,14 +16,27 @@ export interface AgentResponseIdentity {
   responseId?: string;
 }
 
+/** Private, bounded content for the caller's consent-scoped RAM history, never diagnostics. */
+export interface AgentConversationText extends AgentResponseIdentity {
+  kind: 'user_final' | 'agent_final' | 'agent_correction';
+  text: string;
+  truncated: boolean;
+}
+
 export interface AgentCallbacks {
   /** Copy borrowed PCM before returning/resolving; it is erased after bounded acceptance. */
   onAudio(pcm: Buffer, eventId: number, info?: { responseId?: string }): void | Promise<void>;
   onResponseComplete(eventId?: number): void | Promise<void>;
   /** Content-free signals only. Never forward the provider's text to diagnostics. */
   onTextResponse?(identity?: AgentResponseIdentity): void;
-  /** A nonempty final ASR utterance was recognized; the transcript never leaves this adapter. */
+  /** Content-free recognition marker; tentative transcripts never trigger it. */
   onUserTranscript?(identity?: AgentResponseIdentity): void;
+  /**
+   * Opt-in private text, at most 4 KiB UTF-8 per event, in wire order with PCM.
+   * Final text is not proof of generation completion or audible delivery.
+   * Never send this payload to logs, errors, status, or another user's session.
+   */
+  onConversationText?(event: AgentConversationText): void;
   onToolActivity?(pending: number): void;
   onProtocolEvent?(event: 'audio' | 'agent_response' | 'agent_response_complete' | 'client_error'): void;
   onInterruption(): void;
@@ -79,6 +92,8 @@ const MAX_INGRESS_PCM_BYTES = 384 * 1024;
 const PAUSE_INGRESS_PCM_BYTES = 256 * 1024;
 const RESUME_INGRESS_PCM_BYTES = 128 * 1024;
 const MAX_INGRESS_EVENTS = 1024;
+const MAX_CONVERSATION_TEXT_BYTES = 4096;
+const MAX_INGRESS_TEXT_BYTES = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 const METADATA_TIMEOUT_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 90_000;
@@ -110,6 +125,18 @@ function boundedString(value: unknown, bytes: number): string {
     throw new AgentError('invalid_agent_event');
   }
   return value;
+}
+
+function conversationText(
+  kind: AgentConversationText['kind'], value: string, identity: AgentResponseIdentity,
+): AgentConversationText {
+  const encoded = Buffer.from(value, 'utf8');
+  let end = Math.min(encoded.length, MAX_CONVERSATION_TEXT_BYTES);
+  // The prefix must end before a multibyte code point rather than inserting a
+  // replacement character or retaining a view of the provider's full payload.
+  while (end > 0 && end < encoded.length && (encoded[end]! & 0xc0) === 0x80) end--;
+  return { kind, text: encoded.subarray(0, end).toString('utf8'),
+    truncated: end < encoded.length, ...identity };
 }
 
 function pcmRate(format: unknown): number {
@@ -282,6 +309,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       let draining = false;
       let pumping = false;
       let ingressBytes = 0;
+      let ingressTextBytes = 0;
       let paused = false;
       let inFlightPcm: Buffer | undefined;
       let deliveryEpoch = 0;
@@ -297,8 +325,9 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       const cancelTools = new Set<() => void>();
       type Delivery = { kind: 'audio'; pcm: Buffer; eventId: number; info?: { responseId?: string } }
         | { kind: 'complete'; eventId: number }
-        | { kind: 'text'; identity: AgentResponseIdentity }
-        | { kind: 'user_transcript'; identity: AgentResponseIdentity }
+        | { kind: 'text'; identity: AgentResponseIdentity; content?: AgentConversationText }
+        | { kind: 'user_transcript'; identity: AgentResponseIdentity; content?: AgentConversationText }
+        | { kind: 'correction'; content: AgentConversationText }
         | { kind: 'tool'; start(): void; cancel(): void };
       const deliveries: Delivery[] = [];
       const notify = (callback: () => void): void => { try { callback(); } catch { /* Do not expose callback data. */ } };
@@ -328,7 +357,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       const discardDeliveries = (preserveRecognition = false): void => {
         deliveryEpoch++;
         // An interruption invalidates agent output, not speech already recognized
-        // from the user. Keep only content-free ASR markers behind a slow write.
+        // from the user. Keep only final ASR markers behind a slow write.
         // Local cancellation/revocation always discards every delivery instead.
         const recognition = preserveRecognition
           ? deliveries.filter(item => item.kind === 'user_transcript') : [];
@@ -341,6 +370,8 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         deliveries.length = 0;
         deliveries.push(...recognition);
         ingressBytes = 0;
+        ingressTextBytes = recognition.reduce((total, item) =>
+          total + (item.kind === 'user_transcript' && item.content ? Buffer.byteLength(item.content.text) : 0), 0);
         resumeIngress();
       };
       const end = (code?: string, drainAudio = false): void => {
@@ -386,14 +417,21 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         while (deliveries.length > 0 && epoch === deliveryEpoch && !finalized) {
           const item = deliveries.shift()!;
           try {
+            if ('content' in item && item.content) ingressTextBytes -= Buffer.byteLength(item.content.text);
             if (item.kind === 'user_transcript') {
               // Preserve wire order with PCM so greeting audio queued before ASR
               // cannot be reclassified as an answer when a slow write resumes.
               options.callbacks.onUserTranscript?.(item.identity);
+              if (item.content && !finalized && epoch === deliveryEpoch) options.callbacks.onConversationText?.(item.content);
               continue;
             }
             if (item.kind === 'text') {
               options.callbacks.onTextResponse?.(item.identity);
+              if (item.content && !finalized && epoch === deliveryEpoch) options.callbacks.onConversationText?.(item.content);
+              continue;
+            }
+            if (item.kind === 'correction') {
+              options.callbacks.onConversationText?.(item.content);
               continue;
             }
             if (item.kind === 'tool') {
@@ -450,12 +488,15 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       };
       const enqueue = (item: Delivery): void => {
         const bytes = item.kind === 'audio' ? item.pcm.length : 0;
-        if (deliveries.length >= MAX_INGRESS_EVENTS || ingressBytes + bytes > MAX_INGRESS_PCM_BYTES) {
+        const textBytes = 'content' in item && item.content ? Buffer.byteLength(item.content.text) : 0;
+        if (deliveries.length >= MAX_INGRESS_EVENTS || ingressBytes + bytes > MAX_INGRESS_PCM_BYTES
+          || ingressTextBytes + textBytes > MAX_INGRESS_TEXT_BYTES) {
           if (item.kind === 'audio') item.pcm.fill(0);
           throw new AgentError('agent_audio_backpressure');
         }
         deliveries.push(item);
         ingressBytes += bytes;
+        ingressTextBytes += textBytes;
         if (!paused && ingressBytes >= PAUSE_INGRESS_PCM_BYTES && ws.pause) {
           paused = true;
           ws.pause();
@@ -676,9 +717,14 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
             case 'agent_response': {
               dispatch(() => options.callbacks.onProtocolEvent?.('agent_response'));
               if (closed) return;
+              if (!negotiated) throw new AgentError('invalid_agent_event');
               const response = record(event.agent_response_event);
               if (typeof response.agent_response !== 'string') throw new AgentError('invalid_agent_event');
-              if (response.agent_response.trim()) enqueue({ kind: 'text', identity: responseIdentity(response) });
+              if (response.agent_response.trim()) {
+                const identity = responseIdentity(response);
+                enqueue({ kind: 'text', identity, ...(options.callbacks.onConversationText
+                  ? { content: conversationText('agent_final', response.agent_response, identity) } : {}) });
+              }
               break;
             }
             case 'agent_chat_response_part': {
@@ -698,13 +744,25 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               // user_transcript is the finalized utterance in the ElevenAgents
               // protocol; tentative events must never unlock response playback.
               if (transcript.user_transcript.trim()) {
-                enqueue({ kind: 'user_transcript', identity: responseIdentity(transcript) });
+                const identity = responseIdentity(transcript);
+                enqueue({ kind: 'user_transcript', identity, ...(options.callbacks.onConversationText
+                  ? { content: conversationText('user_final', transcript.user_transcript, identity) } : {}) });
               }
               break;
             }
-            // Transcripts and response text are deliberately not retained or logged.
+            case 'agent_response_correction': {
+              if (!options.callbacks.onConversationText) break;
+              if (!negotiated) throw new AgentError('invalid_agent_event');
+              const correction = record(event.agent_response_correction_event);
+              if (typeof correction.corrected_agent_response !== 'string') throw new AgentError('invalid_agent_event');
+              // An empty correction is meaningful: the previously represented
+              // answer may have been fully interrupted. Never retain the original.
+              enqueue({ kind: 'correction', content: conversationText('agent_correction',
+                correction.corrected_agent_response, responseIdentity(correction)) });
+              break;
+            }
+            // Tentative, incremental and internal reasoning text never enters RAM history.
             case 'tentative_user_transcript':
-            case 'agent_response_correction':
             case 'agent_reasoning_response_part':
             case 'vad_score':
               break;

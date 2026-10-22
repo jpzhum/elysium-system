@@ -156,6 +156,9 @@ export interface DiagnosticFields {
   input_source_chunks?: number;
   input_silence_chunks?: number;
   upload_ms?: number;
+  context_injected?: boolean;
+  context_items?: number;
+  context_chars?: number;
 }
 
 const events = new Set([
@@ -175,6 +178,7 @@ const events = new Set([
   'jarvis_agent_user_turn_recognized', 'jarvis_agent_initial_output_discarded', 'jarvis_agent_response_observed',
   'jarvis_agent_session_ready',
   'jarvis_identity_injected', 'jarvis_tool_event', 'jarvis_search_result', 'jarvis_voice_participants_result',
+  'jarvis_short_context', 'jarvis_agent_turn_recovered',
 ]);
 
 export function newIncident(): string { return randomBytes(4).toString('hex').toUpperCase(); }
@@ -220,6 +224,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     'input_audio_finished', 'session_reused', 'speaker_verified', 'consent_current',
     'identity_injected', 'identity_is_creator', 'active_game_known', 'room_context_injected',
     'search_key_configured', 'wait_for_response', 'participants_available', 'participants_complete',
+    'context_injected',
   ]) {
     const value = diagnosticValue(fields, key);
     if (typeof value === 'boolean') result[key] = value;
@@ -228,7 +233,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['duration_ms', 0, 86_400_000], ['stage_duration_ms', 0, 86_400_000], ['timeout_ms', 0, 300_000],
     ['network_status', 0, 6], ['previous_network_status', 0, 6],
     ['websocket_close_code', 1_000, 4_999], ['disconnect_reason', 0, 4],
-    ['dave_protocol_version', 0, 65_535], ['diagnostics_version', 1, 6], ['pending_tools', 0, 128],
+    ['dave_protocol_version', 0, 65_535], ['diagnostics_version', 1, 7], ['pending_tools', 0, 128],
     ['audio_chunks', 0, 1_000_000], ['audio_bytes', 0, 128_000_000],
     ['queue_position', 0, 32], ['queue_depth', 0, 32],
     ['question_wait_ms', 0, 3_600_000], ['first_audio_ms', 0, 3_600_000], ['last_audio_ms', 0, 3_600_000],
@@ -238,6 +243,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['silence_tail_ms', 0, 2_000], ['input_sample_rate', 8_000, 48_000], ['output_sample_rate', 8_000, 48_000],
     ['input_source_chunks', 0, 10_000], ['input_silence_chunks', 0, 10_000], ['upload_ms', 0, 120_000],
     ['source_count', 0, 5],
+    ['context_items', 0, 10], ['context_chars', 0, 2400],
   ] as const) {
     const value = diagnosticValue(fields, key);
     if (integer(value, minimum, maximum)) result[key] = value;

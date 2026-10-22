@@ -27,7 +27,8 @@ O detector de wake analisa somente uma cópia limitada aos primeiros quatro
 segundos. Após ativação, o manager envia o turno PCM completo capturado para a
 mesma sessão do usuário, incluindo a pergunta após “Jarvis”. A conversão é de
 48 kHz estéreo para a taxa mono PCM negociada. O código envia frames de 20 ms com
-pacing e 0,8 s de silêncio final; não converte a transcrição do detector em uma
+pacing e pelo menos 0,8 s de silêncio digital final, descontando na V5.2 somente
+zeros exatos já existentes no PCM; não converte a transcrição do detector em uma
 pergunta escrita nem envia uma pergunta fixa.
 
 O receiver encerra após 600 ms de silêncio e usa RMS mínimo de 0,008; o teto é

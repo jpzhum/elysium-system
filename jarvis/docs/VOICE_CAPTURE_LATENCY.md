@@ -1,5 +1,13 @@
 # Captura, duplicação e latência — V5
 
+Atualização V5.2: o padding sintético descrito abaixo agora desconta somente
+amostras digitais exatamente zero já presentes no final do PCM convertido.
+Nenhuma amostra capturada é removida. A combinação termina com pelo menos 800 ms
+de zeros, arredondando o padding para cima em frames de 20 ms. Fala baixa e ruído
+não contam como silêncio digital. `silence_tail_ms` informa o padding real e
+`agent_input_silence_saved_ms` mede o padding evitado; isso não comprova ganho
+acústico no Render. Veja o [roteiro atual](V52_PRODUCTION_VALIDATION.md).
+
 Esta revisão protege a entrega de uma mesma captura; não comprova que a causa
 única das duplicações em produção fosse o Discord emitir segmentos sobrepostos.
 Os eventos existentes não continham identificadores de captura suficientes para

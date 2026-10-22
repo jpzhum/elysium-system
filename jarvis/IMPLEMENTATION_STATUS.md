@@ -1,5 +1,66 @@
 # Estado da implementação — 22/10/2026
 
+## Revisão V5.2: continuidade, turnos e personalidade
+
+Escopo confirmado pelo operador: priorizar V5.2 em RAM e deixar V6/PostgreSQL
+para o próximo ciclo. **Entrega técnica local preparada; aceitação em chamada
+real pendente.** Não houve push, deploy, publicação de prompt, serviço pago ou
+audição humana desta revisão.
+
+As métricas informadas mostram áudio reproduzido e ausência de conclusão. O código
+anterior reutilizava sessões somente após conclusão explícita; por isso sua
+recuperação abria outros sockets e contava `agent_turns_superseded`. A V5.2 separa
+essa recuperação em `agent_turns_recovered`, sem chamar geração incompleta de
+resposta concluída. A fila também pode recuperar após áudio válido drenado sem
+`agent_response`, evitando esperar o deadline de 45 s só pela ausência de texto.
+Isso demonstra um bloqueio local, sem provar a origem do evento ausente no provedor
+ou a causa de cada pico de produção.
+
+O novo `RecentConversation` retém até dez interações consentidas por canal,
+isoladas por Discord ID, canal, guild e versão do consentimento. Sessões novas
+recebem contexto por `contextual_update`, limitado a 2.400 caracteres/4.096 bytes.
+Respostas confirmadas e drenadas são distintas de `agent_text_observed`, texto
+final observado sem prova de entrega integral. Este último serve somente como
+referência do assunto, sem alegar que foi ouvido por completo. Falhas, correções
+e truncamentos não viram respostas recordadas. Nenhum conteúdo entra nos logs.
+
+TTL, revogação, saída, reset e `/jarvis context clear` limpam as entradas; o
+comando cancela também o turno/fila próprios para impedir repovoamento tardio.
+Sockets com contexto vencido são renovados antes da próxima pergunta, sem cortar
+uma reprodução ativa. `/jarvis context status` é privado e não mostra conteúdo.
+Uma confirmação de enfileiramento é permitida por turno; capturas distintas e
+perguntas intencionalmente repetidas continuam independentes.
+
+Upload mantém pacing e a fonte integral. Somente zeros digitais exatos já
+existentes no final do PCM descontam o padding de 800 ms; silêncio adicional é
+arredondado conservadoramente em frames de 20 ms. Ruído e voz baixa não contam
+como zeros. O ganho real em microfone/Render continua por medir. Métricas novas
+separam captura até playback, processamento após envio, sobreposição do upload
+com geração e preparação do contexto. Timeouts sem áudio ficam separados da
+recuperação por ausência de conclusão com áudio.
+
+O prompt V3 original permanece intacto. Há um complemento aditivo para revisar
+personalidade/contexto no ElevenLabs, sem override de prompt genérico nem nova
+tool/variável dinâmica fictícia. A configuração remota e as respostas ouvidas
+não foram certificadas pelos testes.
+
+| Verificação V5.2 local | Resultado |
+| --- | --- |
+| Build, typecheck e lint Node | Passaram |
+| Suíte Node | 30 arquivos; 507 testes passaram e 1 gate real skipped |
+| Integrações de continuidade | Adapter, manager e memória reais; transporte/player controlados, sem comprovar fala humana |
+| Suíte Python | 78 testes e 67 subtests passaram |
+| Compileall e imports do AGENTS.md | Passaram sem conectar ao Discord |
+| `git diff --check` | Passou |
+| Elysium Python / Blueprint / dependências | Sem alterações |
+| Variável opcional nova | `JARVIS_SHORT_MEMORY_TTL_SECONDS=600`; `0` desabilita, máximo 1800 |
+| Deploy / audição / personalidade remota / latência antes-depois | Pendentes de autorização e validação real |
+
+Guias: [operação e validação V5.2](docs/V52_PRODUCTION_VALIDATION.md),
+[complemento de personalidade](docs/V52_PERSONALITY.md) e
+[pesquisa do protocolo/SDK](docs/V52_PROTOCOL_RESEARCH.md).
+Os números das revisões anteriores abaixo são históricos.
+
 ## Revisão V5: identidade, participantes, captura, ferramentas e latência
 
 Entrega técnica local preparada. **A missão V5 permanece pendente de validação
@@ -178,11 +239,11 @@ pendente.** Especificação: `../JARVIS_ELEVENAGENTS_CODEX_FULL_ACCESS.md`.
 
 | Gate | Evidência e situação |
 | --- | --- |
-| A — build/lint/tipos/testes V5 | Passou localmente: 458 testes Node e gate real skipped; 78 testes Python e 67 subtests. |
+| A — build/lint/tipos/testes V5.2 | Passou localmente: 507 testes Node e gate real skipped; 78 testes Python e 67 subtests. |
 | B — saída Discord/DAVE | Conexão e resposta audível confirmadas pelo operador antes da V4; entrada de humanos, transições e reconexões ainda exigem matriz própria. |
 | C — ElevenAgents real | `/jarvis ask` audível confirmado pelo operador; origem da conclusão ausente permanece sem causa demonstrada. |
-| D — comportamento V5 em chamada | Pendente: duas contas, texto/voz, presença, busca real com fontes, cinco perguntas, revogação e latência comparada. |
-| E — Render V5 | Worker existente informado pelo operador; nenhuma implantação desta revisão executada pelo agente. |
+| D — comportamento V5.2 em chamada | Pendente: continuidade com sockets novos, pronomes, duas contas, resposta longa, pesquisa real, ausência de spam, personalidade e latência comparada. |
+| E — Render V5.2 | Worker existente informado pelo operador; deploy desta revisão não autorizado nem executado. |
 
 ## Gates na entrega inicial
 
@@ -263,11 +324,12 @@ e encerrar o processo anterior evita disputa durante implantação.
 
 ## Próximo ciclo operacional
 
-1. Enviar o commit V5 revisado à branch do worker existente e fazer deploy manual,
+1. Após autorização do operador, enviar o commit V5.2 revisado à branch do worker existente e fazer deploy manual,
    preservando uma instância e o Elysium Python. Conferir o SHA implantado.
-2. Auditar o agente publicado e executar o [gate V5](docs/V5_DEPLOY_VALIDATION.md):
-   duas contas por texto/voz, presença atual, pesquisa com fontes, cinco perguntas,
-   fila, revogação e latência antes/depois. Manter a matriz V4 de barge-in opcional.
+2. Auditar o agente publicado, revisar o complemento de personalidade e executar
+   o [gate V5.2](docs/V52_PRODUCTION_VALIDATION.md): continuidade, pronomes, duas
+   contas, resposta longa, expiração/limpeza, fila, pesquisa real e latência
+   comparada. Preservar a matriz V5 de identidade e V4 de barge-in opcional.
 3. Executar matriz [DAVE](docs/DAVE.md): humanos antes/depois, RMS por usuário,
    `/jarvis tone`, transições MLS e reconexões; registrar versões/repetições reais.
 4. Conferir o agente pelo [guia ElevenLabs](docs/ELEVENLABS.md), testar `/ask`,

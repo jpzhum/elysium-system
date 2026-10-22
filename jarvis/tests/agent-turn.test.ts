@@ -22,7 +22,7 @@ class Socket extends EventEmitter {
 const active: SessionManager[] = [];
 async function settle(): Promise<void> { for (let step = 0; step < 30; step++) await Promise.resolve(); }
 
-function setup(pendingPlayback = false, pace?: SessionOptions['pace']) {
+function setup(pendingPlayback = false, pace?: SessionOptions['pace'], options: Partial<SessionOptions> = {}) {
   const socket = new Socket();
   const metrics = new Metrics();
   const logs: Record<string, unknown>[] = [];
@@ -95,7 +95,7 @@ function setup(pendingPlayback = false, pace?: SessionOptions['pace']) {
     allowed: (context, audio) => consent.isCurrent(context.discordUserId, context.consentVersion, audio),
     detectWake, playback, maxSessions: 2, maxTurnSeconds: 12,
     maxSessionSeconds: 300, idleSeconds: 45, followupSeconds: 18, maxTurnsPerHour: 100,
-    metric: metrics.add, logger: new Logger('info', (line) => logs.push(JSON.parse(line))), pace,
+    metric: metrics.add, logger: new Logger('info', (line) => logs.push(JSON.parse(line))), pace, ...options,
   });
   active.push(manager);
   const audio = (id = 1, value = 1) => socket.event({ type: 'audio', audio_event: {
@@ -125,6 +125,51 @@ function setup(pendingPlayback = false, pace?: SessionOptions['pace']) {
 afterEach(() => {
   for (const manager of active.splice(0)) manager.close();
   vi.useRealTimers();
+});
+
+test('real final text enters RAM only after successful local playback and remains absent from diagnostics', async () => {
+  const onTurnDelivered = vi.fn();
+  const h = setup(true, undefined, { onTurnDelivered });
+  const receipt = await h.ask();
+  h.text(); h.audio(); h.complete(); await settle();
+  expect(onTurnDelivered).not.toHaveBeenCalled();
+  h.finishPlayback(); await settle();
+  expect(onTurnDelivered).toHaveBeenCalledExactlyOnceWith(h.speaker, {
+    turnId: receipt.turnId, inputKind: 'text', question: secret, response: secret, generation: 'confirmed',
+  });
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
+});
+
+test('real audio without completion preserves observed final text separately from a confirmed delivered answer', async () => {
+  vi.useFakeTimers();
+  const onTurnDelivered = vi.fn();
+  const h = setup(false, undefined, { onTurnDelivered });
+  const receipt = await h.ask();
+  h.text(); h.audio(); await settle();
+  await vi.advanceTimersByTimeAsync(45_001); await settle();
+  expect(onTurnDelivered).toHaveBeenCalledExactlyOnceWith(h.speaker, {
+    turnId: receipt.turnId, inputKind: 'text', question: secret, observedResponse: secret, generation: 'unconfirmed',
+  });
+  expect(onTurnDelivered.mock.calls[0]![1]).not.toHaveProperty('response');
+  expect(h.metrics.snapshot().agent_turns_completed ?? 0).toBe(0);
+});
+
+test('wire final ASR, rather than a tentative transcript or startup greeting, is the remembered voice question', async () => {
+  const onTurnDelivered = vi.fn();
+  const h = setup(false, async () => undefined, { onTurnDelivered }); h.detectWake.mockResolvedValue(true);
+  const receipt = await h.manager.voiceTurn(h.speaker, Buffer.alloc(480)); await settle();
+  h.text(); h.audio();
+  h.socket.event({ type: 'tentative_user_transcript', user_transcription_event: { user_transcript: 'tentative-private' } });
+  await settle();
+  h.socket.event({ type: 'user_transcript', user_transcription_event: { user_transcript: 'Jarvis, onde encontro a arma?', event_id: 10 } });
+  h.socket.event({ type: 'agent_response', agent_response_event: { agent_response: 'Na torre.', event_id: 11 } });
+  h.audio(11); h.complete(11); await settle();
+  expect(onTurnDelivered).toHaveBeenCalledExactlyOnceWith(h.speaker, {
+    turnId: receipt!.turnId, inputKind: 'voice', question: 'Jarvis, onde encontro a arma?', response: 'Na torre.', generation: 'confirmed',
+  });
+  expect(JSON.stringify(h.logs)).not.toContain('arma');
+  expect(JSON.stringify(h.logs)).not.toContain('torre');
+  expect(JSON.stringify(h.logs)).not.toContain('tentative-private');
 });
 
 test('documented audio starts before completion and repeated event IDs preserve all PCM in arrival order', async () => {
@@ -185,10 +230,11 @@ test('missing completion recovers after inactivity, drains valid audio and never
   expect(h.streams[0]!.ended).toBe(false);
   await vi.advanceTimersByTimeAsync(1_001); await settle();
   expect(h.metrics.snapshot()).toMatchObject({ audio_chunks_received: 1, audio_bytes_received: 4,
-    agent_response_timeouts: 1, agent_completion_missing: 1, turn_completion_missing: 1,
+    agent_completion_recovery_timeouts: 1, agent_completion_missing: 1, turn_completion_missing: 1,
     playback_started: 1, playback_completed: 1 });
   expect(h.metrics.snapshot().agent_turns_completed ?? 0).toBe(0);
   expect(h.metrics.snapshot().agent_errors ?? 0).toBe(0);
+  expect(h.metrics.snapshot().agent_response_timeouts ?? 0).toBe(0);
   expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
   expect(h.logs.find(line => line.event === 'jarvis_agent_turn_recovering')).toMatchObject({
     code: 'AGENT_COMPLETION_MISSING', audio_bytes: 4, completion_received: false,

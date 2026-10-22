@@ -53,6 +53,7 @@ describe('bounded structured operational logging', () => {
       source_count: secret, tool_name: secret, tool_stage: secret, wait_for_response: secret,
       participants_available: secret, participants_complete: secret, input_source_chunks: secret,
       input_silence_chunks: secret, upload_ms: secret,
+      context_injected: secret, context_items: secret, context_chars: secret,
       voice_status: secret, previous_voice_status: secret, network_status: secret,
       duration_ms: secret, stage_duration_ms: secret, timeout_ms: secret, disconnect_reason: secret,
       websocket_close_code: secret, dave_protocol_version: secret, diagnostics_version: secret,
@@ -106,7 +107,7 @@ describe('bounded structured operational logging', () => {
     state.logger.event('jarvis_ready', 'info', {
       duration_ms: NaN, stage_duration_ms: -1, timeout_ms: Infinity, network_status: -1, previous_network_status: 7,
       websocket_close_code: 5_000, disconnect_reason: 1.5, dave_protocol_version: 65_536,
-      diagnostics_version: 7, pending_tools: 129,
+      diagnostics_version: 8, pending_tools: 129, context_items: 11, context_chars: 2401,
     });
     expect(Object.keys(state.records()[0]!)).toEqual(['time', 'level', 'event', 'incident']);
   });

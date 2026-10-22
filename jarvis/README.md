@@ -16,6 +16,9 @@ Para identidade por turno, participantes atuais, pesquisa Brave e duplicações 
 captura, siga o [deploy e gate real V5](docs/V5_DEPLOY_VALIDATION.md). Essa revisão
 adiciona `/status` com etapas completas e `npm run audit:agent` para conferir o
 contrato publicado sem imprimir dados privados; aceitação em call permanece pendente.
+Para continuidade entre sessões, contexto curto, recuperação de turnos e revisão
+da personalidade, siga o [roteiro V5.2](docs/V52_PRODUCTION_VALIDATION.md). A V6 de
+PostgreSQL fica para o próximo ciclo, conforme a decisão do operador.
 
 ## Começar localmente
 
@@ -92,6 +95,8 @@ um tom sintético de 1 s para separar playback Discord da resposta ElevenLabs.
 | `/jarvis revoke` | Qualquer usuário: cancela sua captura, sessão e resposta |
 | `/jarvis cancel` | Participante: cancela suas perguntas na fila, sessão e resposta; mantém seu consentimento |
 | `/jarvis ask texto:...` | Participante consentido na mesma sala: pergunta escrita |
+| `/jarvis context status` | Estado e quantidade do seu contexto curto, em resposta privada |
+| `/jarvis context clear` | Apaga somente seu contexto curto e cancela suas perguntas atuais; mantém o consentimento |
 
 Participantes não precisam de autorização individual para perguntas. Administração
 é aplicada pelo backend comparando IDs; nomes e pedidos falados não concedem
@@ -172,13 +177,20 @@ com conversão contínua, buffers limitados e backpressure. Não é preciso espe
 
 Conclusão da geração, fim do recebimento e fim da reprodução são estados distintos.
 Se a conclusão faltar e houver outra pergunta esperando, a aplicação pode retirar
-a sessão anterior quando recebeu a mensagem textual, a saída local drenou e não
-há ferramenta conhecida pendente. Fecha o transporte antigo, drena o áudio aceito
+a sessão anterior quando recebeu áudio válido, o upload terminou, a fala foi
+reconhecida e a saída local drenou, sem ferramenta ou write pendente. Fecha o transporte antigo, drena o áudio aceito
 antes do corte e só então inicia a próxima pergunta em sessão isolada. Registra
-substituição sem conclusão confirmada; não declara o turno completo por silêncio.
-Isso pode abandonar geração futura não sinalizada e não preserva automaticamente
-o contexto ElevenAgents entre sessões. Não existe memória compartilhada ou
-reconstrução local de transcrições.
+recuperação em `agent_turns_recovered`, sem contar uma substituição de pergunta
+ou declarar geração concluída por silêncio. Isso pode abandonar geração futura
+não sinalizada; os pacotes aceitos continuam drenados.
+
+A V5.2 mantém até dez interações consentidas em RAM por sala, vinculadas ao Discord
+ID e consentimento. Sessões novas recebem somente contexto do próprio falante,
+com prazo e orçamento limitados. Respostas só entram como completas após conclusão
+explícita e playback terminado. Na recuperação sem confirmação, pergunta e texto
+observado do agente ficam rotulados separadamente, sem afirmar entrega integral.
+Revogação, saída, limpeza, expiração e restart removem referências.
+Não há memória compartilhada entre contas nem transcrição contínua da sala.
 
 Sem nova pergunta, 45 s sem progresso e sem ferramenta pendente disparam a
 recuperação existente, com áudio válido drenado e resultado não confirmado, sem
@@ -207,6 +219,7 @@ análise de licença. Não há latência inferior a dois segundos comprovada.
 | `JARVIS_MAX_AUDIO_SECONDS_PER_TURN` | 12 s por turno recebido |
 | `JARVIS_MAX_SESSION_SECONDS` | 300 s por sessão |
 | `JARVIS_SESSION_IDLE_SECONDS` | 45 s após resposta |
+| `JARVIS_SHORT_MEMORY_TTL_SECONDS` | 600 s de contexto em RAM; `0` desabilita, máximo 1800 |
 | `JARVIS_FOLLOWUP_SECONDS` | 18 s após playback |
 | `JARVIS_MAX_TURNS_PER_HOUR` | 120 tentativas por sessão de sala |
 | `JARVIS_MAX_WAKE_CHECKS_PER_MINUTE` | 6 verificações externas por worker |
@@ -218,7 +231,7 @@ também consomem tentativa. O criador desconectar/reconectar recria a sessão da
 Esses contadores não substituem um teto de crédito da ElevenLabs/Brave. A fila de
 playback admite quatro respostas, com até 120 s de PCM e 384 KiB pendentes por
 resposta; o prazo absoluto de 180 s inclui espera na fila e pausas. O adapter tem
-outros 384 KiB de PCM pendente por sessão. Limites absolutos cancelam o fluxo e
+outros 384 KiB de PCM e até 64 KiB de texto final pendente por sessão. Limites absolutos cancelam o fluxo e
 não significam conclusão. Há backpressure e encerramento de sessões ociosas.
 
 Não há banco nem arquivos de voz/transcrições. Consentimentos e contexto são
@@ -226,6 +239,9 @@ apenas em memória. `JARVIS_CONSENT_STORAGE_URL` é rejeitada enquanto não exis
 implementação durável. A retenção no provedor depende da conta: reveja Audio
 Saving/Data Retention e STT; ausência de gravação local não garante retenção zero
 na ElevenLabs. Revogar impede novos envios, mas não recolhe áudio já enviado.
+Contexto curto expira sem cortar uma resposta ativa; antes de uma pergunta nova,
+o backend renova sockets cujo contexto já venceu. Limpar a RAM não apaga o
+histórico remoto do provedor. Veja o [contrato V5.2](docs/V52_PRODUCTION_VALIDATION.md).
 
 Logs mostram só eventos técnicos, horário e incidentes de oito hexadecimais
 maiúsculos. As etapas medem fila, abertura/reutilização, primeiro áudio, início e

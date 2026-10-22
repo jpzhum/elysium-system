@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { SessionManager, type Playback, type SessionOptions } from '../src/agents/session-manager.js';
 import type { AgentCallbacks, AgentSession } from '../src/agents/elevenlabs-client.js';
+import { convertPcm } from '../src/audio/pcm-conversion.js';
 import { ConsentStore } from '../src/policy/consent.js';
 import { speakerContext } from '../src/policy/identity.js';
 
 const managers: SessionManager[] = [];
 async function settle(): Promise<void> { for (let i = 0; i < 240; i++) await Promise.resolve(); }
 
-function harness(overrides: Partial<SessionOptions> = {}) {
+function harness(overrides: Partial<SessionOptions> = {}, inputSampleRate = 16000) {
   const consent = new ConsentStore();
   const callbacks = new Map<string, AgentCallbacks>();
   const sessions = new Map<string, AgentSession>();
@@ -47,7 +48,7 @@ function harness(overrides: Partial<SessionOptions> = {}) {
     callbacks.set(speaker.discordUserId, cb);
     const copies: Buffer[] = [];
     uploaded.set(speaker.discordUserId, copies);
-    const session: AgentSession = { inputSampleRate: 16000, outputSampleRate: 24000,
+    const session: AgentSession = { inputSampleRate, outputSampleRate: 24000,
       sendText: vi.fn(), sendAudio: vi.fn(pcm => { copies.push(Buffer.from(pcm)); }),
       sendContext: vi.fn(), close: vi.fn(() => cb.onClose()) };
     sessions.set(speaker.discordUserId, session);
@@ -77,7 +78,7 @@ function harness(overrides: Partial<SessionOptions> = {}) {
   return { manager, consent, speaker, callbacks, sessions, playback, streams, connect, finish, ask, notify, metric, uploaded };
 }
 
-afterEach(() => { for (const manager of managers.splice(0)) manager.close(); vi.useRealTimers(); });
+afterEach(() => { for (const manager of managers.splice(0)) manager.close(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('bounded conversational scheduling', () => {
   test('client tools are authorized only for the currently active speaker and consent/channel generation', async () => {
@@ -213,6 +214,37 @@ describe('bounded conversational scheduling', () => {
     expect(Buffer.concat(h.uploaded.get('guest')!).length).toBe(80 + 25_600);
   });
 
+  test.each([16000, 24000])('exact trailing digital silence avoids redundant padding at %i Hz without changing any source sample', async rate => {
+    const cases = [
+      { name: 'all silence below target', durationMs: 100, amplitude: 0, paddingMs: 700 },
+      { name: 'all silence above target', durationMs: 1000, amplitude: 0, paddingMs: 0 },
+      { name: 'nonzero source', durationMs: 100, amplitude: 1200, paddingMs: 800 },
+      { name: 'near-zero is still speech data', durationMs: 100, amplitude: 1, paddingMs: 800 },
+      { name: 'partial input frame rounds padding upward', durationMs: 25, amplitude: 0, paddingMs: 780 },
+    ];
+    for (const sample of cases) {
+      const h = harness({ pace: async () => undefined }, rate);
+      const source = Buffer.alloc(sample.durationMs * 48 * 4);
+      for (let offset = 0; offset < source.length; offset += 2) source.writeInt16LE(sample.amplitude, offset);
+      const original = Buffer.from(source);
+      const converted = convertPcm(source, 48_000, 2, rate, 1);
+      await h.manager.voiceTurn(h.speaker('guest'), source); await settle();
+      const uploaded = Buffer.concat(h.uploaded.get('guest')!);
+      expect(source.equals(original), sample.name).toBe(true);
+      expect(uploaded.subarray(0, converted.length).equals(converted), sample.name).toBe(true);
+      const padding = uploaded.subarray(converted.length);
+      expect(padding.length, sample.name).toBe(sample.paddingMs * rate * 2 / 1000);
+      expect(padding.every(byte => byte === 0), sample.name).toBe(true);
+      let trailingZeroSamples = 0;
+      for (let offset = uploaded.length - 2; offset >= 0 && uploaded.readInt16LE(offset) === 0; offset -= 2) trailingZeroSamples++;
+      expect(trailingZeroSamples, sample.name).toBeGreaterThanOrEqual(rate * 0.8);
+      expect(h.metric).toHaveBeenCalledWith('agent_input_source_chunks', Math.ceil(converted.length / (rate / 50 * 2)));
+      expect(h.metric).toHaveBeenCalledWith('agent_input_silence_chunks', sample.paddingMs / 20);
+      expect(h.metric).toHaveBeenCalledWith('agent_input_silence_saved_ms', 800 - sample.paddingMs);
+      h.manager.close();
+    }
+  });
+
   test('trusted context refresh runs for text and voice and retains current display identity on reuse', async () => {
     const prepareSession = vi.fn();
     const h = harness({ prepareSession, pace: async () => undefined });
@@ -254,7 +286,8 @@ describe('bounded conversational scheduling', () => {
       old.onResponseComplete(999);
       expect(h.streams).toHaveLength(before);
     }
-    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_turns_superseded')).toHaveLength(4);
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_turns_recovered')).toHaveLength(4);
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_turns_superseded')).toHaveLength(0);
     expect(h.metric.mock.calls.filter(([name]) => name === 'agent_turns_completed')).toHaveLength(0);
     expect(h.sessions.get('guest')!.sendText).toHaveBeenCalledWith('Próxima 3');
     expect(h.manager.queueStatus).toEqual({ waiting: 0, active: true });
@@ -272,20 +305,62 @@ describe('bounded conversational scheduling', () => {
     expect(h.manager.queueStatus.active).toBe(true);
   });
 
-  test('queue requires local drain and text, and new audio invalidates an earlier drain', async () => {
+  test('queue requires a current local drain and no pending tools; new audio invalidates an earlier drain', async () => {
     const h = harness();
     await h.ask('guest');
     const cb = h.callbacks.get('guest')!;
+    cb.onToolActivity?.(1);
     await cb.onAudio(Buffer.alloc(480), 1);
     h.streams[0]!.progress('drained');
     await h.ask('owner');
     expect(h.connect).toHaveBeenCalledOnce();
     await cb.onAudio(Buffer.alloc(480), 2);
-    cb.onTextResponse?.();
+    cb.onToolActivity?.(0);
     expect(h.sessions.get('guest')!.close).not.toHaveBeenCalled();
     h.streams[0]!.progress('drained'); await settle();
     expect(h.connect).toHaveBeenCalledTimes(2);
     expect(h.sessions.get('guest')!.close).toHaveBeenCalledWith({ drainAudio: true });
+  });
+
+  test('valid audio without text or completion can recover for a new question after real local drain', async () => {
+    const onTurnDelivered = vi.fn();
+    const h = harness({ onTurnDelivered });
+    const first = await h.ask('guest', 'Pergunta audível');
+    const old = h.callbacks.get('guest')!;
+    await old.onAudio(Buffer.alloc(480), 1);
+    await h.ask('owner');
+    expect(h.connect).toHaveBeenCalledOnce();
+    h.streams[0]!.progress('drained'); await settle();
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(onTurnDelivered).toHaveBeenCalledExactlyOnceWith(h.speaker('guest'), {
+      turnId: first.turnId, inputKind: 'text', question: 'Pergunta audível', generation: 'unconfirmed',
+    });
+    expect(h.metric).toHaveBeenCalledWith('agent_turns_recovered');
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_response_timeouts' || name === 'agent_errors')).toHaveLength(0);
+    const before = h.streams.length;
+    await old.onAudio(Buffer.alloc(480, 99), 2);
+    expect(h.streams).toHaveLength(before);
+  });
+
+  test('a new question never cuts a long response and gets just one queue notification with its own ID', async () => {
+    const h = harness();
+    await h.ask('guest');
+    const cb = h.callbacks.get('guest')!;
+    cb.onTextResponse?.({ responseId: 'long-response' });
+    await cb.onAudio(Buffer.alloc(480, 1), 1);
+    const queued = await h.ask('owner');
+    await cb.onAudio(Buffer.alloc(480, 2), 2);
+    await cb.onAudio(Buffer.alloc(480, 3), 3);
+    expect(h.streams[0]!.cancel).not.toHaveBeenCalled();
+    expect(h.sessions.get('guest')!.close).not.toHaveBeenCalled();
+    expect(h.streams[0]!.chunks.map(chunk => chunk[0])).toEqual([1, 2, 3]);
+    expect(h.notify.mock.calls.filter(([, event]) => event.type === 'queued')).toEqual([
+      [h.speaker('owner'), { type: 'queued', turnId: queued.turnId, position: 1 }],
+    ]);
+    h.streams[0]!.progress('drained'); await settle();
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(h.metric).toHaveBeenCalledWith('agent_turns_recovered');
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_turns_completed')).toHaveLength(0);
   });
 
   test('owners move before queued guests while the active guest finishes normally', async () => {
@@ -612,5 +687,190 @@ describe('speaker authorization and cancellation', () => {
     expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
     await expect(h.ask('other')).rejects.toMatchObject({ code: 'closed' });
     expect(h.notify.mock.calls.filter(([, event]) => event.type === 'cancelled')).toHaveLength(2);
+  });
+});
+
+describe('RAM-only delivered conversation handoff', () => {
+  test('context expiry retires idle provider history before reuse without disturbing the active playback', async () => {
+    let now = 1_000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const h = harness({ sessionContextExpiresAt: () => now + 5_000 });
+    await h.ask('guest'); await h.finish('guest');
+    now = 5_999;
+    await h.ask('guest', 'Antes de expirar');
+    expect(h.connect).toHaveBeenCalledOnce();
+    const stale = h.callbacks.get('guest')!;
+    await stale.onAudio(Buffer.alloc(480, 1), 2);
+    now = 6_001;
+    expect(h.sessions.get('guest')!.close).not.toHaveBeenCalled();
+    const queued = await h.ask('guest', 'Depois de expirar');
+    expect(queued.queued).toBe(true);
+    expect(h.sessions.get('guest')!.close).not.toHaveBeenCalled();
+    stale.onResponseComplete(2); await settle();
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(h.metric).toHaveBeenCalledWith('agent_context_expired_sessions');
+    expect(h.sessions.get('guest')!.sendText).toHaveBeenCalledExactlyOnceWith('Depois de expirar');
+    const before = h.streams.length;
+    await stale.onAudio(Buffer.alloc(480, 99), 99);
+    expect(h.streams).toHaveLength(before);
+  });
+
+  test('remote and end-to-end timings include their actual stages rather than zeroing overlapped work', async () => {
+    let now = 1_000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const h = harness({ detectWake: async () => { now = 1_500; return true; }, pace: async () => { now += 20; } });
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+      captureMs: 700, endDetectionMs: 600, captureStartedAtMs: 100, captureEndedAtMs: 800,
+    }); await settle();
+    now = 4_000;
+    const cb = h.callbacks.get('guest')!;
+    cb.onUserTranscript?.({ eventId: 10 });
+    await cb.onAudio(Buffer.alloc(480), 11);
+    expect(h.metric).toHaveBeenCalledWith('agent_audio_upload_ms', 820);
+    expect(h.metric).toHaveBeenCalledWith('agent_remote_first_audio_ms', 1_680);
+    expect(h.metric).toHaveBeenCalledWith('agent_end_to_end_first_playback_ms', 3_900);
+    expect(h.metric).toHaveBeenCalledWith('agent_first_playback_ms', 2_500);
+  });
+
+  test('audio generated during a voice upload reports overlap without fabricating a remote zero-duration sample', async () => {
+    let first = true;
+    const h = harness({ pace: async () => {
+      if (first) {
+        first = false;
+        const cb = h.callbacks.get('guest')!;
+        cb.onUserTranscript?.({ eventId: 10 });
+        await cb.onAudio(Buffer.alloc(480), 11);
+      }
+    } });
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+    expect(h.metric).toHaveBeenCalledWith('agent_audio_before_input_finished');
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_remote_first_audio_ms')).toHaveLength(0);
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_end_to_end_first_playback_ms')).toHaveLength(0);
+  });
+
+  test('unconfirmed drained output preserves real final text as observed without treating it as a complete answer', async () => {
+    const onTurnDelivered = vi.fn();
+    const h = harness({ onTurnDelivered });
+    const receipt = await h.ask('guest', 'Onde encontro a arma?');
+    const cb = h.callbacks.get('guest')!;
+    cb.onTextResponse?.({ responseId: 'response' });
+    cb.onConversationText?.({ kind: 'agent_final', text: 'Fica na torre.', truncated: false, responseId: 'response' });
+    await cb.onAudio(Buffer.alloc(480), 1, { responseId: 'response' });
+    await h.ask('owner');
+    expect(onTurnDelivered).not.toHaveBeenCalled();
+    h.streams[0]!.progress('drained'); await settle();
+    expect(onTurnDelivered).toHaveBeenCalledExactlyOnceWith(h.speaker('guest'), {
+      turnId: receipt.turnId, inputKind: 'text', question: 'Onde encontro a arma?',
+      observedResponse: 'Fica na torre.', generation: 'unconfirmed',
+    });
+    expect(onTurnDelivered.mock.calls[0]![1]).not.toHaveProperty('response');
+    expect(h.sessions.get('owner')!.sendText).toHaveBeenCalled();
+  });
+
+  test.each(['intact', 'corrected', 'truncated'] as const)('already validated final text delivered during graceful recovery is retained only when %s', async state => {
+    let providerCallbacks!: AgentCallbacks;
+    const session: AgentSession = { inputSampleRate: 16000, outputSampleRate: 24000,
+      sendText: vi.fn(), sendAudio: vi.fn(), sendContext: vi.fn(), close: vi.fn() };
+    const onTurnDelivered = vi.fn();
+    const h = harness({ onTurnDelivered, connect: async (_speaker, cb) => { providerCallbacks = cb; return session; } });
+    const receipt = await h.ask('guest', 'Qual é a melhor arma?');
+    const old = providerCallbacks;
+    await old.onAudio(Buffer.alloc(480), 1);
+    h.streams[0]!.progress('drained');
+    await h.ask('owner');
+    expect(session.close).toHaveBeenCalledWith({ drainAudio: true });
+    expect(onTurnDelivered).not.toHaveBeenCalled();
+    old.onTextResponse?.({ responseId: 'message' });
+    old.onConversationText?.({ kind: 'agent_final', text: 'A espada da torre.', truncated: state === 'truncated', responseId: 'message' });
+    if (state === 'corrected') old.onConversationText?.({ kind: 'agent_correction', text: 'A lança.', truncated: false, responseId: 'message' });
+    old.onClose(); await settle();
+    expect(onTurnDelivered).toHaveBeenCalledExactlyOnceWith(h.speaker('guest'), {
+      turnId: receipt.turnId, inputKind: 'text', question: 'Qual é a melhor arma?', generation: 'unconfirmed',
+      ...(state === 'intact' ? { observedResponse: 'A espada da torre.' } : {}),
+    });
+    expect(onTurnDelivered.mock.calls[0]![1]).not.toHaveProperty('response');
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_turns_completed')).toHaveLength(0);
+  });
+
+  test('recognized consecutive voice questions keep their own content on a safely reused socket', async () => {
+    const onTurnDelivered = vi.fn();
+    const h = harness({ onTurnDelivered, pace: async () => undefined });
+    const questions = ['Jarvis, onde encontro a arma?', 'Onde encontro ela?'];
+    for (let index = 0; index < questions.length; index++) {
+      const receipt = await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+      const cb = h.callbacks.get('guest')!;
+      cb.onUserTranscript?.({ eventId: 100 + index });
+      cb.onConversationText?.({ kind: 'user_final', text: questions[index]!, truncated: false, eventId: 100 + index });
+      cb.onTextResponse?.({ responseId: `response-${index}` });
+      cb.onConversationText?.({ kind: 'agent_final', text: `Resposta ${index}`, truncated: false, responseId: `response-${index}` });
+      await cb.onAudio(Buffer.alloc(480), index, { responseId: `response-${index}` });
+      cb.onResponseComplete(index); await settle();
+      expect(onTurnDelivered).toHaveBeenLastCalledWith(h.speaker('guest'), {
+        turnId: receipt!.turnId, inputKind: 'voice', question: questions[index], response: `Resposta ${index}`, generation: 'confirmed',
+      });
+    }
+    expect(onTurnDelivered).toHaveBeenCalledTimes(2);
+    expect(h.connect).toHaveBeenCalledOnce();
+  });
+
+  test.each([true, false])('stale and duplicate ASR final text cannot contaminate a reused turn, with identities=%s', async identified => {
+    const onTurnDelivered = vi.fn();
+    const h = harness({ onTurnDelivered, pace: async () => undefined });
+    const priorIdentity = identified ? { eventId: 10 } : undefined;
+    const currentIdentity = identified ? { eventId: 20 } : undefined;
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+    const cb = h.callbacks.get('guest')!;
+    cb.onUserTranscript?.(priorIdentity);
+    cb.onConversationText?.({ kind: 'user_final', text: 'Primeira pergunta', truncated: false, ...priorIdentity });
+    await h.finish('guest');
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+    cb.onUserTranscript?.(currentIdentity);
+    cb.onConversationText?.({ kind: 'user_final', text: 'Pergunta atual', truncated: false, ...currentIdentity });
+    cb.onUserTranscript?.(priorIdentity);
+    cb.onConversationText?.({ kind: 'user_final', text: 'TEXTO ANTIGO', truncated: false, ...priorIdentity });
+    cb.onUserTranscript?.(currentIdentity);
+    cb.onConversationText?.({ kind: 'user_final', text: 'Pergunta atual', truncated: false, ...currentIdentity });
+    await h.finish('guest');
+    expect(onTurnDelivered).toHaveBeenCalledTimes(2);
+    expect(onTurnDelivered).toHaveBeenLastCalledWith(h.speaker('guest'), expect.objectContaining({
+      inputKind: 'voice', question: 'Pergunta atual', generation: 'confirmed',
+    }));
+    expect(JSON.stringify(onTurnDelivered.mock.calls)).not.toContain('TEXTO ANTIGO');
+    expect(h.connect).toHaveBeenCalledOnce();
+  });
+
+  test.each(['agent_correction', 'truncated_agent'] as const)('%s omits uncertain output text even after explicit generation and playback completion', async kind => {
+    const onTurnDelivered = vi.fn();
+    const h = harness({ onTurnDelivered });
+    await h.ask('guest', 'Pergunta real');
+    const cb = h.callbacks.get('guest')!;
+    cb.onTextResponse?.({ responseId: 'response' });
+    cb.onConversationText?.({ kind: 'agent_final', text: 'Resposta inicial', truncated: kind === 'truncated_agent', responseId: 'response' });
+    if (kind === 'agent_correction') cb.onConversationText?.({ kind, text: 'Substituição', truncated: false, responseId: 'response' });
+    await h.finish('guest');
+    expect(onTurnDelivered).toHaveBeenCalledWith(h.speaker('guest'), expect.objectContaining({ question: 'Pergunta real', generation: 'confirmed' }));
+    expect(onTurnDelivered.mock.calls[0]![1]).not.toHaveProperty('response');
+  });
+
+  test.each(['revoked', 'failed', 'interrupted'] as const)('%s playback cannot be recorded as delivered', async reason => {
+    const onTurnDelivered = vi.fn();
+    const h = harness({ onTurnDelivered });
+    await h.ask('guest', 'Pergunta real');
+    const cb = h.callbacks.get('guest')!;
+    cb.onTextResponse?.();
+    cb.onConversationText?.({ kind: 'agent_final', text: 'Saída não entregue', truncated: false });
+    await cb.onAudio(Buffer.alloc(480), 1);
+    if (reason === 'revoked') { h.consent.revoke('guest'); h.manager.revoke('guest'); }
+    else if (reason === 'failed') cb.onError('agent_transport_error');
+    else cb.onInterruption();
+    cb.onClose(); cb.onResponseComplete(1); await settle();
+    expect(onTurnDelivered).not.toHaveBeenCalled();
+  });
+
+  test('a failing memory callback cannot block playback completion or the next queued question', async () => {
+    const h = harness({ onTurnDelivered: () => { throw new Error('private callback contents'); } });
+    await h.ask('guest'); await h.ask('owner'); await h.finish('guest');
+    expect(h.metric).toHaveBeenCalledWith('turn_delivery_callback_failed');
+    expect(h.sessions.get('owner')!.sendText).toHaveBeenCalled();
   });
 });

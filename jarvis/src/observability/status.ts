@@ -11,6 +11,10 @@ const counters = [
   'agent_response_received', 'agent_response_complete_received',
   'audio_chunks_played', 'audio_stream_buffer_bytes', 'playback_started', 'playback_completed', 'playback_failed',
   'agent_turns_superseded', 'turn_completion_missing', 'voice_participants_success', 'voice_participants_unavailable',
+  'agent_turns_recovered', 'agent_completion_recovery_timeouts', 'agent_context_expired_sessions',
+  'agent_audio_before_input_finished', 'short_memory_turns_stored', 'short_memory_unconfirmed_turns',
+  'short_memory_context_injections', 'short_memory_context_empty',
+  'turn_delivery_callback_failed',
   'client_tools_received', 'client_tools_started', 'client_tools_completed', 'client_tools_failed', 'search_calls',
   'search_success', 'search_missing_key', 'search_rate_limited', 'search_unavailable',
   'search_timeout', 'search_invalid_input', 'search_invalid_reply', 'search_no_sources', 'search_cancelled',
@@ -21,9 +25,13 @@ const durations = [
   ['wake_queue_wait_ms', 'Fila do STT'], ['wake_recognition_ms', 'STT remoto'],
   ['wake_detection_ms', 'Wake total'], ['question_queue_wait_ms', 'Fila de perguntas'],
   ['agent_session_open_ms', 'Abertura ElevenAgents'], ['agent_audio_upload_ms', 'Upload PCM + silêncio'],
+  ['agent_input_silence_saved_ms', 'Silêncio digital adicional evitado'],
+  ['agent_remote_first_audio_ms', 'Fim do envio → primeiro áudio'],
+  ['agent_end_to_end_first_playback_ms', 'Início da captura → primeiro pacote local'],
   ['agent_first_audio_ms', 'Pergunta → primeiro áudio'], ['pcm_conversion_ms', 'Conversão PCM por lote'],
   ['opus_encode_ms', 'Opus por frame'], ['agent_first_playback_ms', 'Pergunta → primeiro pacote local'],
   ['next_question_ready_ms', 'Drain → próxima disponibilidade'], ['search_duration_ms', 'Pesquisa externa'],
+  ['short_memory_prepare_ms', 'Preparação do contexto curto'],
 ] as const;
 
 function finite(value: number | undefined): value is number { return typeof value === 'number' && Number.isFinite(value); }

@@ -10,6 +10,14 @@ test('default is no voice capture; Elysium variables are unrelated', () => {
   expect(loadConfig(base).JARVIS_MAX_QUEUED_TURNS).toBe(8);
   expect(loadConfig(base).JARVIS_MAX_QUEUED_PER_USER).toBe(2);
   expect(loadConfig(base).JARVIS_QUESTION_QUEUE_TTL_SECONDS).toBe(60);
+  expect(loadConfig(base).JARVIS_SHORT_MEMORY_TTL_SECONDS).toBe(600);
+});
+
+test('short memory has a bounded, explicit disable switch without enabling a database', () => {
+  expect(loadConfig({ ...base, JARVIS_SHORT_MEMORY_TTL_SECONDS: '0' }).JARVIS_SHORT_MEMORY_TTL_SECONDS).toBe(0);
+  for (const value of ['-1', '1801', 'NaN']) {
+    expect(() => loadConfig({ ...base, JARVIS_SHORT_MEMORY_TTL_SECONDS: value })).toThrow(ConfigError);
+  }
 });
 
 test('first-message policy is explicit and never enables unrelated overrides', () => {

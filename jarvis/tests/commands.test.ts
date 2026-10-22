@@ -6,6 +6,7 @@ test('slash payload is valid and audio consent is opt-in rather than a default',
   expect(command.name).toBe('jarvis');
   expect(command.options?.map((o) => o.name)).toEqual(expect.arrayContaining([
     'join', 'leave', 'status', 'consent', 'revoke', 'cancel', 'ask', 'privacy', 'tone',
+    'context',
   ]));
 });
 test('consent disclosure distinguishes local probe, text and external pre-wake audio', () => {
@@ -18,4 +19,5 @@ test('consent disclosure distinguishes local probe, text and external pre-wake a
   expect(privacyNotice('elevenlabs-stt')).not.toContain('Durante respostas');
   expect(privacyNotice('elevenlabs-stt')).toContain('nomes de exibição e presença');
   expect(privacyNotice('elevenlabs-stt', false, 30, true).length).toBeLessThanOrEqual(2000);
+  expect(privacyNotice('disabled', false, 18, false, 0)).toContain('Contexto curto em RAM desativado');
 });

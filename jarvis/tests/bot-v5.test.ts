@@ -119,13 +119,14 @@ async function setup() {
     members.set(id, member); return member;
   };
   addMember(OWNER); addMember(GUEST); addMember(BOT, 'Jarvis', true);
-  const interaction = (command: string, userId = OWNER, audio = false) => {
+  const interaction = (command: string, userId = OWNER, audio = false, group?: string) => {
     let deferred = false;
     const reply = vi.fn(async () => undefined);
     const editReply = vi.fn(async () => undefined);
     const followUp = vi.fn(async () => undefined);
     const input = { inCachedGuild: () => true, guildId: GUILD, guild, user: { id: userId }, member: members.get(userId),
-      options: { getSubcommand: () => command, getString: () => privateText, getBoolean: () => audio },
+      options: { getSubcommand: () => command, getSubcommandGroup: () => group,
+        getString: () => privateText, getBoolean: () => audio },
       get deferred() { return deferred; }, replied: false, reply, editReply, followUp,
       deferReply: vi.fn(async () => { deferred = true; }) };
     return { run: () => access.handle(input as unknown as ChatInputCommandInteraction), reply, editReply, followUp };
@@ -302,5 +303,49 @@ describe('V5 Discord integration with the real per-speaker session manager', () 
     expect(logs[1]).toMatchObject({ input_kind: 'text', session_reused: true, identity_injected: true });
     expect(logs[1]!.incident).not.toBe(logs[0]!.incident);
     expect(h.access.metrics.snapshot()).toMatchObject({ identity_text_turns: 2, agent_session_reused: 1 });
+  });
+
+  test('new owner socket restores actual delivered context while the guest socket receives none of it', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER).run(); await h.interaction('consent', GUEST).run();
+    await h.ask(OWNER);
+    const first = hooks.providers[0]!;
+    first.options.callbacks.onTextResponse?.({ eventId: 200 });
+    first.options.callbacks.onConversationText?.({ kind: 'agent_final', text: 'A arma é a Lua Lunar.', truncated: false, eventId: 200 });
+    await h.complete(first);
+    first.options.callbacks.onClose(); await settle();
+    await h.ask(OWNER);
+    const second = hooks.providers[1]!;
+    expect(second.session.sendContext).toHaveBeenCalledWith(expect.stringContaining('Lua Lunar'));
+    expect(second.session.sendContext).toHaveBeenCalledWith(expect.stringContaining(privateText));
+    await h.complete(second);
+    await h.ask(GUEST);
+    const guest = hooks.providers[2]!;
+    expect(guest.session.sendContext).not.toHaveBeenCalled();
+    const serializedLogs = JSON.stringify(h.logs);
+    expect(serializedLogs).not.toMatch(/Lua Lunar|conteúdo privado|Mesmo nome/);
+    expect(h.logs).toContainEqual(expect.objectContaining({ event: 'jarvis_short_context', context_injected: true, context_items: 1 }));
+  });
+
+  test('context status and clear are private, scoped to the invoking account and fence late output', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER).run(); await h.interaction('consent', GUEST).run();
+    await h.ask(OWNER); await h.complete();
+    await h.ask(GUEST); await h.complete();
+    const owner = hooks.providers[0]!;
+    const status = h.interaction('status', OWNER, false, 'context');
+    await status.run();
+    expect(status.reply).toHaveBeenCalledWith(expect.objectContaining({ flags: 64,
+      content: expect.stringContaining('1 interações suas'), allowedMentions: { parse: [] } }));
+    const clear = h.interaction('clear', OWNER, false, 'context'); await clear.run();
+    expect(clear.reply).toHaveBeenCalledWith(expect.objectContaining({ flags: 64, content: expect.stringContaining('apagado') }));
+    owner.options.callbacks.onConversationText?.({ kind: 'agent_final', text: 'Saída tardia', truncated: false });
+    await owner.options.callbacks.onResponseComplete(999); await settle();
+    const afterClear = h.interaction('status', OWNER, false, 'context'); await afterClear.run();
+    expect(afterClear.reply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('0 interações suas') }));
+    const guestStatus = h.interaction('status', GUEST, false, 'context'); await guestStatus.run();
+    expect(guestStatus.reply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('1 interações suas') }));
+    expect(h.room.consent.get(OWNER)).toBeDefined();
+    expect(JSON.stringify(h.logs)).not.toContain('Saída tardia');
   });
 });

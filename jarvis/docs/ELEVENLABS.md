@@ -71,21 +71,24 @@ Confira especialmente:
 `agent_response_complete` indica conclusão do turno, incluindo tools. O áudio é
 reproduzido progressivamente antes desse evento; sua ausência gera recuperação
 sem afirmar que a geração terminou. `agent_response` delimita uma mensagem textual,
-que pode ser uma entre várias no mesmo turno, e não encerra o áudio. Transcripts,
-correções e texto recebidos não são registrados. O adapter sinaliza somente que
-houve texto, sem guardar seu conteúdo, para detectar uma resposta sem áudio.
+que pode ser uma entre várias no mesmo turno, e não encerra o áudio. Áudio,
+perguntas, respostas e correções não são registrados em logs. A V5.2 disponibiliza
+texto final limitado em callback privado para contexto temporário em RAM;
+correções invalidam a resposta recordada e deltas não viram lembranças completas.
 `user_transcript` é o reconhecimento final da fala pelo ElevenAgents; sua presença
-é sinalizada sem repassar a transcrição. Ele precisa estar habilitado para
+é sinalizada tecnicamente sem conteúdo e seu texto final pode alimentar somente
+o contexto curto do falante consentido. Ele precisa estar habilitado para
 comprovar que a pergunta por microfone foi reconhecida. O resultado do STT usado
 para wake não substitui esse reconhecimento dentro da sessão conversacional.
 Metadata de inicialização e ping são tratados pelo protocolo; não precisam ser
 inventados em overrides. Para diagnóstico e validação audível, siga
 [STREAMING_PRODUCTION_VALIDATION.md](STREAMING_PRODUCTION_VALIDATION.md).
-Na V4, uma nova pergunta pode provocar retirada da sessão anterior depois de
-mensagem textual, drenagem local e nenhuma ferramenta conhecida pendente. Essa
+Na V5.2, uma nova pergunta pode provocar recuperação da sessão anterior depois de
+áudio válido, reconhecimento, upload terminado, drenagem local e nenhuma ferramenta ou write pendente. Essa
 decisão de disponibilidade drena áudio já aceito, mas mantém a geração anterior
 sem confirmação; não usa o fim do texto para certificar fim do turno. Uma sessão
-nova não recupera automaticamente o contexto da sessão encerrada.
+nova recebe contexto curto limitado do próprio falante, sem considerar respostas
+sem conclusão como completas. Não há memória permanente ou de outras contas.
 O follow-up após drenagem local autoriza ouvir a próxima fala do mesmo
 participante sem repetir wake; não certifica conclusão do provedor.
 Confira o [gate V4 de cinco perguntas e voz consentida](V4_CONVERSATION_VALIDATION.md).

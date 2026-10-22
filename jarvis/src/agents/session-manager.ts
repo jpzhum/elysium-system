@@ -1,5 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { AgentError, type AgentCallbacks, type AgentSession } from './elevenlabs-client.js';
+import { AgentError, type AgentCallbacks, type AgentConversationText, type AgentSession } from './elevenlabs-client.js';
 import { convertPcm } from '../audio/pcm-conversion.js';
 import { CaptureWindows, type CaptureTiming } from '../audio/capture-window.js';
 import type { PlaybackStream } from '../audio/playback.js';
@@ -36,6 +36,20 @@ export interface SessionOptions {
   /** Refresh trusted Discord context before a question, including reused sockets. */
   prepareSession?: (speaker: SpeakerContext, session: AgentSession, reused: boolean,
     metadata?: { incident: string; inputKind: 'voice' | 'text' }) => void | Promise<void>;
+  /** Explicit, bounded RAM-only handoff. Never forward conversational text to logs. */
+  onTurnDelivered?: (speaker: SpeakerContext, event: DeliveredTurn) => void | Promise<void>;
+  /** Monotonic upper bound for context already supplied to a provider socket. */
+  sessionContextExpiresAt?: (speaker: SpeakerContext) => number | undefined;
+}
+export interface DeliveredTurn {
+  turnId: string;
+  inputKind: 'voice' | 'text';
+  question: string;
+  /** Present only for confirmed generation with intact final text and drained playback. */
+  response?: string;
+  /** Final text observed in an unconfirmed turn; never proof that its full audio was heard. */
+  observedResponse?: string;
+  generation: 'confirmed' | 'unconfirmed';
 }
 export interface TurnReceipt { queued: boolean; position: number; turnId: string; }
 export interface TurnNotification {
@@ -48,11 +62,14 @@ interface TurnRequest {
   id: string;
   speaker: SpeakerContext;
   receivedAt: number;
+  /** Monotonic timestamp supplied by this process's Discord capture, never wall time. */
+  captureStartedAt?: number;
   dispatchAt?: number;
   text?: string;
   pcm?: Buffer;
   timer?: ReturnType<typeof setTimeout>;
   cancelled: boolean;
+  queuedNotified?: boolean;
   notify?: (event: TurnNotification) => void | Promise<void>;
 }
 interface Entry {
@@ -66,7 +83,6 @@ interface Entry {
   ingressEnded: boolean;
   playbackDone: boolean;
   recovering: boolean;
-  superseded: boolean;
   pendingTools: number;
   acceptingAudio: boolean;
   responseIds: Set<string>;
@@ -94,22 +110,44 @@ interface Entry {
   turnReleased: boolean;
   voiceInput: boolean;
   userTurnRecognized: boolean;
+  acceptedUserEventId?: number;
+  userTextPending: boolean;
   recognizedUserEventIds: Set<number>;
   inputAudioChunks: number;
   inputAudioBytes: number;
   inputAudioFinished: boolean;
   inputSourceChunks: number;
   inputSilenceChunks: number;
+  inputSilenceTailMs: number;
   uploadMs?: number;
+  inputFinishedAt?: number;
   rejectedAudioIds: Set<number>;
   rejectedResponseIds: Set<string>;
   sessionReused: boolean;
   initialAudioReported: boolean;
   initialResponseReported: boolean;
+  conversationQuestion?: string;
+  conversationResponse?: string;
+  conversationQuestionSafe: boolean;
+  conversationResponseSafe: boolean;
+  conversationTextIds: Set<string>;
+  contextExpiresAt?: number;
 }
 export class SessionError extends Error {
   constructor(readonly code: 'consent' | 'busy' | 'limit' | 'closed',
     readonly reason?: 'queue_full' | 'user_queue_full' | 'voice_memory_limit' | 'turn_budget') { super(code); }
+}
+
+/** Preserve every source sample and add only the missing exact digital silence. */
+function silencePaddingSamples(pcm: Buffer, sampleRate: number, frameSamples: number): number {
+  const target = Math.round(sampleRate * 0.8);
+  let existing = 0;
+  for (let offset = pcm.length - 2; offset >= 0 && existing < target; offset -= 2) {
+    if (pcm.readInt16LE(offset) !== 0) break;
+    existing++;
+  }
+  // Rounding upward never supplies less than 800 ms of trailing zero samples.
+  return Math.ceil((target - existing) / frameSamples) * frameSamples;
 }
 
 /** One provider session per authenticated Discord speaker; no mixed audio streams. */
@@ -208,8 +246,15 @@ export class SessionManager {
       } else this.inputReport(incident, 'jarvis_wake_detected', 'wake_detection', { wake_detected: false, followup: true });
       if (abort.signal.aborted) return;
       this.assertAllowed(speaker, true);
+      const receivedAt = performance.now();
+      const captureStart = timing?.captureStartedAtMs;
+      const captureEnd = timing?.captureEndedAtMs;
+      const trustedCaptureTime = captureStart !== undefined && captureEnd !== undefined
+        && Number.isFinite(captureStart) && Number.isFinite(captureEnd)
+        && captureStart >= 0 && captureEnd >= captureStart && captureEnd <= receivedAt
+        && receivedAt - captureStart <= 120_000;
       const request: TurnRequest = { id: incident, speaker, pcm: owned,
-        receivedAt: performance.now(), cancelled: false };
+        receivedAt, cancelled: false, ...(trustedCaptureTime ? { captureStartedAt: captureStart } : {}) };
       let receipt: TurnReceipt;
       try { receipt = this.enqueue(request); }
       catch (error) {
@@ -283,6 +328,7 @@ export class SessionManager {
       this.options.metric?.('questions_started');
       this.notify(request, { type: 'started' });
       if (request.text !== undefined) {
+        entry.inputFinishedAt = performance.now();
         entry.session!.sendText(request.text);
         request.text = undefined;
       } else if (request.pcm) await this.upload(entry, request.pcm);
@@ -303,11 +349,13 @@ export class SessionManager {
     entry.upload = abort;
     const rate = entry.session!.inputSampleRate;
     const mono = convertPcm(pcm, 48_000, 2, rate, 1);
-    const tail = Buffer.alloc(Math.round(rate * 0.8) * 2);
+    const frameSamples = Math.round(rate / 50);
+    const tail = Buffer.alloc(silencePaddingSamples(mono, rate, frameSamples) * 2);
+    entry.inputSilenceTailMs = Math.round(tail.length / (rate * 2) * 1_000);
     const uploadStartedAt = performance.now();
     this.report(entry, 'jarvis_agent_input_started');
     try {
-      const frameBytes = Math.round(rate / 50) * 2;
+      const frameBytes = frameSamples * 2;
       for (const segment of [mono, tail]) {
         for (let offset = 0; offset < segment.length; offset += frameBytes) {
           if (!this.usable(entry) || !this.options.allowed(entry.speaker, true) || abort.signal.aborted) return;
@@ -323,10 +371,12 @@ export class SessionManager {
         }
       }
       entry.inputAudioFinished = true;
+      entry.inputFinishedAt = performance.now();
       entry.uploadMs = Math.max(0, Math.round(performance.now() - uploadStartedAt));
       this.options.metric?.('agent_audio_upload_ms', entry.uploadMs);
       this.options.metric?.('agent_input_source_chunks', entry.inputSourceChunks);
       this.options.metric?.('agent_input_silence_chunks', entry.inputSilenceChunks);
+      this.options.metric?.('agent_input_silence_saved_ms', 800 - entry.inputSilenceTailMs);
       this.report(entry, 'jarvis_agent_input_sent');
     } catch (error) { if (!abort.signal.aborted) throw error; }
     finally {
@@ -339,6 +389,10 @@ export class SessionManager {
   }
 
   private notify(request: TurnRequest, event: Omit<TurnNotification, 'turnId'>): void {
+    if (event.type === 'queued') {
+      if (request.queuedNotified) return;
+      request.queuedNotified = true;
+    }
     const notification = { ...event, turnId: request.id };
     try { void Promise.resolve(request.notify ? request.notify(notification)
       : this.options.notify?.(request.speaker, notification))
@@ -380,6 +434,12 @@ export class SessionManager {
     let entry = this.entries.get(speaker.discordUserId);
     if (entry && (entry.speaker.consentVersion !== speaker.consentVersion
       || entry.speaker.channelId !== speaker.channelId)) { this.remove(entry, false); entry = undefined; }
+    if (entry && entry.contextExpiresAt !== undefined && entry.contextExpiresAt <= performance.now()) {
+      // Only an idle socket can be considered here: the global scheduler keeps
+      // a playing request active. Expiry never cuts packets from that request.
+      this.options.metric?.('agent_context_expired_sessions');
+      this.remove(entry, false); entry = undefined;
+    }
     if (entry) {
       if (entry.opening) await entry.opening;
       this.assertAllowed(speaker);
@@ -396,18 +456,21 @@ export class SessionManager {
       if (inactive) this.remove(inactive);
     }
     if (this.entries.size >= this.options.maxSessions) throw new SessionError('busy');
+    const expiresAt = this.options.sessionContextExpiresAt?.(speaker);
     entry = { speaker, abort: new AbortController(), waiting: false, playing: false,
-      ingressEnded: false, playbackDone: false, recovering: false, superseded: false, pendingTools: 0, acceptingAudio: false,
+      ingressEnded: false, playbackDone: false, recovering: false, pendingTools: 0, acceptingAudio: false,
       responseIds: new Set(), completedResponseIds: new Set(),
       completionIds: new Set(),
       followupUntil: 0, turnStarted: request.receivedAt, incident: request.id,
       audioChunks: 0, audioBytes: 0, textReceived: false, completionReceived: false,
       providerClosed: false, failed: false, localDrained: false, turnReleased: true,
-      voiceInput: request.pcm !== undefined, userTurnRecognized: false, inputAudioChunks: 0, inputAudioBytes: 0,
+      voiceInput: request.pcm !== undefined, userTurnRecognized: false, userTextPending: false, inputAudioChunks: 0, inputAudioBytes: 0,
       recognizedUserEventIds: new Set(),
       inputAudioFinished: false, rejectedAudioIds: new Set(), rejectedResponseIds: new Set(), sessionReused: false,
-      inputSourceChunks: 0, inputSilenceChunks: 0,
-      initialAudioReported: false, initialResponseReported: false };
+      inputSourceChunks: 0, inputSilenceChunks: 0, inputSilenceTailMs: 0,
+      initialAudioReported: false, initialResponseReported: false,
+      conversationQuestionSafe: true, conversationResponseSafe: true, conversationTextIds: new Set(),
+      ...(expiresAt !== undefined && Number.isFinite(expiresAt) && expiresAt >= 0 ? { contextExpiresAt: expiresAt } : {}) };
     this.entries.set(speaker.discordUserId, entry);
     const current = entry;
     const callbacks: AgentCallbacks = {
@@ -426,6 +489,8 @@ export class SessionManager {
         }
         if (current.userTurnRecognized) return;
         current.userTurnRecognized = true;
+        current.acceptedUserEventId = identity?.eventId;
+        current.userTextPending = true;
         this.options.metric?.('agent_user_turns_recognized');
         this.report(current, 'jarvis_agent_user_turn_recognized');
         this.progress(current);
@@ -440,9 +505,9 @@ export class SessionManager {
             this.report(current, 'jarvis_agent_response_observed');
           }
           this.progress(current);
-          this.retireForQueued(current);
         }
       },
+      onConversationText: (event) => this.conversationText(current, event),
       onToolActivity: (pending) => {
         if (!this.usable(current)) return;
         current.pendingTools = pending;
@@ -497,10 +562,14 @@ export class SessionManager {
     entry.request = request;
     entry.voiceInput = request.pcm !== undefined;
     entry.userTurnRecognized = false;
+    entry.acceptedUserEventId = undefined;
+    entry.userTextPending = false;
     entry.inputAudioChunks = entry.inputAudioBytes = 0;
     entry.inputAudioFinished = false;
     entry.inputSourceChunks = entry.inputSilenceChunks = 0;
+    entry.inputSilenceTailMs = 0;
     entry.uploadMs = undefined;
+    entry.inputFinishedAt = undefined;
     // Keep the greeting identifiers observed while a fresh socket was opening.
     // Later turns reset this quarantine; IDs are not assumed monotonic or unique chunks.
     if (entry.sessionReused) entry.rejectedAudioIds.clear();
@@ -514,7 +583,10 @@ export class SessionManager {
     entry.ingressEnded = false;
     entry.playbackDone = false;
     entry.recovering = false;
-    entry.superseded = false;
+    entry.conversationQuestion = request.text;
+    entry.conversationResponse = undefined;
+    entry.conversationQuestionSafe = entry.conversationResponseSafe = true;
+    entry.conversationTextIds.clear();
     entry.acceptingAudio = false;
     entry.audioChunks = 0;
     entry.audioBytes = 0;
@@ -581,6 +653,55 @@ export class SessionManager {
     return true;
   }
 
+  /** Final text is optional conversation context; it is never a playback/end signal. */
+  private conversationText(entry: Entry, event: AgentConversationText): void {
+    if (!this.usable(entry) || entry.turnReleased || entry.failed
+      || !entry.request || this.active !== entry.request
+      || (entry.voiceInput && !entry.userTurnRecognized)) return;
+    if (event.responseId !== undefined && (entry.rejectedResponseIds.has(event.responseId)
+      || entry.completedResponseIds.has(event.responseId))) return;
+    if (entry.voiceInput && event.eventId !== undefined && entry.rejectedAudioIds.has(event.eventId)) return;
+    if (event.kind === 'user_final' && (!entry.waiting || entry.recovering || !entry.voiceInput || !entry.inputAudioChunks)) return;
+    if (event.kind === 'user_final') {
+      if (!entry.userTextPending || event.eventId !== entry.acceptedUserEventId) return;
+      // The adapter delivers this immediately after its matching accepted ASR
+      // marker. A stale/duplicate marker can never supply another turn's text.
+      entry.userTextPending = false;
+    }
+    if (event.kind !== 'user_final' && !entry.textReceived) return;
+    // An output correction does not prove that its replacement audio was heard.
+    // Keep the genuine question, but omit the response from recalled context.
+    if (event.kind === 'agent_correction') {
+      entry.conversationResponse = undefined;
+      entry.conversationResponseSafe = false;
+      return;
+    }
+    // Graceful recovery may still deliver already validated final text. It can
+    // only become observedResponse, never a confirmed/fully delivered answer.
+    if (!entry.waiting) return;
+    if (event.eventId !== undefined || event.responseId !== undefined) {
+      const key = `${event.kind}:${event.eventId ?? ''}:${event.responseId ?? ''}`;
+      if (entry.conversationTextIds.has(key)) return;
+      if (entry.conversationTextIds.size >= 128) {
+        entry.conversationQuestion = entry.conversationResponse = undefined;
+        entry.conversationQuestionSafe = entry.conversationResponseSafe = false;
+        return;
+      }
+      entry.conversationTextIds.add(key);
+    }
+    const isQuestion = event.kind === 'user_final';
+    if (!(isQuestion ? entry.conversationQuestionSafe : entry.conversationResponseSafe)) return;
+    const previous = isQuestion ? entry.conversationQuestion : entry.conversationResponse;
+    const combined = previous ? `${previous}\n${event.text}` : event.text;
+    if (event.truncated || !event.text.trim() || Buffer.byteLength(combined, 'utf8') > 4 * 1024) {
+      if (isQuestion) { entry.conversationQuestion = undefined; entry.conversationQuestionSafe = false; }
+      else { entry.conversationResponse = undefined; entry.conversationResponseSafe = false; }
+      return;
+    }
+    if (isQuestion) entry.conversationQuestion = combined;
+    else entry.conversationResponse = combined;
+  }
+
   private async audio(entry: Entry, pcm: Buffer, eventId: number, responseId?: string): Promise<void> {
     if (!this.usable(entry)) return;
     this.options.metric?.('audio_chunks_received');
@@ -604,6 +725,9 @@ export class SessionManager {
     if (entry.firstAudioAt === undefined) {
       entry.firstAudioAt = entry.lastAudioAt;
       this.options.metric?.('agent_first_audio_ms', Math.round(entry.firstAudioAt - entry.turnStarted));
+      if (entry.inputFinishedAt !== undefined) this.options.metric?.('agent_remote_first_audio_ms',
+        Math.max(0, Math.round(entry.firstAudioAt - entry.inputFinishedAt)));
+      else if (entry.voiceInput) this.options.metric?.('agent_audio_before_input_finished');
     }
     entry.acceptingAudio = true;
     this.progress(entry);
@@ -686,6 +810,7 @@ export class SessionManager {
     entry.turnReleased = true;
     this.options.metric?.('agent_turn_logical_end_ms', Math.round(performance.now() - entry.turnStarted));
     this.report(entry, 'jarvis_agent_turn_finished');
+    this.delivered(entry);
     if (!entry.completionReceived || entry.recovering) { this.remove(entry); return; }
     this.options.metric?.('agent_turns_completed');
     if (entry.providerClosed) { this.remove(entry); return; }
@@ -695,12 +820,32 @@ export class SessionManager {
     this.release(entry);
   }
 
+  private delivered(entry: Entry): void {
+    const question = entry.conversationQuestion;
+    const confirmed = entry.completionReceived && !entry.recovering;
+    if (!entry.failed && entry.audioBytes > 0 && entry.playbackDone && question
+      && entry.conversationQuestionSafe && this.options.allowed(entry.speaker, entry.voiceInput)) {
+      const event: DeliveredTurn = { turnId: entry.incident, inputKind: entry.voiceInput ? 'voice' : 'text',
+        question, generation: confirmed ? 'confirmed' : 'unconfirmed',
+        ...(entry.conversationResponseSafe && entry.conversationResponse
+          ? confirmed ? { response: entry.conversationResponse } : { observedResponse: entry.conversationResponse } : {}) };
+      try {
+        void Promise.resolve(this.options.onTurnDelivered?.(entry.speaker, event))
+          .catch(() => this.options.metric?.('turn_delivery_callback_failed'));
+      } catch { this.options.metric?.('turn_delivery_callback_failed'); }
+    }
+    entry.conversationQuestion = entry.conversationResponse = undefined;
+    entry.conversationTextIds.clear();
+  }
+
   private playbackProgress(entry: Entry, event: 'first_packet' | 'drained' | 'resumed'): void {
     if (!this.usable(entry) || entry.turnReleased) return;
     const now = performance.now();
     if (event === 'first_packet' && entry.firstPlaybackAt === undefined) {
       entry.firstPlaybackAt = now;
       this.options.metric?.('agent_first_playback_ms', Math.round(now - entry.turnStarted));
+      if (entry.request?.captureStartedAt !== undefined) this.options.metric?.('agent_end_to_end_first_playback_ms',
+        Math.max(0, Math.round(now - entry.request.captureStartedAt)));
     }
     if (event === 'drained') {
       entry.localDrained = true;
@@ -717,16 +862,16 @@ export class SessionManager {
 
   private retireForQueued(entry: Entry): void {
     if (!this.queue.length || !this.usable(entry) || entry.turnReleased || entry.recovering
-      || entry.completionReceived || !entry.waiting || !entry.textReceived || !entry.audioBytes
-      || !entry.localDrained || entry.acceptingAudio || entry.pendingTools || entry.upload) return;
-    // The NEW REQUEST authorizes retiring an unconfirmed old provider turn.
+      || entry.completionReceived || !entry.waiting || !entry.audioBytes
+      || !entry.localDrained || entry.acceptingAudio || entry.pendingTools || entry.upload
+      || (entry.voiceInput && (!entry.inputAudioFinished || !entry.userTurnRecognized))) return;
+    // The NEW REQUEST authorizes recovering an unconfirmed old provider turn.
     // A quiet interval alone never does. Drain validated adapter input before
     // ending the local stream; a fresh provider session fences all late events.
     this.missing(entry);
     entry.recovering = true;
-    entry.superseded = true;
-    this.options.metric?.('agent_turns_superseded');
-    this.report(entry, 'jarvis_agent_turn_superseded');
+    this.options.metric?.('agent_turns_recovered');
+    this.report(entry, 'jarvis_agent_turn_recovered');
     if (entry.deadline) clearTimeout(entry.deadline);
     entry.session?.close({ drainAudio: true });
   }
@@ -760,7 +905,8 @@ export class SessionManager {
     if (!entry.waiting || entry.recovering || entry.completionReceived || entry.pendingTools > 0 || entry.acceptingAudio) return;
     entry.deadline = setTimeout(() => {
       if (!this.usable(entry) || !entry.waiting) return;
-      this.options.metric?.('agent_response_timeouts');
+      this.options.metric?.(entry.audioBytes > 0
+        ? 'agent_completion_recovery_timeouts' : 'agent_response_timeouts');
       this.missing(entry);
       if (entry.voiceInput && !entry.userTurnRecognized) {
         this.options.metric?.('agent_user_turn_missing');
@@ -805,13 +951,13 @@ export class SessionManager {
       input_audio_chunks: entry.inputAudioChunks, input_audio_bytes: entry.inputAudioBytes,
       input_source_chunks: entry.inputSourceChunks, input_silence_chunks: entry.inputSilenceChunks,
       ...(entry.uploadMs === undefined ? {} : { upload_ms: entry.uploadMs }),
-      input_audio_finished: entry.inputAudioFinished, silence_tail_ms: entry.voiceInput ? 800 : 0,
+      input_audio_finished: entry.inputAudioFinished, silence_tail_ms: entry.inputSilenceTailMs,
       ...(entry.session ? { input_sample_rate: entry.session.inputSampleRate, output_sample_rate: entry.session.outputSampleRate } : {}),
       session_reused: entry.sessionReused, speaker_verified: true,
       consent_current: this.options.allowed(entry.speaker, entry.voiceInput),
       queue_depth: this.queue.length,
       turn_outcome: entry.failed ? 'failed' : entry.turnReleased
-        ? entry.completionReceived && !entry.recovering ? 'completed' : entry.superseded ? 'superseded' : 'unconfirmed' : undefined,
+        ? entry.completionReceived && !entry.recovering ? 'completed' : 'unconfirmed' : undefined,
       ...(entry.request?.dispatchAt === undefined ? {} : {
         question_wait_ms: Math.round(entry.request.dispatchAt - entry.request.receivedAt),
       }),
@@ -927,6 +1073,8 @@ export class SessionManager {
       this.release(entry);
     }
     entry.upload?.abort();
+    entry.conversationQuestion = entry.conversationResponse = undefined;
+    entry.conversationTextIds.clear();
     entry.abort.abort();
     for (const timer of [entry.idle, entry.lifetime, entry.deadline]) if (timer) clearTimeout(timer);
     entry.stream?.cancel();

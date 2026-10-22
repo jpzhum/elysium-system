@@ -208,6 +208,144 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     expect(h.callbacks.onError).not.toHaveBeenCalled();
   });
 
+  it('opts in to private final text in wire order without treating text as completed audio', async () => {
+    const h = harness();
+    const order: string[] = [];
+    h.callbacks.onUserTranscript = vi.fn(() => { order.push('recognized'); });
+    h.callbacks.onTextResponse = vi.fn(() => { order.push('response-marker'); });
+    h.callbacks.onConversationText = vi.fn(event => { order.push(event.kind); });
+    await h.connect();
+    h.socket.message({ type: 'user_transcript', user_transcription_event: {
+      user_transcript: 'Onde encontro a arma?', event_id: 8, response_id: 'user_8', secret_metadata: 'discard',
+    } });
+    h.socket.message({ type: 'agent_response', agent_response_event: {
+      agent_response: 'Ela fica no castelo.', event_id: 9, response_id: 'answer_9', unrelated: 'discard',
+    } });
+    expect(order).toEqual(['recognized', 'user_final', 'response-marker', 'agent_final']);
+    expect(h.callbacks.onConversationText).toHaveBeenNthCalledWith(1, {
+      kind: 'user_final', text: 'Onde encontro a arma?', truncated: false, eventId: 8, responseId: 'user_8',
+    });
+    expect(h.callbacks.onConversationText).toHaveBeenNthCalledWith(2, {
+      kind: 'agent_final', text: 'Ela fica no castelo.', truncated: false, eventId: 9, responseId: 'answer_9',
+    });
+    expect(h.callbacks.onUserTranscript).toHaveBeenCalledExactlyOnceWith({ eventId: 8, responseId: 'user_8' });
+    expect(h.callbacks.onTextResponse).toHaveBeenCalledExactlyOnceWith({ eventId: 9, responseId: 'answer_9' });
+    expect(h.callbacks.onResponseComplete).not.toHaveBeenCalled();
+    expect(JSON.stringify(vi.mocked(h.callbacks.onConversationText).mock.calls)).not.toContain('discard');
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+  });
+
+  it('keeps streaming, tentative and correction text distinct from final messages', async () => {
+    const h = harness();
+    h.callbacks.onConversationText = vi.fn();
+    h.callbacks.onTextResponse = vi.fn();
+    h.callbacks.onUserTranscript = vi.fn();
+    await h.connect();
+    h.socket.message({ type: 'tentative_user_transcript', user_transcription_event: { user_transcript: 'in progress' } });
+    h.socket.message({ type: 'agent_chat_response_part', text_response_part: { type: 'delta', text: 'partial' } });
+    h.socket.message({ type: 'agent_reasoning_response_part', text_response_part: { type: 'delta', text: 'internal' } });
+    expect(h.callbacks.onConversationText).not.toHaveBeenCalled();
+    expect(h.callbacks.onUserTranscript).not.toHaveBeenCalled();
+    h.socket.message({ type: 'agent_response_correction', agent_response_correction_event: {
+      original_agent_response: 'Never retain this original', corrected_agent_response: 'What was actually said.', event_id: 4,
+    } });
+    h.socket.message({ type: 'agent_response_correction', agent_response_correction_event: {
+      original_agent_response: 'Interrupted entirely', corrected_agent_response: '', event_id: 5,
+    } });
+    expect(h.callbacks.onConversationText).toHaveBeenNthCalledWith(1, {
+      kind: 'agent_correction', text: 'What was actually said.', truncated: false, eventId: 4,
+    });
+    expect(h.callbacks.onConversationText).toHaveBeenNthCalledWith(2, {
+      kind: 'agent_correction', text: '', truncated: false, eventId: 5,
+    });
+    expect(h.callbacks.onResponseComplete).not.toHaveBeenCalled();
+    expect(h.callbacks.onTextResponse).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(vi.mocked(h.callbacks.onConversationText).mock.calls)).not.toContain('original');
+  });
+
+  it.each(['user_transcript', 'agent_response', 'agent_response_correction'])(
+    'bounds opted-in %s text by UTF-8 bytes without broken Unicode', async type => {
+      const h = harness();
+      h.callbacks.onConversationText = vi.fn();
+      await h.connect();
+      const text = 'a'.repeat(4094) + '🦾中文'.repeat(1000);
+      const envelopes = {
+        user_transcript: { user_transcription_event: { user_transcript: text } },
+        agent_response: { agent_response_event: { agent_response: text } },
+        agent_response_correction: { agent_response_correction_event: { corrected_agent_response: text } },
+      };
+      h.socket.message({ type, ...envelopes[type as keyof typeof envelopes] });
+      const event = vi.mocked(h.callbacks.onConversationText).mock.calls[0]?.[0];
+      expect(event).toMatchObject({ text: 'a'.repeat(4094), truncated: true });
+      expect(Buffer.byteLength(event!.text)).toBeLessThanOrEqual(4096);
+      expect(event!.text).not.toContain('�');
+      expect(h.callbacks.onError).not.toHaveBeenCalled();
+    },
+  );
+
+  it('bounds retained private text behind slow PCM and discards all text on backpressure', async () => {
+    let accept: (() => void) | undefined;
+    const h = harness();
+    h.callbacks.onAudio = vi.fn(() => new Promise<void>(resolve => { accept = resolve; }));
+    h.callbacks.onConversationText = vi.fn();
+    await h.connect();
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AQA=', event_id: 1 } });
+    for (let i = 0; i < 17; i++) {
+      h.socket.message({ type: 'agent_response', agent_response_event: { agent_response: 'x'.repeat(4096), event_id: 2 } });
+    }
+    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_audio_backpressure');
+    accept?.();
+    await Promise.resolve();
+    expect(h.callbacks.onConversationText).not.toHaveBeenCalled();
+  });
+
+  it('delivers private text only after prior PCM, with ping still immediate', async () => {
+    let accept: (() => void) | undefined;
+    const order: string[] = [];
+    const h = harness();
+    h.callbacks.onAudio = vi.fn(() => new Promise<void>(resolve => { accept = resolve; }));
+    h.callbacks.onUserTranscript = vi.fn(() => { order.push('recognized'); });
+    h.callbacks.onTextResponse = vi.fn(() => { order.push('text'); });
+    h.callbacks.onConversationText = vi.fn(event => { order.push(event.kind); });
+    await h.connect();
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AQA=', event_id: 1 } });
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private question' } });
+    h.socket.message({ type: 'agent_response', agent_response_event: { agent_response: 'private answer' } });
+    h.socket.message({ type: 'ping', ping_event: { event_id: 2 } });
+    expect(order).toEqual([]);
+    expect(h.socket.sent.at(-1)).toEqual({ type: 'pong', event_id: 2 });
+    accept?.();
+    await vi.waitFor(() => expect(order).toEqual(['recognized', 'user_final', 'text', 'agent_final']));
+  });
+
+  it('does not deliver private content when the recognition marker revokes consent', async () => {
+    const controller = new AbortController();
+    const h = harness({ signal: controller.signal });
+    h.callbacks.onUserTranscript = vi.fn(() => { controller.abort(); });
+    h.callbacks.onConversationText = vi.fn();
+    await h.connect();
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private speech' } });
+    h.socket.message({ type: 'agent_response', agent_response_event: { agent_response: 'late private answer' } });
+    expect(h.callbacks.onUserTranscript).toHaveBeenCalledOnce();
+    expect(h.callbacks.onConversationText).not.toHaveBeenCalled();
+  });
+
+  it('sanitizes private-text callback failures and malformed correction envelopes', async () => {
+    const h = harness();
+    h.callbacks.onConversationText = vi.fn(() => { throw new Error('private question and answer'); });
+    await h.connect();
+    h.socket.message({ type: 'agent_response', agent_response_event: { agent_response: 'private answer' } });
+    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_callback_error');
+    const bad = harness();
+    bad.callbacks.onConversationText = vi.fn();
+    await bad.connect();
+    bad.socket.message({ type: 'agent_response_correction', agent_response_correction_event: {
+      corrected_agent_response: { message: 'private answer' },
+    } });
+    expect(bad.callbacks.onConversationText).not.toHaveBeenCalled();
+    expect(bad.callbacks.onError).toHaveBeenCalledExactlyOnceWith('invalid_agent_event');
+  });
+
   it.each([
     { type: 'user_transcript' },
     { type: 'user_transcript', user_transcription_event: [] },
