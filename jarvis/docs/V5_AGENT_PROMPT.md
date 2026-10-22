@@ -14,7 +14,7 @@ npm run audit:agent
 
 Execute o build antes desse comando quando usar um checkout local. O comando usa `loadConfig()` do worker, exige sua configuração válida e faz apenas `GET https://api.elevenlabs.io/v1/convai/agents/{agent_id}` e `GET https://api.elevenlabs.io/v1/convai/tools/{tool_id}` para os IDs referenciados pelo prompt principal. Nenhum agente ou ferramenta é alterado. Há deadline total de 10 segundos, limite de 512 KiB por resposta, até 32 referências e rejeição de redirects. A chave fica exclusivamente no header enviado à origem oficial.
 
-O relatório contém somente nomes fixos de verificações e booleanos: referências `{{speaker_name}}`, `{{speaker_is_creator}}`, `{{active_game}}` e `{{room_context}}` no **system prompt**, nomes e parâmetros exatos das duas Client Tools, `expects_response`, eventos configurados e permissão de override da primeira mensagem. Não imprime prompt, IDs, nomes de participantes, perfis, chaves nem respostas brutas do provedor.
+O relatório contém campos fixos: verificações booleanas de variáveis, ferramentas, eventos e saudação; comparação privada entre prompt local/publicado; e valores numéricos/enum/boolean/null permitidos em `turn_taking`. Campos desconhecidos não assumem defaults. Não imprime prompt, IDs, nomes de participantes, perfis, chaves nem respostas brutas do provedor. Veja o [contrato V5.4.1](V541_FINE_TUNING.md) para a medição e os campos exatos a revisar.
 
 Interpretação:
 
@@ -25,7 +25,7 @@ Interpretação:
 - Cada ferramenta deve ter `registered`, `unique`, `client`, `expects_response`, `parameters_match` e `mentioned_in_prompt` verdadeiros. Um default false para Wait for response impede o agente de utilizar o resultado como esperado.
 - `first_message_override_visible: false` significa que esse campo não veio na configuração e requer verificação no dashboard; não prova que o override está permitido. Se visível, `first_message_override_allowed` deve ser verdadeiro com a supressão de saudação habilitada no worker.
 - `workflow_present: true` exige inspeção dos nós, overrides, transferências e ferramentas desses nós no dashboard. O escopo automático é `main_agent_only`; não comprova todas as rotas de workflow.
-- `manual_review_required: true` sinaliza workflow ou permissão de override não exposta pela API. A CLI retorna 1 sempre que esse campo é verdadeiro, mesmo quando o contrato principal passa. Ela não grava aprovação humana nem certifica rotas adicionais; registre a revisão separadamente.
+- `manual_review_required: true` sinaliza workflow, permissão de override não exposta pela API ou prompt local ausente/diferente da versão lida, após normalizar apenas CRLF e whitespace externo. A CLI retorna 1 sempre que esse campo é verdadeiro, mesmo quando o contrato principal passa. Divergência não comprova uma causa de perda de personalidade. A CLI não grava aprovação humana nem certifica rotas adicionais; registre a revisão separadamente.
 - `agent_response_complete` continua recomendado como sinal explícito. Sua ausência não bloqueia o início da reprodução progressiva nem autoriza declarar a geração concluída.
 - `runtime_behavior_verified` permanece falso por definição: uma leitura estática não comprova resposta correta ao criador, convidado ou chamada de ferramenta.
 

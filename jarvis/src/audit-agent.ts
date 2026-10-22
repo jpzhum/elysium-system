@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { loadConfig, loadEnvironment } from './config.js';
 import { agentConfigurationChecksPassed, auditAgentConfiguration } from './agents/config-audit.js';
 
@@ -6,9 +7,12 @@ async function main(): Promise<void> {
   try {
     loadEnvironment();
     const config = loadConfig();
-    const audit = await auditAgentConfiguration({ apiKey: config.ELEVENLABS_API_KEY, agentId: config.ELEVENLABS_AGENT_ID });
+    // The local artifact is compared in RAM, never printed or uploaded to the provider.
+    const localPrompt = await readFile(new URL('../agent-system-prompt.md', import.meta.url), 'utf8').catch(() => undefined);
+    const audit = await auditAgentConfiguration({ apiKey: config.ELEVENLABS_API_KEY, agentId: config.ELEVENLABS_AGENT_ID,
+      localPrompt });
     const checksPassed = agentConfigurationChecksPassed(audit, config.JARVIS_SUPPRESS_FIRST_MESSAGE);
-    const manualReview = audit.workflow_present
+    const manualReview = audit.workflow_present || (audit.status === 'ok' && !audit.published_prompt_matches_local_normalized)
       || (config.JARVIS_SUPPRESS_FIRST_MESSAGE && !audit.first_message_override_visible);
     process.stdout.write(`${JSON.stringify({ ...audit, configuration_checks_passed: checksPassed,
       manual_review_required: manualReview })}\n`);

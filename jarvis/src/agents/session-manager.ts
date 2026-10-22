@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { AgentError, type AgentCallbacks, type AgentConversationText, type AgentSession } from './elevenlabs-client.js';
+import { WakeError } from './wake-detector.js';
 import { convertPcm } from '../audio/pcm-conversion.js';
 import { CaptureWindows, type CaptureTiming } from '../audio/capture-window.js';
 import type { PlaybackStream } from '../audio/playback.js';
@@ -121,6 +122,7 @@ interface Entry {
   inputSilenceChunks: number;
   inputSilenceTailMs: number;
   uploadMs?: number;
+  inputStartedAt?: number;
   inputFinishedAt?: number;
   rejectedAudioIds: Set<number>;
   rejectedResponseIds: Set<string>;
@@ -259,8 +261,20 @@ export class SessionManager {
           && prior.channelId === speaker.channelId && prior.until > Date.now());
       const wakeStart = performance.now();
       if (!followup) {
-        const activated = await this.options.detectWake(owned, abort.signal);
+        let activated: boolean;
+        try { activated = await this.options.detectWake(owned, abort.signal); }
+        catch (error) {
+          if (!abort.signal.aborted) this.options.logger?.event('jarvis_wake_failed', 'warn', {
+            incident, operation: 'agent_turn', stage: 'wake_detection', input_kind: 'voice',
+            rejection_reason: error instanceof WakeError ? error.code : 'unexpected',
+            duration_ms: Math.max(0, Math.round(performance.now() - wakeStart)),
+          });
+          throw error;
+        }
         this.options.metric?.('wake_detection_ms', Math.round(performance.now() - wakeStart));
+        // Cancellation settles the detector as false; it is not evidence that
+        // consenting speech was inspected and lacked the wake word.
+        if (abort.signal.aborted) return;
         this.options.metric?.(activated ? 'voice_wake_activations' : 'wake_rejections');
         this.inputReport(incident, 'jarvis_wake_detected', 'wake_detection', { wake_detected: activated, followup: false,
           duration_ms: Math.max(0, Math.round(performance.now() - wakeStart)) });
@@ -375,6 +389,7 @@ export class SessionManager {
     const tail = Buffer.alloc(silencePaddingSamples(mono, rate, frameSamples) * 2);
     entry.inputSilenceTailMs = Math.round(tail.length / (rate * 2) * 1_000);
     const uploadStartedAt = performance.now();
+    entry.inputStartedAt = uploadStartedAt;
     this.report(entry, 'jarvis_agent_input_started');
     try {
       const frameBytes = frameSamples * 2;
@@ -526,6 +541,10 @@ export class SessionManager {
         current.acceptedUserEventId = identity?.eventId;
         current.userTextPending = true;
         this.options.metric?.('agent_user_turns_recognized');
+        if (current.inputStartedAt !== undefined) this.options.metric?.('agent_user_recognition_ms',
+          Math.max(0, Math.round(performance.now() - current.inputStartedAt)));
+        if (current.inputFinishedAt !== undefined) this.options.metric?.('agent_post_upload_recognition_ms',
+          Math.max(0, Math.round(performance.now() - current.inputFinishedAt)));
         this.report(current, 'jarvis_agent_user_turn_recognized');
         this.progress(current);
       },
@@ -603,6 +622,7 @@ export class SessionManager {
     entry.inputSourceChunks = entry.inputSilenceChunks = 0;
     entry.inputSilenceTailMs = 0;
     entry.uploadMs = undefined;
+    entry.inputStartedAt = undefined;
     entry.inputFinishedAt = undefined;
     // Keep the greeting identifiers observed while a fresh socket was opening.
     // Later turns reset this quarantine; IDs are not assumed monotonic or unique chunks.
@@ -885,6 +905,8 @@ export class SessionManager {
       entry.localDrained = true;
       entry.drainedAt = now;
       this.options.metric?.('agent_playback_drained_ms', Math.round(now - entry.turnStarted));
+      if (entry.firstPlaybackAt !== undefined) this.options.metric?.('agent_playback_ms',
+        Math.max(0, Math.round(now - entry.firstPlaybackAt)));
       // A perceptual follow-up window is authorization to hear this speaker's
       // next utterance, not proof that the provider has completed generation.
       entry.followupUntil = Date.now() + this.options.followupSeconds * 1000;
@@ -1027,6 +1049,8 @@ export class SessionManager {
     }
     if (entry.failed || entry.recovering) return;
     this.options.metric?.('agent_errors');
+    if (code === 'agent_guardrail') this.options.metric?.('agent_guardrail_rejections');
+    if (code === 'agent_concurrency_limit') this.options.metric?.('agent_concurrency_rejections');
     const codes: Readonly<Record<string, ErrorCode>> = {
       agent_transport_error: 'AGENT_TRANSPORT_ERROR', invalid_agent_event: 'AGENT_INVALID_EVENT',
       invalid_output_audio: 'AGENT_INVALID_EVENT', unsupported_audio_format: 'AGENT_AUDIO_FORMAT_UNSUPPORTED',
@@ -1036,6 +1060,7 @@ export class SessionManager {
       agent_audio_backpressure: 'AGENT_BACKPRESSURE',
       agent_heartbeat_timeout: 'AGENT_HEARTBEAT_TIMEOUT',
       agent_initiation_rejected: 'AGENT_INITIATION_REJECTED',
+      agent_guardrail: 'AGENT_GUARDRAIL_REJECTED', agent_concurrency_limit: 'AGENT_CONCURRENCY_LIMIT',
     };
     const safeCode = Object.hasOwn(codes, code) ? codes[code]! : 'AGENT_PROVIDER_ERROR';
     if ((code === 'agent_transport_error' || code === 'agent_heartbeat_timeout') && entry.waiting) {

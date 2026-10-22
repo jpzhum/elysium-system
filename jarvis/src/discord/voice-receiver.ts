@@ -227,6 +227,8 @@ export class VoiceReceiver {
         ...(state.playbackToken !== undefined ? { playbackToken: state.playbackToken } : {}) };
       this.metric("voice_turn_seconds", result.length / BYTES_PER_SECOND);
       this.metric('voice_capture_ms', timing.captureMs);
+      // Wall time through the last voiced frame, separate from the VAD tail.
+      this.metric('voice_capture_active_ms', Math.max(0, timing.captureMs - timing.endDetectionMs));
       this.metric('voice_end_detection_ms', timing.endDetectionMs);
       try {
         Promise.resolve(this.options.onTurn(userId, result, timing))

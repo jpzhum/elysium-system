@@ -1,25 +1,59 @@
 import { randomBytes } from 'node:crypto';
 
+const MAX_METRICS = 256;
+const MAX_DURATION_SERIES = 32;
+const DURATION_WINDOW_SAMPLES = 256;
+
+interface DurationWindow {
+  readonly values: number[];
+  next: number;
+}
+
 export class Metrics {
   private readonly counters = new Map<string, number>();
+  private readonly durations = new Map<string, DurationWindow>();
   add = (name: string, value = 1): void => {
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(name) || !Number.isFinite(value)) return;
-    if (!this.counters.has(name) && this.counters.size >= 256) return;
+    if (!this.counters.has(name) && this.counters.size >= MAX_METRICS) return;
     this.counters.set(name, (this.counters.get(name) ?? 0) + value);
   };
-  snapshot(): Record<string, number> { return Object.fromEntries(this.counters); }
-  /** Durations are aggregates with a sample count, not invented percentiles. */
+  snapshot(): Record<string, number> {
+    const result = Object.fromEntries(this.counters);
+    for (const [name, window] of this.durations) {
+      const sorted = [...window.values].sort((left, right) => left - right);
+      const middle = Math.floor(sorted.length / 2);
+      result[`${name}_median`] = sorted.length % 2 === 0
+        ? (sorted[middle - 1]! + sorted[middle]!) / 2 : sorted[middle]!;
+      // Nearest-rank p95 is an observed value; the median averages the two middle values.
+      result[`${name}_p95`] = sorted[Math.ceil(sorted.length * 0.95) - 1]!;
+      result[`${name}_window_samples`] = sorted.length;
+    }
+    return result;
+  }
+  /** Lifetime aggregates plus a bounded, recent window; no audio, content or identities. */
   record = (name: string, value = 1): void => {
     if (!name.endsWith('_ms')) { this.add(name, value); return; }
     if (!/^[a-z][a-z0-9_]{0,51}$/.test(name) || !Number.isFinite(value) || value < 0 || value > 3_600_000) return;
+    if (!this.durations.has(name) && this.durations.size >= MAX_DURATION_SERIES) return;
+    const keys = [name, `${name}_samples`, `${name}_last`, `${name}_min`, `${name}_max`];
+    // Reserve the entire aggregate before changing it, even when counter capacity is exhausted.
+    if (this.counters.size + keys.filter(key => !this.counters.has(key)).length > MAX_METRICS) return;
     this.add(name, value);
     this.add(`${name}_samples`);
     this.set(`${name}_last`, value);
     this.set(`${name}_min`, Math.min(this.counters.get(`${name}_min`) ?? value, value));
     this.set(`${name}_max`, Math.max(this.counters.get(`${name}_max`) ?? value, value));
+    let window = this.durations.get(name);
+    if (!window) {
+      window = { values: [], next: 0 };
+      this.durations.set(name, window);
+    }
+    if (window.values.length < DURATION_WINDOW_SAMPLES) window.values.push(value);
+    else window.values[window.next] = value;
+    window.next = (window.next + 1) % DURATION_WINDOW_SAMPLES;
   };
   private set(name: string, value: number): void {
-    if (this.counters.has(name) || this.counters.size < 256) this.counters.set(name, value);
+    if (this.counters.has(name) || this.counters.size < MAX_METRICS) this.counters.set(name, value);
   }
 }
 
@@ -62,6 +96,7 @@ export const errorCodes = [
   'AGENT_AUDIO_OVERFLOW', 'AGENT_SESSION_EXPIRED', 'AGENT_TRANSPORT_ERROR', 'AGENT_HEARTBEAT_TIMEOUT',
   'AGENT_INVALID_EVENT', 'AGENT_AUDIO_FORMAT_UNSUPPORTED', 'AGENT_METADATA_TIMEOUT',
   'AGENT_CREDIT_LIMIT', 'AGENT_RATE_LIMITED', 'AGENT_AUTHENTICATION_FAILED',
+  'AGENT_GUARDRAIL_REJECTED', 'AGENT_CONCURRENCY_LIMIT',
   'AGENT_CALLBACK_ERROR', 'AGENT_BACKPRESSURE', 'PLAYBACK_FAILED', 'AGENT_USER_TURN_MISSING', 'AGENT_INITIATION_REJECTED',
   'AGENT_INPUT_INCOMPLETE', 'AGENT_INPUT_INVALID',
   'TOOL_UNAVAILABLE', 'TOOL_FAILED', 'TOOL_TIMEOUT', 'TOOL_CANCELLED',
@@ -184,6 +219,7 @@ const events = new Set([
   'jarvis_agent_playback_completed', 'jarvis_agent_turn_recovering',
   'jarvis_turn_queue_changed', 'jarvis_agent_turn_superseded', 'jarvis_agent_turn_finished', 'jarvis_agent_audio_progress',
   'jarvis_voice_captured', 'jarvis_wake_detected', 'jarvis_agent_input_started', 'jarvis_agent_input_sent',
+  'jarvis_wake_failed',
   'jarvis_agent_user_turn_recognized', 'jarvis_agent_initial_output_discarded', 'jarvis_agent_response_observed',
   'jarvis_agent_session_ready',
   'jarvis_identity_injected', 'jarvis_tool_event', 'jarvis_search_result', 'jarvis_voice_participants_result',

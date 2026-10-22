@@ -391,6 +391,11 @@ describe('V5 Discord integration with the real per-speaker session manager', () 
     };
     expect(search.sources).toEqual([]);
     expect(search.uncertainty).toMatch(/chave|configurad/i);
+    const turn = h.logs.find(event => event.event === 'jarvis_agent_turn_started')!;
+    expect(h.logs.filter(event => event.event === 'jarvis_search_result')).toEqual([
+      expect.objectContaining({ incident: turn.incident, search_status: 'missing_key', source_count: 0 }),
+    ]);
+    expect(JSON.stringify(h.logs)).not.toMatch(/fictional-elevenlabs-key|conteúdo privado|"game"|"query"/);
     await expect(tools('search_game_info', { game: 'Game', query: 'Update', user_id: OWNER },
       new AbortController().signal)).rejects.toThrow('tool_parameters');
     expect(fetch).not.toHaveBeenCalled();

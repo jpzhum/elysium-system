@@ -112,6 +112,11 @@ e cancelamento impedem execução posterior de tarefas daquele participante.
 
 ## ElevenLabs
 
+O ajuste V5.4.1 adiciona diagnóstico correlacionado, mediana/p95 por etapa e
+comparação privada do prompt publicado. Consulte
+[docs/V541_FINE_TUNING.md](docs/V541_FINE_TUNING.md) para evidências, limites das
+medições e campos exatos do ElevenLabs a revisar manualmente.
+
 Para a revisão V5.4, veja a investigação, os testes, a configuração manual e o
 rollback em [docs/V54_STABILITY_REVIEW.md](docs/V54_STABILITY_REVIEW.md).
 O prompt final está em [agent-system-prompt.md](agent-system-prompt.md); sua

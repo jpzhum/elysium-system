@@ -14,10 +14,31 @@ export interface ToolConfigurationAudit {
   readonly mentioned_in_prompt: boolean;
 }
 
+/** Allowlisted configuration values only; missing/unknown values remain null, never assumed defaults. */
+export interface TurnTakingConfigurationAudit {
+  readonly turn_timeout: number | null;
+  readonly silence_end_call_timeout: number | null;
+  readonly turn_eagerness: 'patient' | 'normal' | 'eager' | null;
+  readonly turn_model: 'turn_v2' | 'turn_v3' | null;
+  readonly mode: 'turn' | 'silence' | null;
+  readonly speculative_turn: boolean | null;
+  readonly soft_timeout_config: {
+    readonly timeout_seconds: number | null;
+    readonly use_llm_generated_message: boolean | null;
+  };
+  readonly max_duration_seconds: number | null;
+  readonly text_only: boolean | null;
+  readonly vad_background_voice_detection: boolean | null;
+}
+
 export interface AgentConfigurationAudit {
   readonly status: 'ok' | 'missing_configuration' | 'invalid_identifier' | 'request_failed' | 'invalid_reply' | 'tool_limit';
   readonly scope: 'main_agent_only';
   readonly published_prompt_present: boolean;
+  readonly local_prompt_present: boolean;
+  readonly published_prompt_matches_local: boolean;
+  /** Only line endings and outer whitespace are ignored; this does not compare semantic equivalence. */
+  readonly published_prompt_matches_local_normalized: boolean;
   readonly prompt_variables: Record<typeof VARIABLES[number], boolean>;
   readonly tools: { readonly search_game_info: ToolConfigurationAudit; readonly get_voice_participants: ToolConfigurationAudit };
   readonly client_events: Record<typeof EVENTS[number], boolean>;
@@ -26,6 +47,7 @@ export interface AgentConfigurationAudit {
   readonly first_message_override_allowed: boolean;
   readonly published_first_message_empty: boolean;
   readonly workflow_present: boolean;
+  readonly turn_taking: TurnTakingConfigurationAudit;
   /** Static references do not prove that the LLM follows them; live two-account tests are mandatory. */
   readonly runtime_behavior_verified: false;
 }
@@ -33,6 +55,39 @@ export interface AgentConfigurationAudit {
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown> : {};
+}
+
+function allowed<T extends string>(value: unknown, values: readonly T[]): T | null {
+  return typeof value === 'string' && values.includes(value as T) ? value as T : null;
+}
+
+function numeric(value: unknown, minimum: number, maximum: number): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= minimum && value <= maximum ? value : null;
+}
+
+function boolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function turnTakingAudit(conversation: Record<string, unknown>): TurnTakingConfigurationAudit {
+  const turn = record(conversation.turn);
+  const softTimeout = record(turn.soft_timeout_config);
+  const config = record(conversation.conversation);
+  return {
+    turn_timeout: numeric(turn.turn_timeout, 1, 30),
+    silence_end_call_timeout: numeric(turn.silence_end_call_timeout, -1, 7200),
+    turn_eagerness: allowed(turn.turn_eagerness, ['patient', 'normal', 'eager']),
+    turn_model: allowed(turn.turn_model, ['turn_v2', 'turn_v3']),
+    mode: allowed(turn.mode, ['turn', 'silence']),
+    speculative_turn: boolean(turn.speculative_turn),
+    soft_timeout_config: {
+      timeout_seconds: softTimeout.timeout_seconds === -1 ? -1 : numeric(softTimeout.timeout_seconds, 0.5, 8),
+      use_llm_generated_message: boolean(softTimeout.use_llm_generated_message),
+    },
+    max_duration_seconds: numeric(config.max_duration_seconds, 60, 7200),
+    text_only: boolean(config.text_only),
+    vad_background_voice_detection: boolean(record(conversation.vad).background_voice_detection),
+  };
 }
 
 function toolAudit(name: string, prompt: string, tools: readonly unknown[], expected: readonly string[]): ToolConfigurationAudit {
@@ -53,14 +108,16 @@ function toolAudit(name: string, prompt: string, tools: readonly unknown[], expe
   };
 }
 
-/** Pure inspector: outputs fixed field names and booleans even when upstream includes private fields. */
+/** Pure inspector: fixed field names, booleans and allowlisted settings; never returns provider text. */
 export function inspectAgentConfiguration(
-  payload: unknown, resolvedTools: readonly unknown[] = [], toolDefinitionsResolved = true,
+  payload: unknown, resolvedTools: readonly unknown[] = [], toolDefinitionsResolved = true, localPrompt?: string,
 ): AgentConfigurationAudit {
   const agent = record(payload);
   const conversation = record(agent.conversation_config);
   const promptConfig = record(record(conversation.agent).prompt);
   const prompt = typeof promptConfig.prompt === 'string' ? promptConfig.prompt : '';
+  const localPromptPresent = typeof localPrompt === 'string' && localPrompt.trim().length > 0;
+  const normalize = (value: string): string => value.replace(/\r\n?/g, '\n').trim();
   const inline = Array.isArray(promptConfig.tools) ? promptConfig.tools : [];
   const tools = [...inline, ...resolvedTools.map((tool) => record(tool).tool_config ?? tool)];
   const events = Array.isArray(record(conversation.conversation).client_events)
@@ -71,6 +128,10 @@ export function inspectAgentConfiguration(
     status: Object.keys(conversation).length > 0 ? 'ok' : 'invalid_reply',
     scope: 'main_agent_only',
     published_prompt_present: prompt.length > 0,
+    local_prompt_present: localPromptPresent,
+    published_prompt_matches_local: prompt.length > 0 && localPromptPresent && prompt === localPrompt,
+    published_prompt_matches_local_normalized: prompt.length > 0 && localPromptPresent
+      && normalize(prompt) === normalize(localPrompt),
     prompt_variables: Object.fromEntries(VARIABLES.map((name) => [name,
       new RegExp(`\\{\\{\\s*${name}\\s*\\}\\}`).test(prompt)])) as AgentConfigurationAudit['prompt_variables'],
     tools: {
@@ -83,6 +144,7 @@ export function inspectAgentConfiguration(
     first_message_override_allowed: firstMessage === true,
     published_first_message_empty: record(conversation.agent).first_message === '',
     workflow_present: Object.keys(record(record(agent.workflow).nodes)).length > 0,
+    turn_taking: turnTakingAudit(conversation),
     runtime_behavior_verified: false,
   };
 }
@@ -133,10 +195,10 @@ async function readBounded(response: Response, signal: AbortSignal): Promise<unk
 }
 
 export async function auditAgentConfiguration(
-  options: { apiKey?: string; agentId?: string; signal?: AbortSignal }, request: typeof fetch = fetch,
+  options: { apiKey?: string; agentId?: string; signal?: AbortSignal; localPrompt?: string }, request: typeof fetch = fetch,
 ): Promise<AgentConfigurationAudit> {
   const failure = (status: AgentConfigurationAudit['status']): AgentConfigurationAudit => ({
-    ...inspectAgentConfiguration({}), status, tool_definitions_resolved: false,
+    ...inspectAgentConfiguration({}, [], false, options.localPrompt), status,
   });
   if (!options.apiKey || !options.agentId) return failure('missing_configuration');
   if (!/^[A-Za-z0-9_-]{1,200}$/.test(options.agentId)) return failure('invalid_identifier');
@@ -154,6 +216,6 @@ export async function auditAgentConfiguration(
     const ids = [...new Set(rawIds as string[])];
     const tools: unknown[] = [];
     for (const id of ids) tools.push(await get(`tools/${id}`));
-    return inspectAgentConfiguration(agent, tools, true);
+    return inspectAgentConfiguration(agent, tools, true, options.localPrompt);
   } catch { return failure('request_failed'); }
 }

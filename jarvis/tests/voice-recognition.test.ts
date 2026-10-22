@@ -153,6 +153,73 @@ describe('voice recognition fences initial agent greetings', () => {
     expect(h.manager.queueStatus).toEqual({ waiting: 0, active: true });
   });
 
+  test('cancelled wake detection is not counted as an unheard wake word', async () => {
+    let resolve!: (activated: boolean) => void;
+    const h = harness({ detectWake: () => new Promise<boolean>(yes => { resolve = yes; }) });
+    const pending = h.manager.voiceTurn(h.speaker(), utterance());
+    h.manager.cancelUser('guest', 'revoked');
+    resolve(false);
+    expect(await pending).toBeUndefined();
+    expect(h.metric).not.toHaveBeenCalledWith('wake_rejections');
+    expect(h.connect).not.toHaveBeenCalled();
+  });
+
+  test('post-upload recognition has its own single timing sample', async () => {
+    vi.useFakeTimers();
+    const h = harness(); await h.voice();
+    await vi.advanceTimersByTimeAsync(125);
+    const cb = h.callbacks.get('guest')!;
+    cb.onUserTranscript?.({ eventId: 10 });
+    cb.onUserTranscript?.({ eventId: 10 });
+    const samples = h.metric.mock.calls.filter(([name]) => name === 'agent_user_recognition_ms');
+    expect(samples).toHaveLength(1);
+    expect(samples[0]?.[1]).toBe(125);
+    expect(h.metric).toHaveBeenCalledWith('agent_post_upload_recognition_ms', 125);
+  });
+
+  test.each([
+    { phase: 'source', frame: 6, elapsed: 100 },
+    { phase: 'VAD tail', frame: 14, elapsed: 260 },
+  ])('recognition during $phase measures elapsed input without inventing a post-upload sample', async ({ frame, elapsed }) => {
+    vi.useFakeTimers();
+    const h = harness({ pace: async () => { vi.advanceTimersByTime(20); }, onSendAudio: (cb, currentFrame) => {
+      if (currentFrame === frame) cb.onUserTranscript?.({ eventId: 10 });
+    } });
+    await h.voice();
+    expect(h.metric).toHaveBeenCalledWith('agent_user_turns_recognized');
+    expect(h.metric).toHaveBeenCalledWith('agent_user_recognition_ms', elapsed);
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_post_upload_recognition_ms')).toHaveLength(0);
+  });
+
+  test('a reused socket measures recognition from its current input rather than a previous turn', async () => {
+    vi.useFakeTimers();
+    const h = harness(); await h.voice();
+    const cb = h.callbacks.get('guest')!;
+    await vi.advanceTimersByTimeAsync(125);
+    cb.onUserTranscript?.({ eventId: 10 });
+    await cb.onAudio(Buffer.alloc(480, 1), 11); cb.onResponseComplete(11); await settle();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await h.voice();
+    await vi.advanceTimersByTimeAsync(250);
+    cb.onUserTranscript?.({ eventId: 20 });
+    expect(h.connect).toHaveBeenCalledOnce();
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_user_recognition_ms'))
+      .toEqual([['agent_user_recognition_ms', 125], ['agent_user_recognition_ms', 250]]);
+  });
+
+  test('playback duration starts at the first local packet rather than question arrival', async () => {
+    vi.useFakeTimers();
+    const h = harness(); await h.voice();
+    await vi.advanceTimersByTimeAsync(300);
+    const cb = h.callbacks.get('guest')!;
+    cb.onUserTranscript?.({ eventId: 10 });
+    await cb.onAudio(Buffer.alloc(480, 1), 11);
+    await vi.advanceTimersByTimeAsync(125);
+    h.streams[0]!.drain();
+    expect(h.metric).toHaveBeenCalledWith('agent_playback_ms', 125);
+    expect(h.metric).toHaveBeenCalledWith('agent_playback_drained_ms', 425);
+  });
+
   test('recognition deadline starts after the entire paced upload rather than during a long question', async () => {
     vi.useFakeTimers();
     const h = harness({ pace: async () => { vi.advanceTimersByTime(20); } });

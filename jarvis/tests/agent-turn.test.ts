@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { afterEach, expect, test, vi } from 'vitest';
 import { createAgentConnector, type AgentDependencies } from '../src/agents/elevenlabs-client.js';
 import { SessionManager, type Playback, type SessionOptions } from '../src/agents/session-manager.js';
+import { WakeError } from '../src/agents/wake-detector.js';
 import type { PlaybackStream } from '../src/audio/playback.js';
 import { Logger, Metrics } from '../src/observability/metrics.js';
 import { ConsentStore } from '../src/policy/consent.js';
@@ -154,6 +155,36 @@ test('missing ASR has its own sanitized ten-second diagnostic without being coun
   });
   expect(h.metrics.snapshot().agent_response_timeouts ?? 0).toBe(0);
   expect(h.metrics.snapshot().agent_completion_missing ?? 0).toBe(0);
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+});
+
+test('failed wake STT retains the capture incident without becoming a missed wake word', async () => {
+  const h = setup();
+  h.detectWake.mockRejectedValue(new WakeError('wake_provider_failed'));
+  await expect(h.manager.voiceTurn(h.speaker, Buffer.alloc(19_200, 1)))
+    .rejects.toMatchObject({ code: 'wake_provider_failed' });
+  const capture = h.logs.find(line => line.event === 'jarvis_voice_captured');
+  expect(h.logs.find(line => line.event === 'jarvis_wake_failed')).toMatchObject({
+    incident: capture?.incident, stage: 'wake_detection', rejection_reason: 'wake_provider_failed',
+    duration_ms: expect.any(Number),
+  });
+  expect(h.metrics.snapshot().wake_rejections ?? 0).toBe(0);
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
+});
+
+test.each([
+  { event: { type: 'guardrail_triggered', private_details: secret }, code: 'AGENT_GUARDRAIL_REJECTED',
+    counter: 'agent_guardrail_rejections' },
+  { event: { type: 'queue_status', queue_status_event: { status: 'waiting' } }, code: 'AGENT_CONCURRENCY_LIMIT',
+    counter: 'agent_concurrency_rejections' },
+])('known provider rejection is distinguishable from an absent response: $code', async ({ event, code, counter }) => {
+  const h = setup();
+  await h.ask();
+  h.socket.event(event); await settle();
+  h.failed(code);
+  expect(h.metrics.snapshot()[counter]).toBe(1);
+  expect(h.metrics.snapshot().agent_response_timeouts ?? 0).toBe(0);
+  expect(h.metrics.snapshot().agent_user_turn_missing ?? 0).toBe(0);
   expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
 });
 

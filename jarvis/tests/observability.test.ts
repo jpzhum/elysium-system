@@ -274,14 +274,59 @@ test('stream gauges return to zero and fixed metric cardinality is bounded', () 
   expect(Object.keys(metrics.snapshot())).toHaveLength(256);
 });
 
-test('latency samples retain units, count, extrema and last value without invented percentiles', () => {
+test('latency samples retain aggregates and measured window median/p95 in milliseconds', () => {
   const metrics = new Metrics();
   metrics.record('opus_encode_ms', 0.25); metrics.record('opus_encode_ms', 0.75);
   metrics.record('opus_encode_ms', -1); metrics.record('opus_encode_ms', NaN);
   metrics.record('opus_encode_ms', Infinity); metrics.record('opus_encode_ms', 3_600_001);
   metrics.record('turn_queue_depth', 2); metrics.record('turn_queue_depth', -2);
   expect(metrics.snapshot()).toEqual({ opus_encode_ms: 1, opus_encode_ms_samples: 2,
-    opus_encode_ms_last: 0.75, opus_encode_ms_min: 0.25, opus_encode_ms_max: 0.75, turn_queue_depth: 0 });
+    opus_encode_ms_last: 0.75, opus_encode_ms_min: 0.25, opus_encode_ms_max: 0.75,
+    opus_encode_ms_median: 0.5, opus_encode_ms_p95: 0.75, opus_encode_ms_window_samples: 2,
+    turn_queue_depth: 0 });
+});
+
+test('latency distribution keeps only the latest 256 samples and preserves lifetime aggregates', () => {
+  const metrics = new Metrics();
+  for (let value = 1; value <= 300; value++) metrics.record('stage_ms', value);
+  expect(metrics.snapshot()).toEqual({ stage_ms: 45_150, stage_ms_samples: 300,
+    stage_ms_last: 300, stage_ms_min: 1, stage_ms_max: 300,
+    stage_ms_median: 172.5, stage_ms_p95: 288, stage_ms_window_samples: 256 });
+  // Sorting a snapshot must not alter the ring, including when values arrive out of order.
+  metrics.record('stage_ms', 0);
+  expect(metrics.snapshot()).toMatchObject({ stage_ms_samples: 301, stage_ms_window_samples: 256,
+    stage_ms_median: 172.5, stage_ms_p95: 288, stage_ms_min: 0, stage_ms_last: 0 });
+});
+
+test('skewed stages keep independent windows and distinguish median from nearest-rank p95', () => {
+  const metrics = new Metrics();
+  for (const value of [1, 2, 3, 4, 100]) metrics.record('recognition_ms', value);
+  for (const value of [0, 0, 0, 1000]) metrics.record('playback_ms', value);
+  expect(metrics.snapshot()).toMatchObject({ recognition_ms_median: 3,
+    recognition_ms_p95: 100, recognition_ms_window_samples: 5,
+    playback_ms_median: 0, playback_ms_p95: 1000, playback_ms_window_samples: 4 });
+});
+
+test('duration aggregate admission is atomic at the counter limit and existing series keep updating', () => {
+  const full = new Metrics();
+  for (let index = 0; index < 252; index++) full.add(`counter_${index}`);
+  full.record('stage_ms', 10);
+  expect(full.snapshot()).not.toHaveProperty('stage_ms');
+  expect(Object.keys(full.snapshot())).toHaveLength(252);
+
+  const admitted = new Metrics();
+  for (let index = 0; index < 251; index++) admitted.add(`counter_${index}`);
+  admitted.record('stage_ms', 10);
+  admitted.record('stage_ms', 20);
+  expect(admitted.snapshot()).toMatchObject({ stage_ms: 30, stage_ms_samples: 2,
+    stage_ms_median: 15, stage_ms_p95: 20, stage_ms_window_samples: 2 });
+});
+
+test('duration windows have bounded series cardinality', () => {
+  const metrics = new Metrics();
+  for (let index = 0; index < 100; index++) metrics.record(`stage_${index}_ms`, index);
+  expect(Object.keys(metrics.snapshot())).toHaveLength(32 * 8);
+  expect(metrics.snapshot()).not.toHaveProperty('stage_32_ms');
 });
 
 test('queue and local drain diagnostics accept only bounded, reviewed state', () => {

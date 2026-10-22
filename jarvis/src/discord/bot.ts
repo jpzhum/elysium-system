@@ -56,11 +56,6 @@ export class JarvisBot {
       timeoutMs: config.JARVIS_SEARCH_TIMEOUT_MS, onDiagnostic: (event) => {
       this.metrics.add(`search_${event.status}`);
       this.metrics.record('search_duration_ms', event.durationMs);
-      this.logger.event('jarvis_search_result', event.status === 'success' ? 'info' : 'warn', {
-        operation: 'search', stage: 'search_request', search_status: event.status,
-        duration_ms: Math.round(event.durationMs), source_count: event.sourceCount,
-        search_key_configured: Boolean(this.config.JARVIS_SEARCH_API_KEY),
-      });
     } });
     this.client.once(Events.ClientReady, () => {
       void this.ready().catch(() => { this.logger.event('command_registration_failed', 'error'); void this.stop(); });
@@ -369,7 +364,15 @@ export class JarvisBot {
             const values = parameters as Record<string, unknown>;
             if (typeof values.game !== 'string' || typeof values.query !== 'string') throw new Error('tool_parameters');
             this.metrics.add('search_calls');
+            // Capture the originating turn before cancellation can release it.
+            const incident = room.sessions.turnIncident(speaker);
+            const started = performance.now();
             const result = await this.search(values.game, values.query, currentSignal);
+            this.logger.event('jarvis_search_result', result.status === 'success' ? 'info' : 'warn', {
+              incident, operation: 'search', stage: 'search_request', search_status: result.status,
+              duration_ms: Math.max(0, Math.round(performance.now() - started)), source_count: result.sources.length,
+              search_key_configured: Boolean(this.config.JARVIS_SEARCH_API_KEY),
+            });
             if (!allowed()) throw new AuthorizationError();
             return result;
           },

@@ -127,6 +127,7 @@ test('capture and end-of-speech latency are numeric and a barge-in retains its p
     captureStartedAtMs: 0, captureEndedAtMs: 640 });
   expect(h.delivered[0]!.timing.captureId).toMatch(/:1$/);
   expect(h.metric).toHaveBeenCalledWith('voice_capture_ms', 640);
+  expect(h.metric).toHaveBeenCalledWith('voice_capture_active_ms', 40);
   expect(h.metric).toHaveBeenCalledWith('voice_end_detection_ms', 600);
   h.receiver.stop();
 });
