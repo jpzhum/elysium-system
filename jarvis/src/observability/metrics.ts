@@ -63,7 +63,7 @@ export const errorCodes = [
   'AGENT_INVALID_EVENT', 'AGENT_AUDIO_FORMAT_UNSUPPORTED', 'AGENT_METADATA_TIMEOUT',
   'AGENT_CREDIT_LIMIT', 'AGENT_RATE_LIMITED', 'AGENT_AUTHENTICATION_FAILED',
   'AGENT_CALLBACK_ERROR', 'AGENT_BACKPRESSURE', 'PLAYBACK_FAILED', 'AGENT_USER_TURN_MISSING', 'AGENT_INITIATION_REJECTED',
-  'AGENT_INPUT_INCOMPLETE',
+  'AGENT_INPUT_INCOMPLETE', 'AGENT_INPUT_INVALID',
   'TOOL_UNAVAILABLE', 'TOOL_FAILED', 'TOOL_TIMEOUT', 'TOOL_CANCELLED',
 ] as const;
 export type ErrorCode = typeof errorCodes[number];
@@ -159,6 +159,15 @@ export interface DiagnosticFields {
   context_injected?: boolean;
   context_items?: number;
   context_chars?: number;
+  recovery_attempt?: number;
+  retry_delay_ms?: number;
+  receiver_state?: 'ready' | 'suspended' | 'stopped';
+  capture_rejection?: 'too_short' | 'silent';
+  rejection_reason?: 'consent' | 'busy' | 'limit' | 'closed' | 'unexpected'
+    | 'queue_full' | 'user_queue_full' | 'voice_memory_limit' | 'turn_budget'
+    | 'wake_check_busy' | 'wake_capacity' | 'voice_unavailable' | 'consent_invalid'
+    | 'wake_queue_full' | 'wake_queue_timeout' | 'wake_rate_limited' | 'wake_provider_failed';
+  voice_lifecycle_reason?: 'explicit_leave' | 'channel_changed' | 'channel_empty' | 'shutdown' | 'connection_destroyed' | 'room_replaced';
 }
 
 const events = new Set([
@@ -179,6 +188,7 @@ const events = new Set([
   'jarvis_agent_session_ready',
   'jarvis_identity_injected', 'jarvis_tool_event', 'jarvis_search_result', 'jarvis_voice_participants_result',
   'jarvis_short_context', 'jarvis_agent_turn_recovered',
+  'jarvis_voice_receiver_state', 'jarvis_voice_turn_rejected', 'jarvis_voice_capture_rejected',
 ]);
 
 export function newIncident(): string { return randomBytes(4).toString('hex').toUpperCase(); }
@@ -211,6 +221,13 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['search_status', ['success', 'missing_key', 'invalid_input', 'cancelled', 'rate_limited', 'unavailable', 'timeout', 'invalid_reply', 'no_sources']],
     ['tool_name', ['search_game_info', 'get_voice_participants', 'unknown']],
     ['tool_stage', ['received', 'started', 'completed', 'failed']],
+    ['receiver_state', ['ready', 'suspended', 'stopped']],
+    ['capture_rejection', ['too_short', 'silent']],
+    ['rejection_reason', ['consent', 'busy', 'limit', 'closed', 'unexpected',
+      'queue_full', 'user_queue_full', 'voice_memory_limit', 'turn_budget',
+      'wake_check_busy', 'wake_capacity', 'voice_unavailable', 'consent_invalid',
+      'wake_queue_full', 'wake_queue_timeout', 'wake_rate_limited', 'wake_provider_failed']],
+    ['voice_lifecycle_reason', ['explicit_leave', 'channel_changed', 'channel_empty', 'shutdown', 'connection_destroyed', 'room_replaced']],
     ['platform', ['win32', 'linux', 'darwin']], ['arch', ['x64', 'arm64']],
   ] as const) {
     const value = diagnosticValue(fields, key);
@@ -244,6 +261,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['input_source_chunks', 0, 10_000], ['input_silence_chunks', 0, 10_000], ['upload_ms', 0, 120_000],
     ['source_count', 0, 5],
     ['context_items', 0, 10], ['context_chars', 0, 2400],
+    ['recovery_attempt', 1, 3], ['retry_delay_ms', 0, 5_000],
   ] as const) {
     const value = diagnosticValue(fields, key);
     if (integer(value, minimum, maximum)) result[key] = value;

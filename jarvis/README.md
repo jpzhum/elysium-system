@@ -112,6 +112,11 @@ e cancelamento impedem execução posterior de tarefas daquele participante.
 
 ## ElevenLabs
 
+Para a revisão V5.4, veja a investigação, os testes, a configuração manual e o
+rollback em [docs/V54_STABILITY_REVIEW.md](docs/V54_STABILITY_REVIEW.md).
+O prompt final está em [agent-system-prompt.md](agent-system-prompt.md); sua
+preparação local não significa que a versão publicada foi atualizada.
+
 Siga [docs/ELEVENLABS.md](docs/ELEVENLABS.md): agente privado, voz existente
 autorizada, português, PCM negociado e evento `agent_response_complete` habilitado.
 Copie [agent-system-prompt.md](agent-system-prompt.md) para System prompt. O worker
@@ -147,6 +152,10 @@ um detector acústico local. Há limite global de verificações por minuto. A g
 transcrita Jarvis/Járvis/Djárvis ativa uma sessão ElevenAgents para o falante;
 o turno original segue em PCM mono negociado, em chunks com pacing e silêncio
 final para VAD. Não há streaming permanente do canal inteiro.
+Capturas menores que um frame de 20 ms ou que resultam em silêncio digital no
+downmix são descartadas. Depois do upload completo, o reconhecimento por
+`user_transcript` tem prazo próprio de 10 s; se faltar, a sessão é encerrada e a
+fila avança. Esse prazo não é o watchdog de geração de 45 s nem o deadline Brave.
 O turno enviado inclui a pergunta completa capturada, sem recortar tudo após um
 timestamp presumido da wake word. O fim de captura usa 600 ms de silêncio, RMS
 mínimo de 0,008 e teto de 12 s por padrão; 600 ms não é a duração total da captura.
@@ -223,6 +232,7 @@ análise de licença. Não há latência inferior a dois segundos comprovada.
 | `JARVIS_FOLLOWUP_SECONDS` | 18 s após playback |
 | `JARVIS_MAX_TURNS_PER_HOUR` | 120 tentativas por sessão de sala |
 | `JARVIS_MAX_WAKE_CHECKS_PER_MINUTE` | 6 verificações externas por worker |
+| `JARVIS_SEARCH_TIMEOUT_MS` | 5000 ms totais para Brave, incluindo leitura da resposta, sem retries |
 | `JARVIS_BARGE_IN_ENABLED` | `false`; requer modo `elevenlabs-stt` e aceite de áudio |
 | `JARVIS_LOG_LEVEL` | `info`; aceita `warn`/`error` |
 

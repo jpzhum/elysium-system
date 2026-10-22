@@ -311,7 +311,7 @@ test("recovery timeout destroys after 25 seconds with no remaining waits", async
   assertClean(state.connection);
 });
 
-test("a new asynchronous error during recovery is not mislabeled as timeout", async () => {
+test("transient errors during recovery retry with backoff without destroying the live connection", async () => {
   vi.useFakeTimers();
   const state = setup();
   const joining = state.manager.join(channel, state.diagnostics);
@@ -320,12 +320,78 @@ test("a new asynchronous error during recovery is not mislabeled as timeout", as
   state.connection.transition(VoiceConnectionStatus.Disconnected, { reason: VoiceConnectionDisconnectReason.EndpointRemoved });
   state.connection.emit("error", Object.assign(new Error("PRIVATE"), { code: "ENOTFOUND" }));
   await vi.advanceTimersByTimeAsync(0);
-  const record = state.records().find((entry) => entry.event === "voice_recovery_failed")!;
-  assert.equal(record.category, "network");
-  assert.equal(record.code, "ENOTFOUND");
-  assert.equal(state.manager.connection, undefined);
+  assert.equal(state.connection.rejoin.mock.calls.length, 1);
+  state.connection.emit("error", Object.assign(new Error("PRIVATE"), { code: "ECONNRESET" }));
+  // Repeated callbacks do not create parallel recovery loops or connections.
+  state.connection.emit("error", Object.assign(new Error("PRIVATE"), { code: "ECONNRESET" }));
+  await vi.advanceTimersByTimeAsync(999);
+  assert.equal(state.connection.rejoin.mock.calls.length, 1);
+  await vi.advanceTimersByTimeAsync(1);
+  assert.equal(state.connection.rejoin.mock.calls.length, 2);
+  assert.equal(state.connection.destroy.mock.calls.length, 0);
+  state.connection.transition(VoiceConnectionStatus.Ready);
+  await vi.advanceTimersByTimeAsync(0);
+  assert.equal(state.manager.connection, state.connection);
+  assert.equal(mocks.join.mock.calls.length, 1);
+  assert.equal(state.records().some((entry) => entry.event === "voice_recovery_ready"), true);
+  assert.equal(state.records().some((entry) => entry.event === "voice_recovery_failed"), false);
+  assert.deepEqual(state.records().filter((entry) => entry.event === "voice_recovery_rejoin")
+    .map(({ recovery_attempt, retry_delay_ms }) => ({ recovery_attempt, retry_delay_ms })), [
+    { recovery_attempt: 1, retry_delay_ms: 0 }, { recovery_attempt: 2, retry_delay_ms: 1_000 },
+  ]);
+  assert.doesNotMatch(state.lines.join(""), /PRIVATE/);
+  state.manager.leave();
   assert.equal(vi.getTimerCount(), 0);
   assertClean(state.connection);
+});
+
+test("recovery uses at most three rejoins and cancels all waits at its original deadline", async () => {
+  vi.useFakeTimers();
+  const state = setup();
+  const joining = state.manager.join(channel, state.diagnostics);
+  state.connection.transition(VoiceConnectionStatus.Ready); await joining;
+  state.connection.transition(VoiceConnectionStatus.Disconnected, { reason: VoiceConnectionDisconnectReason.EndpointRemoved });
+  await vi.advanceTimersByTimeAsync(25_000);
+  assert.equal(state.connection.rejoin.mock.calls.length, 3);
+  assert.equal(state.connection.destroy.mock.calls.length, 1);
+  await vi.advanceTimersByTimeAsync(60_000);
+  assert.equal(state.connection.rejoin.mock.calls.length, 3);
+  assert.equal(vi.getTimerCount(), 0);
+  assertClean(state.connection);
+});
+
+test("a transport that becomes ready during backoff is retained without another rejoin", async () => {
+  vi.useFakeTimers();
+  const state = setup();
+  const joining = state.manager.join(channel, state.diagnostics);
+  state.connection.transition(VoiceConnectionStatus.Ready); await joining;
+  state.connection.transition(VoiceConnectionStatus.Disconnected, { reason: VoiceConnectionDisconnectReason.EndpointRemoved });
+  await vi.advanceTimersByTimeAsync(10_000); // Grace + first attempt end; 1 s backoff is pending.
+  assert.equal(state.connection.rejoin.mock.calls.length, 1);
+  state.connection.transition(VoiceConnectionStatus.Ready);
+  await vi.advanceTimersByTimeAsync(1_000);
+  assert.equal(state.connection.rejoin.mock.calls.length, 1);
+  assert.equal(state.manager.connection, state.connection);
+  assert.equal(state.records().some((entry) => entry.event === "voice_recovery_ready"), true);
+  state.manager.leave();
+  assert.equal(vi.getTimerCount(), 0);
+  assertClean(state.connection);
+});
+
+test("fatal permission and encryption failures do not automatically rejoin a ready channel", async () => {
+  for (const extra of [
+    { reason: VoiceConnectionDisconnectReason.AdapterUnavailable },
+    { reason: VoiceConnectionDisconnectReason.WebSocketClose, closeCode: 4017 },
+    { reason: VoiceConnectionDisconnectReason.WebSocketClose, closeCode: 4014 },
+  ]) {
+    const state = setup();
+    const joining = state.manager.join(channel, state.diagnostics);
+    state.connection.transition(VoiceConnectionStatus.Ready); await joining;
+    state.connection.transition(VoiceConnectionStatus.Disconnected, extra);
+    assert.equal(state.manager.connection, undefined);
+    assert.equal(state.connection.rejoin.mock.calls.length, 0);
+    assertClean(state.connection);
+  }
 });
 
 test("cancel during reconnect does not reconnect later or retain observers", async () => {

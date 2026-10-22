@@ -25,11 +25,14 @@ export interface GameSearchDiagnostic {
 
 export interface GameSearchOptions {
   apiKey?: string;
+  /** One total deadline for headers and body, with no automatic retries. */
+  timeoutMs?: number;
   /** Content-free diagnostics only; no query, source, provider body or credential. */
   onDiagnostic?(event: GameSearchDiagnostic): void;
 }
 
-const UNAVAILABLE = 'Não foi possível verificar essa informação de jogo agora.';
+const DEFAULT_TIMEOUT_MS = 5000;
+const UNAVAILABLE = 'Não consegui concluir a pesquisa desta vez, senhor. Posso tentar novamente.';
 
 /** One instance per worker: at most one request in flight and one start per second. */
 export function createGameSearch(options: GameSearchOptions): (
@@ -71,7 +74,7 @@ export function createGameSearch(options: GameSearchOptions): (
         }
         if (waits.length) nextRequestAt = Math.max(nextRequestAt,
           Date.now() + Math.min(120, Math.max(...waits)) * 1000);
-      }));
+      }, options.timeoutMs));
     } finally { active = false; }
   };
 }
@@ -114,7 +117,12 @@ async function readReply(response: Response, signal: AbortSignal): Promise<unkno
   };
   signal.addEventListener('abort', onAbort, { once: true });
   try {
-    if (signal.aborted) throw new Error('search_cancelled');
+    if (signal.aborted) {
+      // An abort can win the handoff between fetch headers and body reading.
+      // The listener was attached after that event, so cancel the reader here.
+      void reader.cancel().catch(() => { /* Cancellation must not block the result. */ });
+      throw new Error('search_cancelled');
+    }
     while (true) {
       const part = await Promise.race([reader.read(), aborted]);
       if (part.done) break;
@@ -138,14 +146,14 @@ async function readReply(response: Response, signal: AbortSignal): Promise<unkno
  * This module never reads environment variables or logs queries, secrets or replies.
  */
 export async function searchGameInfo(
-  game: string, query: string, apiKey?: string, signal?: AbortSignal,
+  game: string, query: string, apiKey?: string, signal?: AbortSignal, timeoutMs?: number,
 ): Promise<GameSearchResult> {
-  return performSearch(game, query, apiKey, signal);
+  return performSearch(game, query, apiKey, signal, undefined, timeoutMs);
 }
 
 async function performSearch(
   game: string, query: string, apiKey?: string, signal?: AbortSignal,
-  onHeaders?: (response: Response) => void,
+  onHeaders?: (response: Response) => void, timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<GameSearchResult> {
   const result = emptyResult(game, query);
   const unavailable = (status: GameSearchStatus, reason: string): GameSearchResult => ({
@@ -156,18 +164,40 @@ async function performSearch(
   }
   if (!apiKey) return unavailable('missing_key', 'Pesquisa externa indisponível: chave da API de busca não configurada.');
   if (signal?.aborted) return unavailable('cancelled', 'Consulta cancelada; nenhuma informação foi verificada.');
-  const timeout = AbortSignal.timeout(6000);
-  const requestSignal = signal ? AbortSignal.any([timeout, signal]) : timeout;
+  const controller = new AbortController();
+  const requestSignal = controller.signal;
+  let timedOut = false;
+  const cancel = (): void => { controller.abort(); };
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    cancel();
+  }, Number.isInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_TIMEOUT_MS);
+  let rejectAborted!: (reason: Error) => void;
+  const aborted = new Promise<never>((_resolve, reject) => { rejectAborted = reject; });
+  const onAbort = (): void => { rejectAborted(new Error('search_cancelled')); };
+  requestSignal.addEventListener('abort', onAbort, { once: true });
   const endpoint = new URL('https://api.search.brave.com/res/v1/web/search');
   endpoint.searchParams.set('q', `${result.game} ${result.query}`);
   endpoint.searchParams.set('count', '5');
   endpoint.searchParams.set('safesearch', 'moderate');
   try {
-    const response = await fetch(endpoint, {
+    if (requestSignal.aborted) throw new Error('search_cancelled');
+    const request = fetch(endpoint, {
       headers: { Accept: 'application/json', 'X-Subscription-Token': apiKey },
       signal: requestSignal,
       redirect: 'error',
     });
+    // Fetch normally rejects on abort. Also release the local slot promptly if a
+    // transport delays that rejection, and discard any response arriving later.
+    const response = await Promise.race([request.then(value => {
+      if (requestSignal.aborted) {
+        void value.body?.cancel().catch(() => { /* Late provider replies are discarded. */ });
+        throw new Error('search_cancelled');
+      }
+      return value;
+    }), aborted]);
     onHeaders?.(response);
     if (!response.ok) {
       void response.body?.cancel().catch(() => { /* Discard upstream error bodies. */ });
@@ -209,9 +239,13 @@ async function performSearch(
     result.status = 'success';
     return result;
   } catch (error) {
-    const status: GameSearchStatus = signal?.aborted ? 'cancelled' : timeout.aborted ? 'timeout'
+    const status: GameSearchStatus = signal?.aborted ? 'cancelled' : timedOut ? 'timeout'
       : error instanceof SyntaxError || (error instanceof Error && ['invalid_search_reply', 'search_reply_too_large'].includes(error.message))
         ? 'invalid_reply' : 'unavailable';
     return unavailable(status, signal?.aborted ? 'Consulta cancelada.' : 'A consulta falhou ou excedeu o tempo limite.');
+  } finally {
+    clearTimeout(deadline);
+    signal?.removeEventListener('abort', cancel);
+    requestSignal.removeEventListener('abort', onAbort);
   }
 }

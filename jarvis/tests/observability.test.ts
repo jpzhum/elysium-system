@@ -54,6 +54,8 @@ describe('bounded structured operational logging', () => {
       participants_available: secret, participants_complete: secret, input_source_chunks: secret,
       input_silence_chunks: secret, upload_ms: secret,
       context_injected: secret, context_items: secret, context_chars: secret,
+      recovery_attempt: secret, retry_delay_ms: secret, receiver_state: secret,
+      capture_rejection: secret, rejection_reason: secret, voice_lifecycle_reason: secret,
       voice_status: secret, previous_voice_status: secret, network_status: secret,
       duration_ms: secret, stage_duration_ms: secret, timeout_ms: secret, disconnect_reason: secret,
       websocket_close_code: secret, dave_protocol_version: secret, diagnostics_version: secret,

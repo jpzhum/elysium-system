@@ -48,7 +48,7 @@ describe('game search', () => {
     expect(result.sources).toEqual([]);
     expect(JSON.stringify(result)).not.toContain('key-secret');
     expect(JSON.stringify(result)).not.toContain('private provider body');
-    expect(result.answer).toContain('Não foi possível verificar');
+    expect(result.answer).toBe('Não consegui concluir a pesquisa desta vez, senhor. Posso tentar novamente.');
   });
 
   it('cancels before fetch and bounds oversized reply bodies', async () => {
@@ -76,6 +76,22 @@ describe('game search', () => {
     expect(result.sources).toEqual([]);
     expect(result.uncertainty).toContain('cancelada');
     expect(cancelled).toHaveBeenCalledOnce();
+  });
+
+  it('cancels the body when caller abort lands between headers and body-reader setup', async () => {
+    const controller = new AbortController();
+    const cancelled = vi.fn(() => new Promise<void>(() => { /* Remote cancellation never settles. */ }));
+    const response = new Response(new ReadableStream<Uint8Array>({ cancel: cancelled }));
+    vi.stubGlobal('fetch', vi.fn(() => {
+      const request = Promise.resolve(response);
+      void request.then(() => queueMicrotask(() => controller.abort()));
+      return request;
+    }));
+    const result = await searchGameInfo('Game', 'quest', 'secret', controller.signal);
+    expect(result.status).toBe('cancelled');
+    expect(result.sources).toEqual([]);
+    expect(cancelled).toHaveBeenCalledOnce();
+    expect(response.body?.locked).toBe(false);
   });
 
   it('does not wait for an error body or copy provider error messages into its result', async () => {
@@ -179,21 +195,75 @@ describe('game search', () => {
     expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(14 * 1024);
   });
 
-  it('classifies a timed out body and releases the worker slot for a later request', async () => {
-    const timeout = new AbortController();
-    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal);
-    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(new ReadableStream<Uint8Array>()));
-    vi.stubGlobal('fetch', request);
-    const search = createGameSearch({ apiKey: 'secret' });
-    const pending = search('Game', 'quest');
-    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
-    timeout.abort();
-    expect((await pending).status).toBe('timeout');
+  it('uses a five-second total deadline across delayed headers and a stalled body, then releases the slot', async () => {
     vi.useFakeTimers();
-    await vi.advanceTimersByTimeAsync(1000);
-    const fresh = new AbortController();
-    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(fresh.signal);
+    const cancelled = vi.fn(() => new Promise<void>(() => { /* Remote cancel never settles. */ }));
+    const response = new Response(new ReadableStream<Uint8Array>({ cancel: cancelled }));
+    const request = vi.fn<typeof fetch>().mockImplementation(() => new Promise<Response>(resolve => {
+      setTimeout(() => resolve(response), 3500);
+    }));
+    vi.stubGlobal('fetch', request);
+    const diagnostics = vi.fn();
+    const search = createGameSearch({ apiKey: 'secret', onDiagnostic: diagnostics });
+    const pending = search('Game', 'quest');
+    const signal = request.mock.calls[0]?.[1]?.signal;
+    await vi.advanceTimersByTimeAsync(3500);
+    expect(response.body?.locked).toBe(true);
+    await vi.advanceTimersByTimeAsync(1499);
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await pending;
+    expect(result.status).toBe('timeout');
+    expect(result.sources).toEqual([]);
+    expect(signal?.aborted).toBe(true);
+    expect(cancelled).toHaveBeenCalledOnce();
+    expect(diagnostics).toHaveBeenCalledWith({ status: 'timeout', durationMs: 5000, sourceCount: 0 });
+    expect(request).toHaveBeenCalledOnce(); // No retries consume another deadline.
     request.mockResolvedValue(new Response('{}'));
     expect((await search('Game', 'next')).status).toBe('no_sources');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('aborts stalled headers within the configured deadline and discards late responses', async () => {
+    vi.useFakeTimers();
+    let complete!: (response: Response) => void;
+    const request = vi.fn<typeof fetch>().mockImplementation(() => new Promise<Response>(resolve => { complete = resolve; }));
+    vi.stubGlobal('fetch', request);
+    const search = createGameSearch({ apiKey: 'secret', timeoutMs: 2500 });
+    const pending = search('Game', 'quest');
+    const signal = request.mock.calls[0]?.[1]?.signal;
+    await vi.advanceTimersByTimeAsync(2499);
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await pending).status).toBe('timeout');
+    expect(signal?.aborted).toBe(true);
+    expect(request).toHaveBeenCalledOnce();
+    const cancelled = vi.fn();
+    complete(new Response(new ReadableStream<Uint8Array>({ cancel: cancelled })));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cancelled).toHaveBeenCalledOnce();
+    request.mockResolvedValue(new Response('{}'));
+    expect((await search('Game', 'next')).status).toBe('no_sources');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('cancels pending headers immediately on caller abort and frees the slot without a retry', async () => {
+    vi.useFakeTimers();
+    const request = vi.fn<typeof fetch>().mockImplementation(() => new Promise<Response>(() => { /* Transport stalls. */ }));
+    vi.stubGlobal('fetch', request);
+    const controller = new AbortController();
+    const removeListener = vi.spyOn(controller.signal, 'removeEventListener');
+    const search = createGameSearch({ apiKey: 'secret' });
+    const pending = search('Game', 'quest', controller.signal);
+    const signal = request.mock.calls[0]?.[1]?.signal;
+    await vi.advanceTimersByTimeAsync(1000);
+    controller.abort();
+    expect((await pending).status).toBe('cancelled');
+    expect(signal?.aborted).toBe(true);
+    expect(removeListener).toHaveBeenCalledWith('abort', expect.any(Function));
+    expect(request).toHaveBeenCalledOnce();
+    request.mockResolvedValue(new Response('{}'));
+    expect((await search('Game', 'next')).status).toBe('no_sources');
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

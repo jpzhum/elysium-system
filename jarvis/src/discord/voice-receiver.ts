@@ -4,6 +4,8 @@ import { OpusDecoder } from "../audio/opus-decoder.js";
 import { rms } from "../audio/voice-activity.js";
 import type { CaptureTiming } from '../audio/capture-window.js';
 
+export type VoiceReceiverState = 'ready' | 'suspended' | 'stopped';
+
 export interface VoiceReceiverOptions {
   ownUserId: string;
   canReceive: (userId: string) => boolean;
@@ -15,6 +17,7 @@ export interface VoiceReceiverOptions {
   maxTurnSeconds: number;
   onTurn: (userId: string, pcm48kStereo: Buffer, timing: VoiceTurnTiming) => void | Promise<void>;
   onMetric?: (name: string, value: number) => void;
+  onState?: (state: VoiceReceiverState) => void;
 }
 
 export interface VoiceTurnTiming extends CaptureTiming {
@@ -53,13 +56,15 @@ export class VoiceReceiver {
   private nextBargeInAt = 0;
   private readonly captureEpoch = randomUUID();
   private captureSequence = 0;
+  private reportedState?: VoiceReceiverState;
   private readonly maxBytes: number;
   private readonly onStart = (userId: string): void => this.subscribe(userId);
   private readonly onConnectionState = (_before: unknown, next: { status: string }): void => {
     if (next.status === VoiceConnectionStatus.Destroyed) this.stop();
-    else if (next.status === VoiceConnectionStatus.Disconnected) {
+    else if (next.status !== VoiceConnectionStatus.Ready) {
       for (const userId of [...this.turns.keys()]) this.stopUser(userId);
     }
+    this.reportState();
   };
 
   constructor(private readonly connection: VoiceConnection, private readonly options: VoiceReceiverOptions) {
@@ -74,6 +79,7 @@ export class VoiceReceiver {
     this.started = true;
     this.connection.on("stateChange", this.onConnectionState);
     this.connection.receiver.speaking.on("start", this.onStart);
+    this.reportState();
   }
 
   stopUser(userId: string): void {
@@ -86,6 +92,18 @@ export class VoiceReceiver {
     this.connection.receiver.speaking.off("start", this.onStart);
     for (const userId of [...this.turns.keys()]) this.stopUser(userId);
     this.nextBargeInAt = 0;
+    this.reportState();
+  }
+
+  get state(): VoiceReceiverState {
+    return !this.started ? 'stopped' : this.connection.state.status === VoiceConnectionStatus.Ready ? 'ready' : 'suspended';
+  }
+
+  private reportState(): void {
+    const state = this.state;
+    if (state === this.reportedState) return;
+    this.reportedState = state;
+    try { this.options.onState?.(state); } catch { /* Diagnostics cannot interrupt capture cleanup. */ }
   }
 
   private allowed(userId: string): boolean {

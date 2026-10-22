@@ -11,6 +11,16 @@ test('default is no voice capture; Elysium variables are unrelated', () => {
   expect(loadConfig(base).JARVIS_MAX_QUEUED_PER_USER).toBe(2);
   expect(loadConfig(base).JARVIS_QUESTION_QUEUE_TTL_SECONDS).toBe(60);
   expect(loadConfig(base).JARVIS_SHORT_MEMORY_TTL_SECONDS).toBe(600);
+  expect(loadConfig(base).JARVIS_SEARCH_TIMEOUT_MS).toBe(5000);
+});
+
+test('search total deadline is configurable and bounded independently of agent idle', () => {
+  const config = loadConfig({ ...base, JARVIS_SEARCH_TIMEOUT_MS: '3500' });
+  expect(config.JARVIS_SEARCH_TIMEOUT_MS).toBe(3500);
+  expect(config.JARVIS_SESSION_IDLE_SECONDS).toBe(45);
+  for (const value of ['999', '15001', '0', '-1', 'NaN', '5000.5']) {
+    expect(() => loadConfig({ ...base, JARVIS_SEARCH_TIMEOUT_MS: value })).toThrow(ConfigError);
+  }
 });
 
 test('short memory has a bounded, explicit disable switch without enabling a database', () => {

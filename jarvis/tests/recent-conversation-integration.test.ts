@@ -214,7 +214,7 @@ describe('short RAM context through actual adapter and session manager (controll
     await h.response('Ela está no Castelo Azul.'); await h.finish();
     h.latest().close(); await settle();
     const renamed = h.speaker('owner', 'Nome atualizado');
-    await h.manager.voiceTurn(renamed, Buffer.alloc(19_200), {
+    await h.manager.voiceTurn(renamed, Buffer.alloc(19_200, 1), {
       captureId: 'capture-real-asr', captureMs: 100, endDetectionMs: 600,
       captureStartedAtMs: performance.now(), captureEndedAtMs: performance.now() + 100,
     });

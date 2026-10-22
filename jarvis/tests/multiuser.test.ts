@@ -120,7 +120,7 @@ describe('bounded conversational scheduling', () => {
 
   test('startup tools during voice upload remain blocked until ElevenAgents recognizes the user turn', async () => {
     const h = harness({ pace: async () => undefined }); const guest = h.speaker('guest');
-    await h.manager.voiceTurn(guest, Buffer.alloc(480)); await settle();
+    await h.manager.voiceTurn(guest, Buffer.alloc(3_840, 1)); await settle();
     expect(h.manager.isTurnActive(guest)).toBe(false);
     h.callbacks.get('guest')!.onUserTranscript?.({ eventId: 20 });
     expect(h.manager.isTurnActive(guest)).toBe(true);
@@ -132,13 +132,13 @@ describe('bounded conversational scheduling', () => {
     let completeWake!: (activated: boolean) => void;
     const detectWake = vi.fn(() => new Promise<boolean>(resolve => { completeWake = resolve; }));
     const h = harness({ detectWake, pace: async () => undefined });
-    const first = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+    const first = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1), {
       captureMs: 1000, endDetectionMs: 600, captureId: 'capture-1', captureStartedAtMs: 0, captureEndedAtMs: 1000,
     });
-    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1), {
       captureMs: 1000, endDetectionMs: 600, captureId: 'capture-1', captureStartedAtMs: 0, captureEndedAtMs: 1000,
     })).toBeUndefined();
-    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1), {
       captureMs: 1000, endDetectionMs: 600, captureId: 'overlapping', captureStartedAtMs: 900, captureEndedAtMs: 1900,
     })).toBeUndefined();
     expect(detectWake).toHaveBeenCalledOnce();
@@ -152,7 +152,7 @@ describe('bounded conversational scheduling', () => {
     const detectWake = vi.fn(async () => true);
     const h = harness({ detectWake, pace: async () => undefined });
     for (let index = 0; index < 5; index++) {
-      expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+      expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1), {
         captureMs: 1000, endDetectionMs: 600, captureId: `capture-${index}`,
         captureStartedAtMs: index * 1000, captureEndedAtMs: (index + 1) * 1000,
       })).toMatchObject({ queued: false });
@@ -170,9 +170,9 @@ describe('bounded conversational scheduling', () => {
   test('identical capture windows belonging to different Discord IDs are independently enqueued', async () => {
     const h = harness({ pace: async () => undefined });
     const timing = { captureMs: 1000, endDetectionMs: 600, captureId: 'same', captureStartedAtMs: 0, captureEndedAtMs: 1000 };
-    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), timing)).toMatchObject({ queued: false });
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1), timing)).toMatchObject({ queued: false });
     await settle();
-    expect(await h.manager.voiceTurn(h.speaker('owner'), Buffer.alloc(480), timing)).toMatchObject({ queued: true });
+    expect(await h.manager.voiceTurn(h.speaker('owner'), Buffer.alloc(3_840, 1), timing)).toMatchObject({ queued: true });
     expect(h.manager.queuedCount).toBe(1);
     expect(h.metric).not.toHaveBeenCalledWith('voice_capture_duplicates');
   });
@@ -182,9 +182,9 @@ describe('bounded conversational scheduling', () => {
     const h = harness({ maxQueuedTurns: 1, detectWake, pace: async () => undefined });
     await h.ask('guest'); await h.ask('owner');
     const timing = { captureMs: 1000, endDetectionMs: 600, captureId: 'full', captureStartedAtMs: 0, captureEndedAtMs: 1000 };
-    await expect(h.manager.voiceTurn(h.speaker('other'), Buffer.alloc(480), timing))
+    await expect(h.manager.voiceTurn(h.speaker('other'), Buffer.alloc(3_840, 1), timing))
       .rejects.toMatchObject({ code: 'limit', reason: 'queue_full' });
-    expect(await h.manager.voiceTurn(h.speaker('other'), Buffer.alloc(480), timing)).toBeUndefined();
+    expect(await h.manager.voiceTurn(h.speaker('other'), Buffer.alloc(3_840, 1), timing)).toBeUndefined();
     expect(detectWake).toHaveBeenCalledOnce();
     expect(h.metric.mock.calls.filter(([name]) => name === 'voice_queue_rejected')).toHaveLength(1);
     expect(h.manager.queuedCount).toBe(1);
@@ -195,11 +195,11 @@ describe('bounded conversational scheduling', () => {
     const h = harness({ pace: async () => undefined,
       detectWake: () => new Promise<boolean>(resolve => { resolveWake = resolve; }) });
     const timing = { captureMs: 1000, endDetectionMs: 600, captureId: 'capture', captureStartedAtMs: 0, captureEndedAtMs: 1000 };
-    const first = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), timing);
+    const first = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1), timing);
     h.consent.revoke('guest'); h.manager.revoke('guest'); resolveWake(true);
     expect(await first).toBeUndefined(); expect(h.connect).not.toHaveBeenCalled();
     h.consent.grant('guest', true);
-    const next = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), timing);
+    const next = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1), timing);
     resolveWake(true); expect(await next).toMatchObject({ queued: false });
     expect(h.metric).not.toHaveBeenCalledWith('voice_capture_duplicates');
   });
@@ -207,17 +207,17 @@ describe('bounded conversational scheduling', () => {
   test('upload latency counts the recorded source separately from the final VAD silence', async () => {
     vi.useFakeTimers();
     const h = harness({ pace: async () => { vi.advanceTimersByTime(20); } });
-    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1)); await settle();
     expect(h.metric).toHaveBeenCalledWith('agent_input_source_chunks', 1);
     expect(h.metric).toHaveBeenCalledWith('agent_input_silence_chunks', 40);
     expect(h.metric).toHaveBeenCalledWith('agent_audio_upload_ms', 820);
-    expect(Buffer.concat(h.uploaded.get('guest')!).length).toBe(80 + 25_600);
+    expect(Buffer.concat(h.uploaded.get('guest')!).length).toBe(640 + 25_600);
   });
 
   test.each([16000, 24000])('exact trailing digital silence avoids redundant padding at %i Hz without changing any source sample', async rate => {
     const cases = [
-      { name: 'all silence below target', durationMs: 100, amplitude: 0, paddingMs: 700 },
-      { name: 'all silence above target', durationMs: 1000, amplitude: 0, paddingMs: 0 },
+      { name: 'speech then silence below target', durationMs: 120, amplitude: 0, paddingMs: 700 },
+      { name: 'speech then silence above target', durationMs: 1000, amplitude: 0, paddingMs: 0 },
       { name: 'nonzero source', durationMs: 100, amplitude: 1200, paddingMs: 800 },
       { name: 'near-zero is still speech data', durationMs: 100, amplitude: 1, paddingMs: 800 },
       { name: 'partial input frame rounds padding upward', durationMs: 25, amplitude: 0, paddingMs: 780 },
@@ -226,6 +226,9 @@ describe('bounded conversational scheduling', () => {
       const h = harness({ pace: async () => undefined }, rate);
       const source = Buffer.alloc(sample.durationMs * 48 * 4);
       for (let offset = 0; offset < source.length; offset += 2) source.writeInt16LE(sample.amplitude, offset);
+      // A silent capture is rejected before STT; retain a real signal prefix
+      // when checking how an otherwise silent tail avoids redundant padding.
+      if (!sample.amplitude) { source.writeInt16LE(1200, 0); source.writeInt16LE(1200, 2); }
       const original = Buffer.from(source);
       const converted = convertPcm(source, 48_000, 2, rate, 1);
       await h.manager.voiceTurn(h.speaker('guest'), source); await settle();
@@ -250,7 +253,7 @@ describe('bounded conversational scheduling', () => {
     const h = harness({ prepareSession, pace: async () => undefined });
     await h.ask('guest'); await h.finish('guest');
     const current = { ...h.speaker('guest'), displayName: 'Nome atualizado' };
-    await h.manager.voiceTurn(current, Buffer.alloc(480)); await settle();
+    await h.manager.voiceTurn(current, Buffer.alloc(3_840, 1)); await settle();
     expect(prepareSession).toHaveBeenNthCalledWith(1, expect.objectContaining({ discordUserId: 'guest' }),
       h.sessions.get('guest'), false, expect.objectContaining({ inputKind: 'text' }));
     expect(prepareSession).toHaveBeenNthCalledWith(2, current, h.sessions.get('guest'), true,
@@ -429,7 +432,7 @@ describe('bounded conversational scheduling', () => {
   test('queued raw PCM stays under the global memory ceiling independently of configured queue slots', async () => {
     const h = harness({ maxQueuedTurns: 16, maxQueuedPerUser: 4, maxTurnSeconds: 30 });
     await h.ask('owner');
-    const pcm = Buffer.alloc(30 * 48_000 * 4);
+    const pcm = Buffer.alloc(30 * 48_000 * 4, 1);
     await h.manager.voiceTurn(h.speaker('one'), pcm);
     await h.manager.voiceTurn(h.speaker('two'), pcm);
     await expect(h.manager.voiceTurn(h.speaker('three'), pcm)).rejects.toMatchObject({ code: 'limit' });
@@ -565,25 +568,25 @@ describe('speaker authorization and cancellation', () => {
   test('voice awaiting wake detection cannot activate after revoke', async () => {
     let resolve!: (activated: boolean) => void;
     const h = harness({ detectWake: () => new Promise<boolean>(yes => { resolve = yes; }) });
-    const voice = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480));
+    const voice = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1));
     h.consent.revoke('guest'); h.manager.revoke('guest'); resolve(true); await voice;
     expect(h.connect).not.toHaveBeenCalled();
   });
 
   test('false wake and missing consent cannot open provider sessions', async () => {
     const h = harness({ detectWake: async () => false });
-    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480))).toBeUndefined();
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1))).toBeUndefined();
     expect(h.connect).not.toHaveBeenCalled();
     const guest = h.speaker('guest'); h.consent.revoke('guest');
-    await expect(h.manager.voiceTurn(guest, Buffer.alloc(480))).rejects.toMatchObject({ code: 'consent' });
+    await expect(h.manager.voiceTurn(guest, Buffer.alloc(3_840, 1))).rejects.toMatchObject({ code: 'consent' });
   });
 
   test('wake concurrency and captured duration are bounded before external detection', async () => {
     let resolve!: (activated: boolean) => void;
     const detect = vi.fn(() => new Promise<boolean>(yes => { resolve = yes; }));
     const h = harness({ maxSessions: 1, detectWake: detect });
-    const pending = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480));
-    await expect(h.manager.voiceTurn(h.speaker('owner'), Buffer.alloc(480))).rejects.toMatchObject({ code: 'limit' });
+    const pending = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1));
+    await expect(h.manager.voiceTurn(h.speaker('owner'), Buffer.alloc(3_840, 1))).rejects.toMatchObject({ code: 'limit' });
     await expect(h.manager.voiceTurn(h.speaker('other'), Buffer.alloc(12 * 48_000 * 4 + 4)))
       .rejects.toMatchObject({ code: 'limit' });
     resolve(false); await pending;
@@ -593,7 +596,7 @@ describe('speaker authorization and cancellation', () => {
   test('voice activation enqueues owned PCM while another speaker is active', async () => {
     const h = harness({ pace: async () => undefined });
     await h.ask('owner');
-    const pcm = Buffer.alloc(480, 1);
+    const pcm = Buffer.alloc(3_840, 1);
     expect(await h.manager.voiceTurn(h.speaker('guest'), pcm)).toMatchObject({ queued: true });
     pcm.fill(0);
     expect(h.sessions.has('guest')).toBe(false);
@@ -611,13 +614,13 @@ describe('speaker authorization and cancellation', () => {
     const old = h.callbacks.get('guest')!;
     old.onTextResponse?.(); await old.onAudio(Buffer.alloc(480), 1);
     h.streams[0]!.progress('drained');
-    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480))).toMatchObject({ queued: true });
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1))).toMatchObject({ queued: true });
     await settle();
     expect(detect).not.toHaveBeenCalled();
     expect(h.connect).toHaveBeenCalledTimes(2);
     await h.finish('guest');
     await vi.advanceTimersByTimeAsync(19_000);
-    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480));
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1));
     expect(detect).toHaveBeenCalledOnce();
   });
 
@@ -627,7 +630,7 @@ describe('speaker authorization and cancellation', () => {
     await h.ask('guest'); await h.finish('guest');
     const prior = h.sessions.get('guest')!;
     const otherChannel = { ...h.speaker('guest'), channelId: 'different-channel' };
-    expect(await h.manager.voiceTurn(otherChannel, Buffer.alloc(480))).toBeUndefined();
+    expect(await h.manager.voiceTurn(otherChannel, Buffer.alloc(3_840, 1))).toBeUndefined();
     expect(detectWake).toHaveBeenCalledOnce();
     expect(prior.sendAudio).not.toHaveBeenCalled();
     expect(h.connect).toHaveBeenCalledOnce();
@@ -642,7 +645,7 @@ describe('speaker authorization and cancellation', () => {
         h.callbacks.get('guest')!.onInterruption();
       }
     } });
-    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(48_000)); await settle();
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(48_000, 1)); await settle();
     const oldSession = h.sessions.get('guest')!;
     expect(oldSession.sendAudio).toHaveBeenCalledTimes(1);
     await h.ask('guest', 'Novo turno');
@@ -655,10 +658,10 @@ describe('speaker authorization and cancellation', () => {
     const h = harness({ detectWake: detect, pace: async () => undefined });
     await h.ask('guest');
     expect(h.manager.interruptOwner(h.speaker('owner'))).toBe(true); await settle();
-    await h.manager.voiceTurn(h.speaker('owner'), Buffer.alloc(480)); await settle();
+    await h.manager.voiceTurn(h.speaker('owner'), Buffer.alloc(3_840, 1)); await settle();
     expect(detect).not.toHaveBeenCalled();
     expect(h.sessions.get('owner')!.sendAudio).toHaveBeenCalled();
-    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480));
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1));
     expect(detect).toHaveBeenCalledOnce();
   });
 
@@ -719,7 +722,7 @@ describe('RAM-only delivered conversation handoff', () => {
     let now = 1_000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);
     const h = harness({ detectWake: async () => { now = 1_500; return true; }, pace: async () => { now += 20; } });
-    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1), {
       captureMs: 700, endDetectionMs: 600, captureStartedAtMs: 100, captureEndedAtMs: 800,
     }); await settle();
     now = 4_000;
@@ -742,7 +745,7 @@ describe('RAM-only delivered conversation handoff', () => {
         await cb.onAudio(Buffer.alloc(480), 11);
       }
     } });
-    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1)); await settle();
     expect(h.metric).toHaveBeenCalledWith('agent_audio_before_input_finished');
     expect(h.metric.mock.calls.filter(([name]) => name === 'agent_remote_first_audio_ms')).toHaveLength(0);
     expect(h.metric.mock.calls.filter(([name]) => name === 'agent_end_to_end_first_playback_ms')).toHaveLength(0);
@@ -797,7 +800,7 @@ describe('RAM-only delivered conversation handoff', () => {
     const h = harness({ onTurnDelivered, pace: async () => undefined });
     const questions = ['Jarvis, onde encontro a arma?', 'Onde encontro ela?'];
     for (let index = 0; index < questions.length; index++) {
-      const receipt = await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+      const receipt = await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1)); await settle();
       const cb = h.callbacks.get('guest')!;
       cb.onUserTranscript?.({ eventId: 100 + index });
       cb.onConversationText?.({ kind: 'user_final', text: questions[index]!, truncated: false, eventId: 100 + index });
@@ -818,12 +821,12 @@ describe('RAM-only delivered conversation handoff', () => {
     const h = harness({ onTurnDelivered, pace: async () => undefined });
     const priorIdentity = identified ? { eventId: 10 } : undefined;
     const currentIdentity = identified ? { eventId: 20 } : undefined;
-    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1)); await settle();
     const cb = h.callbacks.get('guest')!;
     cb.onUserTranscript?.(priorIdentity);
     cb.onConversationText?.({ kind: 'user_final', text: 'Primeira pergunta', truncated: false, ...priorIdentity });
     await h.finish('guest');
-    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1)); await settle();
     cb.onUserTranscript?.(currentIdentity);
     cb.onConversationText?.({ kind: 'user_final', text: 'Pergunta atual', truncated: false, ...currentIdentity });
     cb.onUserTranscript?.(priorIdentity);

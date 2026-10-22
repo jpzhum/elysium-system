@@ -1,7 +1,8 @@
 # V5.2: personalidade e continuidade no ElevenAgents
 
-Este documento é um complemento ao prompt V3 preservado em
-[`agent-system-prompt.md`](../agent-system-prompt.md), não um prompt substituto.
+Este documento registra o complemento V5.2. A referência atual consolidada é
+[`agent-system-prompt.md`](../agent-system-prompt.md), revisada na V5.4; siga
+[V54_STABILITY_REVIEW.md](V54_STABILITY_REVIEW.md) para a atualização atual.
 O backend continua responsável pela identidade, consentimento, permissões,
 memória curta e reprodução. A inteligência, a personalidade e a voz continuam no
 ElevenAgents. Este arquivo não publica alterações na conta ElevenLabs.

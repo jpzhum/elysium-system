@@ -100,6 +100,7 @@ interface Entry {
   idle?: ReturnType<typeof setTimeout>;
   lifetime?: ReturnType<typeof setTimeout>;
   deadline?: ReturnType<typeof setTimeout>;
+  recognitionDeadline?: ReturnType<typeof setTimeout>;
   upload?: AbortController;
   request?: TurnRequest;
   localDrained: boolean;
@@ -135,7 +136,19 @@ interface Entry {
 }
 export class SessionError extends Error {
   constructor(readonly code: 'consent' | 'busy' | 'limit' | 'closed',
-    readonly reason?: 'queue_full' | 'user_queue_full' | 'voice_memory_limit' | 'turn_budget') { super(code); }
+    readonly reason?: 'queue_full' | 'user_queue_full' | 'voice_memory_limit' | 'turn_budget'
+      | 'wake_check_busy' | 'wake_capacity' | 'voice_unavailable' | 'consent_invalid') { super(code); }
+}
+
+const MIN_CAPTURE_BYTES = 48_000 * 4 / 50; // One 20 ms Discord Opus frame.
+const USER_RECOGNITION_TIMEOUT_MS = 10_000;
+
+/** Match the actual stereo-to-mono input, including channels that cancel out. */
+function hasMonoSignal(pcm: Buffer): boolean {
+  for (let offset = 0; offset < pcm.length; offset += 4) {
+    if (Math.round((pcm.readInt16LE(offset) + pcm.readInt16LE(offset + 2)) / 2) !== 0) return true;
+  }
+  return false;
 }
 
 /** Preserve every source sample and add only the missing exact digital silence. */
@@ -208,19 +221,28 @@ export class SessionManager {
     if (!pcm.length || pcm.length % 4 || pcm.length > Math.min(this.options.maxTurnSeconds, 30) * 48_000 * 4) {
       this.options.metric?.('voice_capture_limit_rejected'); throw new SessionError('limit');
     }
+    const incident = newIncident();
+    const rejection = pcm.length < MIN_CAPTURE_BYTES ? 'too_short' : !hasMonoSignal(pcm) ? 'silent' : undefined;
+    if (rejection) {
+      this.options.metric?.(`voice_capture_${rejection}_rejected`);
+      this.inputReport(incident, 'jarvis_voice_capture_rejected', 'voice_capture', {
+        code: 'AGENT_INPUT_INVALID', capture_rejection: rejection,
+        capture_bytes: pcm.length, capture_ms: Math.round(pcm.length / 192_000 * 1000),
+      });
+      return;
+    }
     // Claim before asynchronous wake detection, so a duplicate delivery cannot
     // purchase another STT check or occupy a second queue position. No PCM hashes.
     if (this.captures.duplicate(speaker.discordUserId, speaker.consentVersion, speaker.channelId, timing)) {
       this.options.metric?.('voice_capture_duplicates'); return;
     }
     if (this.checking.has(speaker.discordUserId)) {
-      this.options.metric?.('voice_wake_busy'); throw new SessionError('busy');
+      this.options.metric?.('voice_wake_busy'); throw new SessionError('busy', 'wake_check_busy');
     }
     if (this.checking.size >= this.options.maxSessions) {
-      this.options.metric?.('voice_capture_limit_rejected'); throw new SessionError('limit');
+      this.options.metric?.('voice_capture_limit_rejected'); throw new SessionError('limit', 'wake_capacity');
     }
     const existing = this.entries.get(speaker.discordUserId);
-    const incident = newIncident();
     this.options.metric?.('voice_turns_captured');
     this.inputReport(incident, 'jarvis_voice_captured', 'voice_capture', {
       capture_bytes: pcm.length, capture_ms: Math.round(pcm.length / 192_000 * 1000),
@@ -378,6 +400,16 @@ export class SessionManager {
       this.options.metric?.('agent_input_silence_chunks', entry.inputSilenceChunks);
       this.options.metric?.('agent_input_silence_saved_ms', 800 - entry.inputSilenceTailMs);
       this.report(entry, 'jarvis_agent_input_sent');
+      // Upload duration is not recognition latency. No provider retry or extra
+      // API request follows this fail-fast bound; the next question starts fresh.
+      if (!entry.userTurnRecognized && this.usable(entry)) {
+        entry.recognitionDeadline = setTimeout(() => {
+          if (!this.usable(entry) || !entry.waiting || entry.userTurnRecognized) return;
+          this.options.metric?.('agent_user_turn_missing');
+          this.fail(entry, 'AGENT_USER_TURN_MISSING');
+        }, USER_RECOGNITION_TIMEOUT_MS);
+        entry.recognitionDeadline.unref();
+      }
     } catch (error) { if (!abort.signal.aborted) throw error; }
     finally {
       mono.fill(0); tail.fill(0);
@@ -426,8 +458,8 @@ export class SessionManager {
   }
 
   private assertAllowed(speaker: SpeakerContext, audio = false): void {
-    if (this.closed || !this.available) throw new SessionError('closed');
-    if (!speaker.consented || !this.options.allowed(speaker, audio)) throw new SessionError('consent');
+    if (this.closed || !this.available) throw new SessionError('closed', 'voice_unavailable');
+    if (!speaker.consented || !this.options.allowed(speaker, audio)) throw new SessionError('consent', 'consent_invalid');
   }
 
   private async ensure(speaker: SpeakerContext, request: TurnRequest): Promise<Entry> {
@@ -489,6 +521,8 @@ export class SessionManager {
         }
         if (current.userTurnRecognized) return;
         current.userTurnRecognized = true;
+        if (current.recognitionDeadline) clearTimeout(current.recognitionDeadline);
+        current.recognitionDeadline = undefined;
         current.acceptedUserEventId = identity?.eventId;
         current.userTextPending = true;
         this.options.metric?.('agent_user_turns_recognized');
@@ -902,7 +936,8 @@ export class SessionManager {
     if (entry.deadline) clearTimeout(entry.deadline);
     // Local backpressure is not provider inactivity. Absolute playback/session
     // deadlines still bound waiting participants while this write is suspended.
-    if (!entry.waiting || entry.recovering || entry.completionReceived || entry.pendingTools > 0 || entry.acceptingAudio) return;
+    if (!entry.waiting || entry.recovering || entry.completionReceived || entry.pendingTools > 0 || entry.acceptingAudio
+      || (entry.voiceInput && !entry.userTurnRecognized)) return;
     entry.deadline = setTimeout(() => {
       if (!this.usable(entry) || !entry.waiting) return;
       this.options.metric?.(entry.audioBytes > 0
@@ -941,6 +976,7 @@ export class SessionManager {
         : entry.playing ? 'playback' : entry.textReceived && !entry.audioBytes ? 'agent_audio_wait'
         : entry.waiting ? 'agent_response_wait' : 'agent_connect',
       ...(code ? { code, category: code === 'PLAYBACK_FAILED' ? 'playback' : 'agent' } : {}),
+      ...(code === 'AGENT_USER_TURN_MISSING' ? { timeout_ms: USER_RECOGNITION_TIMEOUT_MS } : {}),
       duration_ms: Math.max(0, Math.round(performance.now() - entry.turnStarted)),
       audio_chunks: entry.audioChunks, audio_bytes: entry.audioBytes,
       text_received: entry.textReceived, completion_received: entry.completionReceived,
@@ -1076,7 +1112,7 @@ export class SessionManager {
     entry.conversationQuestion = entry.conversationResponse = undefined;
     entry.conversationTextIds.clear();
     entry.abort.abort();
-    for (const timer of [entry.idle, entry.lifetime, entry.deadline]) if (timer) clearTimeout(timer);
+    for (const timer of [entry.idle, entry.lifetime, entry.deadline, entry.recognitionDeadline]) if (timer) clearTimeout(timer);
     entry.stream?.cancel();
     this.options.playback.stopUser(entry.speaker.discordUserId);
     entry.session?.close();

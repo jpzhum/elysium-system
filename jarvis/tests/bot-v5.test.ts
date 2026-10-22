@@ -8,9 +8,9 @@ import { Logger, type Metrics } from '../src/observability/metrics.js';
 import { AuthorizationError } from '../src/policy/authorization.js';
 import type { ConsentStore } from '../src/policy/consent.js';
 import type { SpeakerContext } from '../src/policy/identity.js';
-import type { SessionManager, SessionOptions } from '../src/agents/session-manager.js';
+import { SessionError, type SessionManager, type SessionOptions } from '../src/agents/session-manager.js';
 import type { AgentSession, ConnectAgentOptions } from '../src/agents/elevenlabs-client.js';
-import type { ElevenWakeDetector } from '../src/agents/wake-detector.js';
+import { WakeError, type ElevenWakeDetector } from '../src/agents/wake-detector.js';
 import type { VoiceReceiverOptions } from '../src/discord/voice-receiver.js';
 import type { VoiceConnectionManager } from '../src/discord/voice-connection.js';
 import type { VoiceParticipantsResult } from '../src/tools/voice-participants.js';
@@ -112,7 +112,7 @@ async function setup() {
   const members = new Collection<string, GuildMember>();
   const guild = { id: GUILD, name: 'Servidor privado', members: { me: { id: BOT } } };
   const channel = { id: CHANNEL, name: 'Canal privado', guild, type: ChannelType.GuildVoice, full: false, members,
-    send: vi.fn(async () => undefined), permissionsFor: () => ({ has: (permission: bigint) =>
+    send: vi.fn(async (_payload: { content: string }) => undefined), permissionsFor: () => ({ has: (permission: bigint) =>
       [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak].includes(permission) }) };
   const addMember = (id: string, name = 'Mesmo nome', isBot = false): GuildMember => {
     const member = { id, displayName: name, guild, user: { bot: isBot }, voice: { channel, channelId: CHANNEL } } as unknown as GuildMember;
@@ -161,7 +161,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
   for (const bot of active.splice(0)) await bot.stop();
-  await settle(); vi.restoreAllMocks(); vi.unstubAllGlobals();
+  await settle(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals();
 });
 
 describe('V5 Discord integration with the real per-speaker session manager', () => {
@@ -222,6 +222,117 @@ describe('V5 Discord integration with the real per-speaker session manager', () 
     await h.voice(GUEST);
     expect(hooks.connect).not.toHaveBeenCalled();
     expect(h.access.wake.detect).not.toHaveBeenCalled();
+  });
+
+  test('joining, consenting, revoking and leaving affect only the authenticated participant', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER, true).run();
+    const ownerConsent = h.room.consent.get(OWNER)!;
+    h.addMember(OBSERVER);
+    h.access.client.emit('voiceStateUpdate', { guild: { id: GUILD }, channelId: null } as never,
+      { id: OBSERVER, guild: { id: GUILD }, channelId: CHANNEL } as never);
+    expect(h.room.consent.get(OWNER)).toBe(ownerConsent);
+    expect(hooks.receiver!.canReceive(OWNER)).toBe(true);
+    expect(hooks.receiver!.canReceive(GUEST)).toBe(false);
+    expect(hooks.receiver!.canReceive(OBSERVER)).toBe(false);
+    await h.voice(GUEST); await h.voice(OWNER);
+    expect(hooks.providers).toHaveLength(1);
+    expect(hooks.providers[0]!.options.dynamicVariables?.speaker_is_creator).toBe(true);
+    await h.complete();
+    await h.interaction('consent', GUEST, true).run();
+    expect(hooks.receiver!.canReceive(OWNER)).toBe(true);
+    expect(hooks.receiver!.canReceive(GUEST)).toBe(true);
+    await h.interaction('revoke', GUEST).run();
+    expect(hooks.receiver!.canReceive(GUEST)).toBe(false);
+    expect(h.room.consent.get(OWNER)).toBe(ownerConsent);
+    await h.interaction('consent', GUEST, true).run();
+    h.members.delete(GUEST);
+    h.access.client.emit('voiceStateUpdate', { guild: { id: GUILD }, channelId: CHANNEL } as never,
+      { id: GUEST, guild: { id: GUILD }, channelId: null } as never);
+    expect(h.room.consent.get(GUEST)).toBeUndefined();
+    expect(h.room.consent.get(OWNER)).toBe(ownerConsent);
+    h.addMember(GUEST);
+    expect(hooks.receiver!.canReceive(GUEST)).toBe(false);
+    await h.ask(OWNER);
+    expect(hooks.providers.at(-1)!.session.sendText).toHaveBeenCalledWith(privateText);
+  });
+
+  test('transient transport loss keeps individual consent, whereas destruction requires renewed authorization', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER, true).run(); await h.interaction('consent', GUEST, true).run();
+    const ownerConsent = h.room.consent.get(OWNER)!;
+    const guestConsent = h.room.consent.get(GUEST)!;
+    await h.ask(OWNER);
+    const original = hooks.providers[0]!;
+    const transition = (status: VoiceConnectionStatus) => {
+      const before = h.connection.state;
+      Object.assign(h.connection, { state: { status } }); h.connection.emit('stateChange', before, h.connection.state);
+    };
+    transition(VoiceConnectionStatus.Disconnected); await settle();
+    expect(original.session.close).toHaveBeenCalled();
+    expect(h.access.room).toBe(h.room);
+    expect(h.room.consent.get(OWNER)).toBe(ownerConsent);
+    expect(h.room.consent.get(GUEST)).toBe(guestConsent);
+    transition(VoiceConnectionStatus.Ready);
+    await h.ask(GUEST);
+    expect(hooks.providers).toHaveLength(2);
+    expect(hooks.providers[1]!.options.dynamicVariables?.speaker_is_creator).toBe(false);
+    transition(VoiceConnectionStatus.Destroyed); await settle();
+    expect(h.access.room).toBeUndefined();
+    expect(h.room.consent.get(OWNER)).toBeUndefined(); expect(h.room.consent.get(GUEST)).toBeUndefined();
+    expect(h.channel.send).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringMatching(/\/jarvis join.*\/jarvis consent/), allowedMentions: { parse: [] },
+    }));
+  });
+
+  test('provider idle expiry leaves Discord and consent available for a fresh question', async () => {
+    vi.useFakeTimers();
+    const h = await setup();
+    await h.interaction('consent', OWNER, true).run();
+    const consent = h.room.consent.get(OWNER)!;
+    await h.ask(OWNER); await h.complete();
+    const original = hooks.providers[0]!;
+    await vi.advanceTimersByTimeAsync(46_000); await settle();
+    expect(original.session.close).toHaveBeenCalled();
+    expect(h.access.room).toBe(h.room);
+    expect(h.room.consent.get(OWNER)).toBe(consent);
+    expect(h.connection.destroy).not.toHaveBeenCalled();
+    expect(hooks.receiver!.canReceive(OWNER)).toBe(true);
+    await h.ask(OWNER);
+    expect(hooks.providers).toHaveLength(2);
+    expect(hooks.providers[1]!.session.sendText).toHaveBeenCalledWith(privateText);
+  });
+
+  test('repeated delivery of one capture enqueues and notifies exactly once', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER).run(); await h.interaction('consent', GUEST, true).run();
+    await h.ask(OWNER);
+    const timing = { duringPlayback: false, captureMs: 100, endDetectionMs: 600, captureId: 'same-local-capture' };
+    const pcm = Buffer.alloc(19_200, 12);
+    await hooks.receiver!.onTurn(GUEST, pcm, timing); await hooks.receiver!.onTurn(GUEST, pcm, timing); await settle();
+    expect(h.room.sessions.queuedCount).toBe(1);
+    expect(h.channel.send.mock.calls.filter(([payload]) => String(payload.content).includes('enfileirada'))).toHaveLength(1);
+    await h.complete();
+    expect(hooks.providers).toHaveLength(2);
+  });
+
+  test.each([
+    { error: new WakeError('wake_rate_limited'), reason: 'wake_rate_limited' },
+    { error: new WakeError('wake_queue_full'), reason: 'wake_queue_full' },
+    { error: new WakeError('wake_queue_timeout'), reason: 'wake_queue_timeout' },
+    { error: new WakeError('wake_provider_failed'), reason: 'wake_provider_failed' },
+    { error: new SessionError('busy', 'wake_check_busy'), reason: 'wake_check_busy' },
+    { error: new SessionError('limit', 'wake_capacity'), reason: 'wake_capacity' },
+    { error: new SessionError('limit', 'queue_full'), reason: 'queue_full' },
+    { error: new SessionError('closed', 'voice_unavailable'), reason: 'voice_unavailable' },
+    { error: new SessionError('consent', 'consent_invalid'), reason: 'consent_invalid' },
+  ])('voice rejection $reason has a sanitized operational category', async ({ error, reason }) => {
+    const h = await setup(); await h.interaction('consent', OWNER, true).run();
+    vi.spyOn(h.room.sessions, 'voiceTurn').mockRejectedValueOnce(error);
+    await h.voice(OWNER);
+    expect(h.logs).toContainEqual(expect.objectContaining({ event: 'jarvis_voice_turn_rejected',
+      rejection_reason: reason, voice_status: 'ready', queue_depth: 0, incident: expect.stringMatching(/^[A-F0-9]{8}$/) }));
+    expect(JSON.stringify(h.logs)).not.toMatch(/conteúdo privado|Mesmo nome|100000000000000/);
   });
 
   test('tools are denied before a turn begins, before final voice ASR, and on idle sockets', async () => {

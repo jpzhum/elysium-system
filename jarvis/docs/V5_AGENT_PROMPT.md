@@ -2,7 +2,7 @@
 
 O backend associa cada sessão ao Discord User ID recebido no gateway ou na interação. O mesmo caminho de injeção atende comandos escritos e áudio. `speaker_is_creator` resulta da comparação exata com `JARVIS_OWNER_USER_ID`; nome de exibição, voz, pergunta e parâmetros de ferramentas não concedem propriedade. O jogo continua `não informado` quando não há contexto explícito; não foi adicionado intent de presença para inferi-lo.
 
-O arquivo original `agent-system-prompt.md` permanece preservado. Ele já referencia as quatro variáveis. Isso comprova o contrato local, **não** comprova que o agente publicado na conta ElevenLabs contém esse texto ou o segue. O prompt remoto e a audição de duas contas ainda precisam ser verificados no ambiente do operador.
+O arquivo `agent-system-prompt.md` referencia as quatro variáveis e recebeu a revisão de personalidade V5.4. Isso comprova o contrato local, **não** comprova que o agente publicado na conta ElevenLabs contém esse texto ou o segue. O prompt remoto e a audição de duas contas ainda precisam ser verificados no ambiente do operador. Use o [roteiro V5.4](V54_STABILITY_REVIEW.md) para a integração atual; os procedimentos de auditoria abaixo continuam válidos.
 
 ## Auditoria remota somente de leitura
 

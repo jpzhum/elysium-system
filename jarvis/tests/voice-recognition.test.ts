@@ -10,6 +10,7 @@ async function settle(): Promise<void> { for (let i = 0; i < 600; i++) await Pro
 
 interface VoiceHarnessOptions {
   rate?: number;
+  pace?: SessionOptions['pace'];
   detectWake?: SessionOptions['detectWake'];
   onSendAudio?: (callbacks: AgentCallbacks, frame: number) => void;
   onConnect?: (callbacks: AgentCallbacks) => void;
@@ -79,7 +80,7 @@ function harness(options: VoiceHarnessOptions = {}) {
     connect, playback, metric, detectWake,
     allowed: (speaker, audio) => consent.isCurrent(speaker.discordUserId, speaker.consentVersion, audio),
     maxSessions: 2, maxTurnSeconds: 12, maxSessionSeconds: 300, idleSeconds: 45,
-    followupSeconds: 18, maxTurnsPerHour: 100, pace: async () => undefined,
+    followupSeconds: 18, maxTurnsPerHour: 100, pace: options.pace ?? (async () => undefined),
   });
   managers.push(manager);
   const speaker = (id = 'guest') => {
@@ -111,6 +112,87 @@ function utterance(): Buffer {
 afterEach(() => { for (const manager of managers.splice(0)) manager.close(); vi.useRealTimers(); });
 
 describe('voice recognition fences initial agent greetings', () => {
+  test('sub-frame, silent and cancelling stereo captures cannot buy wake detection or a session, including follow-ups', async () => {
+    const h = harness(); const speaker = h.speaker();
+    await h.manager.ask(speaker, 'Primeira pergunta'); await settle();
+    const cb = h.callbacks.get('guest')!;
+    await cb.onAudio(Buffer.alloc(480, 1), 1); cb.onResponseComplete(1); await settle();
+    const stereoCancellation = Buffer.alloc(3_840);
+    for (let offset = 0; offset < stereoCancellation.length; offset += 4) {
+      stereoCancellation.writeInt16LE(2000, offset); stereoCancellation.writeInt16LE(-2000, offset + 2);
+    }
+    for (const invalid of [Buffer.alloc(3_836, 1), Buffer.alloc(19_200), stereoCancellation]) {
+      expect(await h.manager.voiceTurn(speaker, invalid)).toBeUndefined();
+    }
+    expect(h.detectWake).not.toHaveBeenCalled();
+    expect(h.connect).toHaveBeenCalledOnce();
+    expect(h.sessions.get('guest')!.sendAudio).not.toHaveBeenCalled();
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    expect(h.metric).toHaveBeenCalledWith('voice_capture_too_short_rejected');
+    expect(h.metric.mock.calls.filter(([name]) => name === 'voice_capture_silent_rejected')).toHaveLength(2);
+    // One complete frame with a signal is accepted without imposing a
+    // speculative minimum of 360–600 ms on short spoken follow-ups.
+    expect(await h.manager.voiceTurn(speaker, Buffer.alloc(3_840, 1))).toMatchObject({ queued: false });
+    await settle();
+    expect(h.sessions.get('guest')!.sendAudio).toHaveBeenCalled();
+  });
+
+  test('missing recognition releases the queue ten seconds after upload without revoking another caller', async () => {
+    vi.useFakeTimers();
+    const h = harness(); await h.voice();
+    const guest = h.speaker('guest'); const guestSession = h.sessions.get('guest')!;
+    await h.manager.ask(h.speaker('owner'), 'Próxima pergunta'); await settle();
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(guestSession.close).not.toHaveBeenCalled();
+    expect(h.connect).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(2); await settle();
+    expect(guestSession.close).toHaveBeenCalledOnce();
+    expect(h.metric).toHaveBeenCalledWith('agent_user_turn_missing');
+    expect(h.sessions.get('owner')!.sendText).toHaveBeenCalledExactlyOnceWith('Próxima pergunta');
+    expect(h.consent.isCurrent('guest', guest.consentVersion, true)).toBe(true);
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: true });
+  });
+
+  test('recognition deadline starts after the entire paced upload rather than during a long question', async () => {
+    vi.useFakeTimers();
+    const h = harness({ pace: async () => { vi.advanceTimersByTime(20); } });
+    await h.voice('guest', Buffer.alloc(12 * 48_000 * 4, 1));
+    await settle();
+    expect(h.sessions.get('guest')!.sendAudio).toHaveBeenCalledTimes(640);
+    expect(h.metric).not.toHaveBeenCalledWith('agent_user_turn_missing');
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(h.manager.queueStatus.active).toBe(true);
+    await vi.advanceTimersByTimeAsync(2);
+    expect(h.manager.queueStatus.active).toBe(false);
+  });
+
+  test('recognized speech clears its ten-second deadline while slow generation keeps the existing forty-five-second bound', async () => {
+    vi.useFakeTimers();
+    const h = harness(); await h.voice();
+    await vi.advanceTimersByTimeAsync(9_000);
+    const cb = h.callbacks.get('guest')!;
+    cb.onUserTranscript?.({ eventId: 10 });
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(h.metric).not.toHaveBeenCalledWith('agent_user_turn_missing');
+    expect(h.manager.queueStatus.active).toBe(true);
+    await cb.onAudio(Buffer.alloc(480, 1), 11); cb.onResponseComplete(11); await settle();
+    expect(h.metric).toHaveBeenCalledWith('agent_turns_completed');
+  });
+
+  test.each(['revoke', 'close'] as const)('%s clears a pending recognition deadline and late provider markers cannot revive it', async action => {
+    vi.useFakeTimers();
+    const h = harness(); await h.voice();
+    const cb = h.callbacks.get('guest')!;
+    if (action === 'revoke') { h.consent.revoke('guest'); h.manager.revoke('guest'); }
+    else h.manager.close();
+    await vi.advanceTimersByTimeAsync(12_000);
+    cb.onUserTranscript?.({ eventId: 10 }); await cb.onAudio(Buffer.alloc(480, 1), 11);
+    expect(h.metric).not.toHaveBeenCalledWith('agent_user_turn_missing');
+    expect(h.metric).not.toHaveBeenCalledWith('agent_user_turns_recognized');
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    expect(h.streams).toHaveLength(0);
+  });
+
   test('closing the provider during upload drains valid output without claiming the whole input was sent', async () => {
     const h = harness({ onSendAudio: (cb, frame) => {
       if (frame === 1) {
@@ -303,7 +385,7 @@ describe('voice recognition fences initial agent greetings', () => {
     expect(h.connect).toHaveBeenCalledOnce();
   });
 
-  test.each([8000, 16000, 24000])('uploads the complete captured question as %i Hz mono frames and final silence', async rate => {
+  test.each([8000, 16000, 22050, 24000, 44100, 48000])('uploads the complete captured question as %i Hz mono frames and final silence', async rate => {
     const h = harness({ rate });
     const pcm = utterance(); const original = Buffer.from(pcm);
     await h.voice('guest', pcm);
@@ -330,7 +412,7 @@ describe('voice recognition fences initial agent greetings', () => {
     cb.onResponseComplete(1); await settle();
     expect(h.streams).toHaveLength(0);
     expect(h.manager.queueStatus.active).toBe(true);
-    await vi.advanceTimersByTimeAsync(45_001);
+    await vi.advanceTimersByTimeAsync(10_001);
     expect(h.streams).toHaveLength(0);
     expect(h.manager.queueStatus.active).toBe(false);
     expect(h.metric.mock.calls.filter(([name]) => name === 'agent_turns_completed')).toHaveLength(0);

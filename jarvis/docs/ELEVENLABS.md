@@ -9,8 +9,11 @@ podem mudar.
 
 1. Em [ElevenLabs](https://elevenlabs.io/app/), abra Agents e crie um agente
    separado, por exemplo `JARVIS | Elysium`.
-2. Copie integralmente [agent-system-prompt.md](../agent-system-prompt.md) para o
-   campo System prompt. O arquivo contém o texto original da seção 6 do anexo.
+2. Compare o System prompt publicado com
+   [agent-system-prompt.md](../agent-system-prompt.md), atualizado na V5.4. Integre
+   a personalidade preservando instruções técnicas específicas da conta. O
+   [roteiro V5.4](V54_STABILITY_REVIEW.md) detalha revisão e rollback; nenhum
+   prompt é publicado automaticamente pelo worker.
 3. Configure português e teste a pronúncia em português brasileiro.
 4. Escolha a voz de Jarvis que já existe na sua conta e que você tem autorização
    para utilizar. Selecione um modelo disponível no plano e comece com velocidade

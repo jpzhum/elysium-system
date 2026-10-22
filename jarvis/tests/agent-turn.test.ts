@@ -127,6 +127,36 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+test('invalid capture rejection logs only its category before wake detection or provider connection', async () => {
+  const h = setup();
+  await h.manager.voiceTurn(h.speaker, Buffer.alloc(3_836, 1));
+  await h.manager.voiceTurn(h.speaker, Buffer.alloc(19_200));
+  expect(h.detectWake).not.toHaveBeenCalled();
+  expect(h.manager.activeCount).toBe(0);
+  expect(h.logs).toMatchObject([
+    { event: 'jarvis_voice_capture_rejected', code: 'AGENT_INPUT_INVALID', capture_rejection: 'too_short',
+      incident: expect.stringMatching(/^[0-9A-F]{8}$/), capture_ms: 20 },
+    { event: 'jarvis_voice_capture_rejected', code: 'AGENT_INPUT_INVALID', capture_rejection: 'silent', capture_ms: 100 },
+  ]);
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
+});
+
+test('missing ASR has its own sanitized ten-second diagnostic without being counted as generation or search timeout', async () => {
+  vi.useFakeTimers();
+  const h = setup(false, async () => undefined); h.detectWake.mockResolvedValue(true);
+  await h.manager.voiceTurn(h.speaker, Buffer.alloc(3_840, 1)); await settle();
+  await vi.advanceTimersByTimeAsync(9_999);
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
+  await vi.advanceTimersByTimeAsync(2); await settle();
+  expect(h.failed('AGENT_USER_TURN_MISSING')).toMatchObject({
+    stage: 'agent_user_recognition', timeout_ms: 10_000, user_turn_recognized: false,
+    input_audio_finished: true, input_source_chunks: 1, input_silence_chunks: 40,
+  });
+  expect(h.metrics.snapshot().agent_response_timeouts ?? 0).toBe(0);
+  expect(h.metrics.snapshot().agent_completion_missing ?? 0).toBe(0);
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+});
+
 test('real final text enters RAM only after successful local playback and remains absent from diagnostics', async () => {
   const onTurnDelivered = vi.fn();
   const h = setup(true, undefined, { onTurnDelivered });
@@ -157,7 +187,7 @@ test('real audio without completion preserves observed final text separately fro
 test('wire final ASR, rather than a tentative transcript or startup greeting, is the remembered voice question', async () => {
   const onTurnDelivered = vi.fn();
   const h = setup(false, async () => undefined, { onTurnDelivered }); h.detectWake.mockResolvedValue(true);
-  const receipt = await h.manager.voiceTurn(h.speaker, Buffer.alloc(480)); await settle();
+  const receipt = await h.manager.voiceTurn(h.speaker, Buffer.alloc(3_840, 1)); await settle();
   h.text(); h.audio();
   h.socket.event({ type: 'tentative_user_transcript', user_transcription_event: { user_transcript: 'tentative-private' } });
   await settle();
@@ -240,7 +270,7 @@ test('missing completion recovers after inactivity, drains valid audio and never
     code: 'AGENT_COMPLETION_MISSING', audio_bytes: 4, completion_received: false,
   });
   expect(h.manager.activeCount).toBe(0);
-  await h.manager.voiceTurn(h.speaker, Buffer.alloc(192));
+  await h.manager.voiceTurn(h.speaker, Buffer.alloc(3_840, 1));
   expect(h.detectWake).toHaveBeenCalledOnce();
   expect(h.playback.startStream).toHaveBeenCalledOnce();
 });

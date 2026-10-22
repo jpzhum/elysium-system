@@ -4,7 +4,7 @@ import {
 } from 'discord.js';
 import { VoiceConnectionStatus, type VoiceConnection } from '@discordjs/voice';
 import type { Config } from '../config.js';
-import { Logger, Metrics } from '../observability/metrics.js';
+import { Logger, Metrics, type DiagnosticFields } from '../observability/metrics.js';
 import { operationalStatus } from '../observability/status.js';
 import { DiagnosticError, JoinDiagnostics, sanitizeError } from '../observability/diagnostics.js';
 import { inspectVoiceRuntime } from '../observability/voice-runtime.js';
@@ -15,7 +15,7 @@ import { promptIdentitySummary, promptVariables } from '../agents/prompt-context
 import { connectAgent } from '../agents/elevenlabs-client.js';
 import { RecentConversation } from '../agents/recent-conversation.js';
 import { SessionError, SessionManager, type TurnNotification, type TurnReceipt } from '../agents/session-manager.js';
-import { ElevenWakeDetector } from '../agents/wake-detector.js';
+import { ElevenWakeDetector, WakeError } from '../agents/wake-detector.js';
 import { createGameSearch, type GameSearchResult } from '../tools/game-search.js';
 import { createVoiceParticipantsTool } from '../tools/voice-participants.js';
 import { PlaybackQueue } from '../audio/playback.js';
@@ -52,7 +52,8 @@ export class JarvisBot {
   constructor(private readonly config: Config, private readonly logger: Logger) {
     this.wake = new ElevenWakeDetector(config.ELEVENLABS_API_KEY ?? '', config.JARVIS_WAKE_WORD,
       config.JARVIS_MAX_WAKE_CHECKS_PER_MINUTE, this.metrics.record);
-    this.search = createGameSearch({ apiKey: config.JARVIS_SEARCH_API_KEY, onDiagnostic: (event) => {
+    this.search = createGameSearch({ apiKey: config.JARVIS_SEARCH_API_KEY,
+      timeoutMs: config.JARVIS_SEARCH_TIMEOUT_MS, onDiagnostic: (event) => {
       this.metrics.add(`search_${event.status}`);
       this.metrics.record('search_duration_ms', event.durationMs);
       this.logger.event('jarvis_search_result', event.status === 'success' ? 'info' : 'warn', {
@@ -74,9 +75,9 @@ export class JarvisBot {
     this.client.on(Events.VoiceStateUpdate, (before, after) => {
       const room = this.room;
       if (!room || before.guild.id !== config.JARVIS_GUILD_ID) return;
-      if (after.id === this.client.user?.id && after.channelId !== room.channel.id) { this.reset(); return; }
+      if (after.id === this.client.user?.id && after.channelId !== room.channel.id) { this.reset('channel_changed'); return; }
       if (before.channelId === room.channel.id && after.channelId !== room.channel.id) this.revoke(room, after.id);
-      if (!room.channel.members.some((member) => !member.user.bot)) this.reset();
+      if (!room.channel.members.some((member) => !member.user.bot)) this.reset('channel_empty');
     });
   }
 
@@ -156,6 +157,7 @@ export class JarvisBot {
         const pages = operationalStatus(this.metrics.snapshot());
         await this.reply(interaction, `${room ? 'Conectado' : 'Desconectado'}; modo: ${this.config.daveSmoke
           ? 'diagnóstico DAVE local' : this.config.JARVIS_VOICE_INPUT}; sessões: ${room?.sessions.activeCount ?? 0};`
+          + ` voz Discord: ${this.voice.connection?.state.status ?? 'desconectada'}; receiver: ${room?.receiver.state ?? 'stopped'};`
           + ` perguntas na fila: ${room?.sessions.queuedCount ?? 0}; interrupção por voz: ${this.config.JARVIS_BARGE_IN_ENABLED ? 'experimental' : 'desativada'}.`
           + `\nPesquisa Brave: ${this.config.JARVIS_SEARCH_API_KEY ? 'chave configurada; verificar execução' : 'sem chave configurada'}.`
           + `\n${pages[0]}`);
@@ -306,7 +308,7 @@ export class JarvisBot {
       if (this.closed || this.epoch !== preparationEpoch) throw new SessionError('closed');
       if (interaction.member.voice.channel?.id !== channel.id) throw new DiagnosticError('cancelled', 'JOIN_CANCELLED');
       diagnostic?.stage('previous_room_cleanup');
-      this.reset();
+      this.reset('room_replaced');
       const epoch = this.epoch;
       diagnostic?.stage('voice_connect');
       connection = await this.voice.join(channel, diagnostic);
@@ -447,6 +449,13 @@ export class JarvisBot {
           try { await room.sessions.voiceTurn(this.context(room, member), pcm, timing); }
           catch (error) {
             this.metrics.add('voice_turn_rejected');
+            this.logger.event('jarvis_voice_turn_rejected', 'warn', {
+              stage: 'voice_capture', input_kind: 'voice',
+              rejection_reason: error instanceof SessionError ? error.reason ?? error.code
+                : error instanceof WakeError ? error.code : 'unexpected',
+              voice_status: connection!.state.status, queue_depth: room.sessions.queuedCount,
+              ...sanitizeError(error),
+            });
             if (this.room === room && consent.get(id)?.audio) {
               const notice = error instanceof SessionError && error.code === 'limit' ? this.limitNotice(error)
                 : 'Não foi possível aceitar a pergunta de voz. Confira /jarvis status ou use /jarvis ask.';
@@ -455,10 +464,13 @@ export class JarvisBot {
             }
           }
         }, onMetric: this.metrics.record,
+        onState: (state) => this.logger.event('jarvis_voice_receiver_state', 'info', {
+          stage: 'receiver_setup', receiver_state: state, voice_status: connection!.state.status,
+        }),
       });
       this.room = room;
       connection.on('stateChange', (_oldState, state) => {
-        if (state.status === VoiceConnectionStatus.Destroyed && this.room === room) this.reset();
+        if (state.status === VoiceConnectionStatus.Destroyed && this.room === room) this.reset('connection_destroyed');
         else if (this.room === room && state.status === VoiceConnectionStatus.Disconnected) {
           for (const abort of room.interruptions.values()) abort.abort();
           room.interruptions.clear();
@@ -501,11 +513,14 @@ export class JarvisBot {
     room.recent?.forget(userId);
     room.probe.delete(userId);
   }
-  private reset(): void {
+  private reset(reason: DiagnosticFields['voice_lifecycle_reason'] = 'explicit_leave'): void {
     this.epoch++;
     const room = this.room;
     this.room = undefined;
     if (room) {
+      this.logger.event('jarvis_voice_state', 'info', {
+        voice_lifecycle_reason: reason, voice_status: this.voice.connection?.state.status,
+      });
       for (const abort of room.interruptions.values()) abort.abort();
       room.interruptions.clear();
       room.consent.clear();
@@ -515,6 +530,11 @@ export class JarvisBot {
       room.playback.stop();
       room.probe.clear();
       room.echo.clear();
+      if (reason === 'connection_destroyed' || reason === 'channel_changed') {
+        void room.channel.send({ content: 'A conexão de voz foi encerrada e os consentimentos desta chamada foram apagados. '
+          + 'O criador precisa usar /jarvis join; depois, cada participante deve renovar /jarvis consent.',
+        allowedMentions: { parse: [] } }).catch(() => this.metrics.add('turn_notification_failed'));
+      }
     }
     this.voice.leave();
   }
@@ -556,7 +576,7 @@ export class JarvisBot {
   async stop(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    this.reset();
+    this.reset('shutdown');
     await this.client.destroy();
     this.logger.event('jarvis_stopped');
   }

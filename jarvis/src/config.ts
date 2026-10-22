@@ -29,6 +29,7 @@ const schema = z.object({
   JARVIS_MAX_TURNS_PER_HOUR: integer(120, 1, 600),
   JARVIS_MAX_WAKE_CHECKS_PER_MINUTE: integer(6, 1, 30),
   JARVIS_SEARCH_API_KEY: z.string().trim().min(1).optional(),
+  JARVIS_SEARCH_TIMEOUT_MS: integer(5000, 1000, 15000),
   JARVIS_LOG_LEVEL: z.enum(['info', 'warn', 'error']).default('info'),
 });
 

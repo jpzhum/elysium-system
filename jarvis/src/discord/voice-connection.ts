@@ -8,6 +8,30 @@ import { DiagnosticError, sanitizeError, type JoinDiagnostics } from "../observa
 
 const JOIN_TIMEOUT_MS = 20_000;
 const RECONNECT_TIMEOUT_MS = 25_000;
+const RECONNECT_ATTEMPTS = 3;
+const RECOVERY_PHASE_MS = 5_000;
+
+function transientFailure(failure: DiagnosticError): boolean {
+  return failure.category === "network" || failure.code === "ETIMEDOUT" || failure.code === "VOICE_DISCONNECTED" ||
+    ["WS_CLOSE_4006", "WS_CLOSE_4009", "WS_CLOSE_4015"].includes(failure.code);
+}
+
+function backoff(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    timer.unref();
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
 
 // Like @discordjs/voice's disposed Networking instances, a destroyed connection
 // may still receive a late error. This shared listener retains no attempt data.
@@ -177,6 +201,7 @@ export class VoiceConnectionManager {
   private joining = false;
   private reconnecting = false;
   private reconnectAbort: AbortController | undefined;
+  private reconnectAttemptAbort: AbortController | undefined;
   private joinAbort: AbortController | undefined;
   private stopObserving: (() => void) | undefined;
   private diagnostics: JoinDiagnostics | undefined;
@@ -253,6 +278,8 @@ export class VoiceConnectionManager {
     this.joinAbort = undefined;
     this.reconnectAbort?.abort(new DiagnosticError("cancelled", "JOIN_CANCELLED"));
     this.reconnectAbort = undefined;
+    this.reconnectAttemptAbort?.abort(new DiagnosticError("cancelled", "JOIN_CANCELLED"));
+    this.reconnectAttemptAbort = undefined;
     this.reconnecting = false;
     const connection = this.current;
     this.current = undefined;
@@ -267,13 +294,17 @@ export class VoiceConnectionManager {
     if (this.joinAbort && !this.joinAbort.signal.aborted) {
       this.joinAbort.abort(failure);
     } else if (this.reconnectAbort && !this.reconnectAbort.signal.aborted) {
-      this.reconnectAbort.abort(failure);
+      // A transport hiccup ends this attempt, not the channel's valid consent
+      // session. Fatal permission/encryption failures still end recovery.
+      if (transientFailure(failure)) this.reconnectAttemptAbort?.abort(failure);
+      else this.reconnectAbort.abort(failure);
     } else {
-      void this.recover(connection);
+      if (!transientFailure(failure)) { this.leave(); return; }
+      void this.recover(connection, true);
     }
   }
 
-  private async recover(connection: VoiceConnection): Promise<void> {
+  private async recover(connection: VoiceConnection, forceRejoin = false): Promise<void> {
     if (this.current !== connection || this.joining || this.reconnecting ||
       connection.state.status === VoiceConnectionStatus.Destroyed) return;
     this.reconnecting = true;
@@ -290,30 +321,58 @@ export class VoiceConnectionManager {
     }, RECONNECT_TIMEOUT_MS);
     deadline.unref();
     try {
-      // Discord can issue a new endpoint/token while reconnecting. Give that path time first.
-      const phase = new AbortController();
-      const phaseDeadline = setTimeout(() => phase.abort(), 5_000);
-      phaseDeadline.unref();
-      const signal = AbortSignal.any([phase.signal, controller.signal]);
-      try {
-        await Promise.any([
-          entersState(connection, VoiceConnectionStatus.Signalling, signal),
-          entersState(connection, VoiceConnectionStatus.Connecting, signal),
-          entersState(connection, VoiceConnectionStatus.Ready, signal),
-        ]).catch(() => {
-          if (this.current === connection && !controller.signal.aborted) {
-            const accepted = connection.rejoin();
-            observeSafely(() => diagnostics?.event("voice_recovery_rejoin", "info", {}));
-            if (!accepted) throw new DiagnosticError("discord", "VOICE_ADAPTER_UNAVAILABLE");
-          }
-        });
-      } finally {
-        clearTimeout(phaseDeadline);
-        phase.abort();
+      const waitReady = async (timeoutMs?: number, rejoin = false): Promise<void> => {
+        const attempt = new AbortController();
+        this.reconnectAttemptAbort = attempt;
+        const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
+          attempt.abort(new DiagnosticError("timeout", "RECONNECT_TIMEOUT"));
+        }, timeoutMs);
+        timer?.unref();
+        try {
+          if (rejoin && !connection.rejoin()) throw new DiagnosticError("discord", "VOICE_ADAPTER_UNAVAILABLE");
+          await entersState(connection, VoiceConnectionStatus.Ready,
+            AbortSignal.any([controller.signal, attempt.signal]));
+          if (controller.signal.aborted) throw controller.signal.reason;
+          if (attempt.signal.aborted) throw attempt.signal.reason;
+          if (this.current !== connection) throw new DiagnosticError("cancelled", "JOIN_CANCELLED");
+        } catch (error) {
+          throw controller.signal.aborted ? controller.signal.reason
+            : attempt.signal.aborted ? attempt.signal.reason : error;
+        } finally {
+          clearTimeout(timer);
+          attempt.abort();
+          if (this.reconnectAttemptAbort === attempt) this.reconnectAttemptAbort = undefined;
+        }
+      };
+      // Discord can issue a replacement endpoint/token itself. Preserve that
+      // recovery path before requesting up to three rejoins of this connection.
+      let ready = false;
+      if (!forceRejoin) {
+        try { await waitReady(RECOVERY_PHASE_MS); ready = true; }
+        catch { if (controller.signal.aborted) throw controller.signal.reason; }
       }
-      if (controller.signal.aborted) throw controller.signal.reason;
-      if (this.current !== connection) throw new DiagnosticError("cancelled", "JOIN_CANCELLED");
-      await entersState(connection, VoiceConnectionStatus.Ready, controller.signal);
+      for (let attempt = 1; !ready && attempt <= RECONNECT_ATTEMPTS; attempt++) {
+        const backoffMs = attempt === 1 ? 0 : 1_000 * 2 ** (attempt - 2);
+        if (backoffMs) await backoff(backoffMs, controller.signal);
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (this.current !== connection) throw new DiagnosticError("cancelled", "JOIN_CANCELLED");
+        // A late Discord endpoint can become Ready during backoff. Do not tear
+        // down that recovered transport after the bot has resumed its receiver.
+        if (attempt > 1 && connection.state.status === VoiceConnectionStatus.Ready) { ready = true; break; }
+        observeSafely(() => diagnostics?.event("voice_recovery_rejoin", "info", {
+          recovery_attempt: attempt, retry_delay_ms: backoffMs,
+        }));
+        try {
+          // The final attempt is bounded by the original overall 25 s deadline.
+          await waitReady(attempt === RECONNECT_ATTEMPTS ? undefined : RECOVERY_PHASE_MS, true);
+          ready = true;
+        } catch (error) {
+          if (controller.signal.aborted) throw controller.signal.reason;
+          const failure = classified(error);
+          if (attempt === RECONNECT_ATTEMPTS ||
+            (!transientFailure(failure) && failure.code !== "RECONNECT_TIMEOUT")) throw failure;
+        }
+      }
       if (controller.signal.aborted) throw controller.signal.reason;
       observeSafely(() => diagnostics?.event("voice_recovery_ready", "info", {
         duration_ms: Math.round(performance.now() - started),

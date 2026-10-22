@@ -206,3 +206,41 @@ test('disconnect clears capture state and old packets cannot become a new user t
   expect(h.delivered[0]!.timing.captureId).toMatch(/:2$/);
   h.receiver.stop();
 });
+
+test('simultaneous consented speakers retain separate streams and revocation never stops the other speaker', async () => {
+  vi.useFakeTimers();
+  const h = harness(); h.setPlaying(false);
+  h.consent.add('owner'); h.consent.add('guest');
+  h.speaking.emit('start', 'owner'); h.speaking.emit('start', 'guest'); h.speaking.emit('start', 'observer');
+  const owner = h.streams.get('owner')!; const guest = h.streams.get('guest')!;
+  const ownerPcm = packet(); const guestPcm = Buffer.from(ownerPcm); guestPcm.writeInt16LE(4_000, 0);
+  owner.write(ownerPcm); guest.write(guestPcm);
+  h.consent.delete('guest'); h.receiver.stopUser('guest');
+  guest.emit('data', packet()); guest.emit('end');
+  owner.write(ownerPcm); owner.end(); await vi.advanceTimersByTimeAsync(0);
+  expect(h.subscriptions).toEqual(['owner', 'guest']);
+  expect(h.delivered).toHaveLength(1);
+  expect(h.delivered[0]!.userId).toBe('owner');
+  expect(h.delivered[0]!.pcm).toEqual(Buffer.concat([ownerPcm, ownerPcm]));
+  h.receiver.stop();
+});
+
+test('receiver states distinguish standby, transport recovery and shutdown without losing its speaking listener', () => {
+  const h = harness(); h.receiver.stop();
+  const onState = vi.fn();
+  const receiver = new VoiceReceiver(h.connection as unknown as VoiceConnection, {
+    ownUserId: 'bot', canReceive: () => false, isPlaying: () => false, maxTurnSeconds: 1,
+    onTurn: vi.fn(), onState,
+  });
+  receiver.start(); receiver.start();
+  expect(receiver.state).toBe('ready');
+  h.connection.state.status = VoiceConnectionStatus.Disconnected;
+  h.connection.emit('stateChange', {}, h.connection.state);
+  expect(receiver.state).toBe('suspended');
+  h.connection.state.status = VoiceConnectionStatus.Ready;
+  h.connection.emit('stateChange', {}, h.connection.state);
+  expect(h.speaking.listenerCount('start')).toBe(1);
+  receiver.stop();
+  expect(receiver.state).toBe('stopped');
+  expect(onState.mock.calls.map(([state]) => state)).toEqual(['ready', 'suspended', 'ready', 'stopped']);
+});
