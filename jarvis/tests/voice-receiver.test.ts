@@ -123,7 +123,9 @@ test('capture and end-of-speech latency are numeric and a barge-in retains its p
   h.setPlaying(false);
   await vi.advanceTimersByTimeAsync(600);
   stream.emit('end');
-  expect(h.delivered[0]!.timing).toEqual({ duringPlayback: true, captureMs: 640, endDetectionMs: 600 });
+  expect(h.delivered[0]!.timing).toMatchObject({ duringPlayback: true, captureMs: 640, endDetectionMs: 600,
+    captureStartedAtMs: 0, captureEndedAtMs: 640 });
+  expect(h.delivered[0]!.timing.captureId).toMatch(/:1$/);
   expect(h.metric).toHaveBeenCalledWith('voice_capture_ms', 640);
   expect(h.metric).toHaveBeenCalledWith('voice_end_detection_ms', 600);
   h.receiver.stop();
@@ -148,4 +150,59 @@ test('received PCM is zeroed only after the asynchronous consumer has finished',
   await new Promise<void>((resolve) => setImmediate(resolve));
   expect(received.every((value) => value === 0)).toBe(true);
   receiver.stop();
+});
+
+test('repeated speaking starts and microphone microgaps belong to one capture until VAD ends', async () => {
+  vi.useFakeTimers();
+  const h = harness(); h.setPlaying(false); h.consent.add('guest');
+  h.speaking.emit('start', 'guest');
+  const stream = h.streams.get('guest')!;
+  stream.write(packet());
+  for (let index = 0; index < 3; index++) {
+    await vi.advanceTimersByTimeAsync(100);
+    h.speaking.emit('start', 'guest');
+    stream.write(Buffer.alloc(960 * 4));
+  }
+  stream.write(packet()); stream.end();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(h.subscriptions).toEqual(['guest']);
+  expect(h.delivered).toHaveLength(1);
+  expect(h.delivered[0]!.pcm.length).toBe(5 * 960 * 4);
+  expect(h.metric.mock.calls.filter(([name]) => name === 'voice_capture_start_debounced')).toHaveLength(3);
+  h.receiver.stop();
+});
+
+test('separate questions have new capture identities without a normal-speech cooldown', async () => {
+  vi.useFakeTimers();
+  const h = harness(); h.setPlaying(false); h.consent.add('guest'); h.consent.add('other');
+  for (const userId of ['guest', 'guest', 'other']) {
+    h.speaking.emit('start', userId);
+    h.streams.get(userId)!.write(packet());
+    await vi.advanceTimersByTimeAsync(20);
+    h.streams.get(userId)!.end();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+  expect(h.subscriptions).toEqual(['guest', 'guest', 'other']);
+  expect(h.delivered.map(item => item.timing.captureId)).toEqual([
+    expect.stringMatching(/:1$/), expect.stringMatching(/:2$/), expect.stringMatching(/:3$/),
+  ]);
+  expect(h.delivered[0]!.timing.captureEndedAtMs).toBe(h.delivered[1]!.timing.captureStartedAtMs);
+  h.receiver.stop();
+});
+
+test('disconnect clears capture state and old packets cannot become a new user turn', async () => {
+  vi.useFakeTimers();
+  const h = harness(); h.setPlaying(false); h.consent.add('guest');
+  h.speaking.emit('start', 'guest');
+  const old = h.streams.get('guest')!; old.write(packet());
+  h.connection.state.status = VoiceConnectionStatus.Disconnected;
+  h.connection.emit('stateChange', {}, h.connection.state);
+  old.emit('data', packet()); old.emit('end');
+  expect(h.delivered).toHaveLength(0);
+  h.connection.state.status = VoiceConnectionStatus.Ready;
+  h.speaking.emit('start', 'guest'); h.streams.get('guest')!.write(packet());
+  h.streams.get('guest')!.end(); await vi.advanceTimersByTimeAsync(0);
+  expect(h.delivered).toHaveLength(1);
+  expect(h.delivered[0]!.timing.captureId).toMatch(/:2$/);
+  h.receiver.stop();
 });

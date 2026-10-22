@@ -80,6 +80,164 @@ function harness(overrides: Partial<SessionOptions> = {}) {
 afterEach(() => { for (const manager of managers.splice(0)) manager.close(); vi.useRealTimers(); });
 
 describe('bounded conversational scheduling', () => {
+  test('client tools are authorized only for the currently active speaker and consent/channel generation', async () => {
+    const h = harness();
+    const guest = h.speaker('guest'); const owner = h.speaker('owner');
+    expect(h.manager.isTurnActive(guest)).toBe(false);
+    expect(h.manager.turnIncident(guest)).toBeUndefined();
+    const receipt = await h.ask('guest');
+    expect(h.manager.isTurnActive(guest)).toBe(true);
+    expect(h.manager.turnIncident(guest)).toBe(receipt.turnId);
+    expect(h.manager.turnIncident({ ...guest, channelId: 'other' })).toBeUndefined();
+    expect(h.manager.isTurnActive(owner)).toBe(false);
+    expect(h.manager.isTurnActive({ ...guest, channelId: 'other' })).toBe(false);
+    expect(h.manager.isTurnActive({ ...guest, consentVersion: guest.consentVersion + 1 })).toBe(false);
+    await h.ask('owner');
+    expect(h.manager.isTurnActive(owner)).toBe(false);
+    await h.finish('guest');
+    expect(h.manager.isTurnActive(guest)).toBe(false);
+    expect(h.manager.isTurnActive(owner)).toBe(true);
+    h.consent.revoke('owner'); h.manager.revoke('owner');
+    expect(h.manager.isTurnActive(owner)).toBe(false);
+    expect(h.manager.turnIncident(owner)).toBeUndefined();
+  });
+
+  test('a session still opening cannot use a tool on behalf of its startup greeting', async () => {
+    let resolveSession!: (session: AgentSession) => void;
+    const h = harness({ connect: () => new Promise<AgentSession>(resolve => { resolveSession = resolve; }) });
+    const guest = h.speaker('guest');
+    await h.ask('guest');
+    expect(h.manager.activeCount).toBe(1);
+    expect(h.manager.isTurnActive(guest)).toBe(false);
+    resolveSession({ inputSampleRate: 16_000, outputSampleRate: 24_000,
+      sendText: vi.fn(), sendAudio: vi.fn(), sendContext: vi.fn(), close: vi.fn() });
+    await settle();
+    expect(h.manager.isTurnActive(guest)).toBe(true);
+    h.manager.cancelUser('guest');
+    expect(h.manager.isTurnActive(guest)).toBe(false);
+  });
+
+  test('startup tools during voice upload remain blocked until ElevenAgents recognizes the user turn', async () => {
+    const h = harness({ pace: async () => undefined }); const guest = h.speaker('guest');
+    await h.manager.voiceTurn(guest, Buffer.alloc(480)); await settle();
+    expect(h.manager.isTurnActive(guest)).toBe(false);
+    h.callbacks.get('guest')!.onUserTranscript?.({ eventId: 20 });
+    expect(h.manager.isTurnActive(guest)).toBe(true);
+    h.manager.cancelUser('guest');
+    expect(h.manager.isTurnActive(guest)).toBe(false);
+  });
+
+  test('the same capture and overlapping segments are ignored before asynchronous wake detection', async () => {
+    let completeWake!: (activated: boolean) => void;
+    const detectWake = vi.fn(() => new Promise<boolean>(resolve => { completeWake = resolve; }));
+    const h = harness({ detectWake, pace: async () => undefined });
+    const first = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+      captureMs: 1000, endDetectionMs: 600, captureId: 'capture-1', captureStartedAtMs: 0, captureEndedAtMs: 1000,
+    });
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+      captureMs: 1000, endDetectionMs: 600, captureId: 'capture-1', captureStartedAtMs: 0, captureEndedAtMs: 1000,
+    })).toBeUndefined();
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+      captureMs: 1000, endDetectionMs: 600, captureId: 'overlapping', captureStartedAtMs: 900, captureEndedAtMs: 1900,
+    })).toBeUndefined();
+    expect(detectWake).toHaveBeenCalledOnce();
+    completeWake(true); expect(await first).toMatchObject({ queued: false }); await settle();
+    expect(h.metric.mock.calls.filter(([name]) => name === 'questions_received')).toHaveLength(1);
+    expect(h.metric.mock.calls.filter(([name]) => name === 'voice_capture_duplicates')).toHaveLength(2);
+    expect(h.notify.mock.calls.filter(([, event]) => event.type === 'queued')).toHaveLength(0);
+  });
+
+  test('five consecutive captures of identical PCM are distinct and reuse the same completed session', async () => {
+    const detectWake = vi.fn(async () => true);
+    const h = harness({ detectWake, pace: async () => undefined });
+    for (let index = 0; index < 5; index++) {
+      expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), {
+        captureMs: 1000, endDetectionMs: 600, captureId: `capture-${index}`,
+        captureStartedAtMs: index * 1000, captureEndedAtMs: (index + 1) * 1000,
+      })).toMatchObject({ queued: false });
+      await settle();
+      h.callbacks.get('guest')!.onUserTranscript?.({ eventId: 100 + index });
+      await h.finish('guest');
+    }
+    expect(h.connect).toHaveBeenCalledOnce();
+    expect(detectWake).toHaveBeenCalledOnce();
+    expect(h.metric.mock.calls.filter(([name]) => name === 'questions_received')).toHaveLength(5);
+    expect(h.metric).not.toHaveBeenCalledWith('voice_capture_duplicates');
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_session_reused')).toHaveLength(4);
+  });
+
+  test('identical capture windows belonging to different Discord IDs are independently enqueued', async () => {
+    const h = harness({ pace: async () => undefined });
+    const timing = { captureMs: 1000, endDetectionMs: 600, captureId: 'same', captureStartedAtMs: 0, captureEndedAtMs: 1000 };
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), timing)).toMatchObject({ queued: false });
+    await settle();
+    expect(await h.manager.voiceTurn(h.speaker('owner'), Buffer.alloc(480), timing)).toMatchObject({ queued: true });
+    expect(h.manager.queuedCount).toBe(1);
+    expect(h.metric).not.toHaveBeenCalledWith('voice_capture_duplicates');
+  });
+
+  test('queue-full capture is reported once and repeated delivery cannot repeat the rejection or paid check', async () => {
+    const detectWake = vi.fn(async () => true);
+    const h = harness({ maxQueuedTurns: 1, detectWake, pace: async () => undefined });
+    await h.ask('guest'); await h.ask('owner');
+    const timing = { captureMs: 1000, endDetectionMs: 600, captureId: 'full', captureStartedAtMs: 0, captureEndedAtMs: 1000 };
+    await expect(h.manager.voiceTurn(h.speaker('other'), Buffer.alloc(480), timing))
+      .rejects.toMatchObject({ code: 'limit', reason: 'queue_full' });
+    expect(await h.manager.voiceTurn(h.speaker('other'), Buffer.alloc(480), timing)).toBeUndefined();
+    expect(detectWake).toHaveBeenCalledOnce();
+    expect(h.metric.mock.calls.filter(([name]) => name === 'voice_queue_rejected')).toHaveLength(1);
+    expect(h.manager.queuedCount).toBe(1);
+  });
+
+  test('revocation cancels pending wake work and clears its capture metadata for a newly granted consent', async () => {
+    let resolveWake!: (value: boolean) => void;
+    const h = harness({ pace: async () => undefined,
+      detectWake: () => new Promise<boolean>(resolve => { resolveWake = resolve; }) });
+    const timing = { captureMs: 1000, endDetectionMs: 600, captureId: 'capture', captureStartedAtMs: 0, captureEndedAtMs: 1000 };
+    const first = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), timing);
+    h.consent.revoke('guest'); h.manager.revoke('guest'); resolveWake(true);
+    expect(await first).toBeUndefined(); expect(h.connect).not.toHaveBeenCalled();
+    h.consent.grant('guest', true);
+    const next = h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480), timing);
+    resolveWake(true); expect(await next).toMatchObject({ queued: false });
+    expect(h.metric).not.toHaveBeenCalledWith('voice_capture_duplicates');
+  });
+
+  test('upload latency counts the recorded source separately from the final VAD silence', async () => {
+    vi.useFakeTimers();
+    const h = harness({ pace: async () => { vi.advanceTimersByTime(20); } });
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480)); await settle();
+    expect(h.metric).toHaveBeenCalledWith('agent_input_source_chunks', 1);
+    expect(h.metric).toHaveBeenCalledWith('agent_input_silence_chunks', 40);
+    expect(h.metric).toHaveBeenCalledWith('agent_audio_upload_ms', 820);
+    expect(Buffer.concat(h.uploaded.get('guest')!).length).toBe(80 + 25_600);
+  });
+
+  test('trusted context refresh runs for text and voice and retains current display identity on reuse', async () => {
+    const prepareSession = vi.fn();
+    const h = harness({ prepareSession, pace: async () => undefined });
+    await h.ask('guest'); await h.finish('guest');
+    const current = { ...h.speaker('guest'), displayName: 'Nome atualizado' };
+    await h.manager.voiceTurn(current, Buffer.alloc(480)); await settle();
+    expect(prepareSession).toHaveBeenNthCalledWith(1, expect.objectContaining({ discordUserId: 'guest' }),
+      h.sessions.get('guest'), false, expect.objectContaining({ inputKind: 'text' }));
+    expect(prepareSession).toHaveBeenNthCalledWith(2, current, h.sessions.get('guest'), true,
+      expect.objectContaining({ inputKind: 'voice' }));
+    h.callbacks.get('guest')!.onUserTranscript?.({ eventId: 100 });
+    await h.finish('guest');
+    expect(h.notify).toHaveBeenLastCalledWith(current, expect.objectContaining({ type: 'started' }));
+  });
+
+  test('revocation while refreshing a provider context prevents sending the next question', async () => {
+    let release!: () => void;
+    const h = harness({ prepareSession: async () => new Promise<void>(resolve => { release = resolve; }) });
+    await h.ask('guest');
+    const session = h.sessions.get('guest')!;
+    h.consent.revoke('guest'); h.manager.revoke('guest'); release(); await settle();
+    expect(session.sendText).not.toHaveBeenCalled();
+    expect(h.manager.queueStatus.active).toBe(false);
+  });
+
   test('five consecutive questions accept immediately without completion and fence every retired provider', async () => {
     const h = harness();
     await h.ask('guest', 'Primeira');
@@ -386,6 +544,18 @@ describe('speaker authorization and cancellation', () => {
     await vi.advanceTimersByTimeAsync(19_000);
     await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(480));
     expect(detect).toHaveBeenCalledOnce();
+  });
+
+  test('an existing session follow-up cannot bypass wake recognition in a different channel', async () => {
+    const detectWake = vi.fn(async () => false);
+    const h = harness({ detectWake, pace: async () => undefined });
+    await h.ask('guest'); await h.finish('guest');
+    const prior = h.sessions.get('guest')!;
+    const otherChannel = { ...h.speaker('guest'), channelId: 'different-channel' };
+    expect(await h.manager.voiceTurn(otherChannel, Buffer.alloc(480))).toBeUndefined();
+    expect(detectWake).toHaveBeenCalledOnce();
+    expect(prior.sendAudio).not.toHaveBeenCalled();
+    expect(h.connect).toHaveBeenCalledOnce();
   });
 
   test('provider interruption aborts paced upload and allows a fresh next request', async () => {

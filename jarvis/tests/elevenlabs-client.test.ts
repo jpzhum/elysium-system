@@ -4,6 +4,7 @@ import {
   AgentError, createAgentConnector,
   type AgentCallbacks, type AgentDependencies, type ConnectAgentOptions,
 } from '../src/agents/elevenlabs-client.js';
+import { createGameSearch } from '../src/tools/game-search.js';
 
 const sockets: FakeSocket[] = [];
 class FakeSocket extends EventEmitter {
@@ -55,6 +56,7 @@ afterEach(() => {
   for (const socket of sockets.splice(0)) socket.close();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
@@ -304,7 +306,7 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     await vi.waitFor(() => expect(h.socket.sent.at(-1)).toMatchObject({
       type: 'client_tool_result', tool_call_id: 'call_1', is_error: true,
     }));
-    expect(tool).toHaveBeenCalledExactlyOnceWith('search_game_info', { user_id: 'forged' });
+    expect(tool).toHaveBeenCalledExactlyOnceWith('search_game_info', { user_id: 'forged' }, expect.any(AbortSignal));
     expect(JSON.stringify(h.socket.sent)).not.toContain('credential-secret');
   });
 
@@ -316,6 +318,224 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
       type: 'client_tool_result', tool_call_id: 'read_1', is_error: false,
       result: JSON.stringify({ sources: [], uncertainty: 'Sem chave.' }),
     }));
+  });
+
+  it('executes the real search backend from client_tool_call and returns attributed sources over the protocol', async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ web: { results: [
+      { title: 'Guide', url: 'https://example.com/guide', description: 'An attributed source excerpt.' },
+    ] } })));
+    vi.stubGlobal('fetch', request);
+    const search = createGameSearch({ apiKey: 'search-key-secret' });
+    const h = harness({ tools: async (name, parameters, signal) => {
+      if (name !== 'search_game_info') throw new Error('denied');
+      const args = parameters as { game: string; query: string };
+      return search(args.game, args.query, signal);
+    } });
+    await h.connect();
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'search_game_info', tool_call_id: 'search_fixture',
+      parameters: { game: 'Game', query: 'Quest location' }, expects_response: true,
+    } });
+    await vi.waitFor(() => expect(h.socket.sent).toHaveLength(2));
+    const result = h.socket.sent[1];
+    expect(result).toMatchObject({ type: 'client_tool_result', tool_call_id: 'search_fixture', is_error: false });
+    expect(JSON.parse(String(result?.result))).toMatchObject({ status: 'success', sources: [
+      { title: 'Guide', url: 'https://example.com/guide', snippet: 'An attributed source excerpt.' },
+    ] });
+    expect(request).toHaveBeenCalledOnce();
+    expect(String(request.mock.calls[0]?.[0])).toContain('https://api.search.brave.com/res/v1/web/search?');
+    expect(JSON.stringify(h.socket.sent)).not.toContain('search-key-secret');
+  });
+
+  it('reports sanitized client-tool stages without copying untrusted names, parameters or results', async () => {
+    const diagnostics = vi.fn();
+    const h = harness({ onToolEvent: diagnostics, tools: async () => ({ answer: 'private-result' }) });
+    await h.connect();
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'search_game_info', tool_call_id: 'private-call-id',
+      parameters: { game: 'private-game', query: 'private-query' }, expects_response: true,
+    } });
+    await vi.waitFor(() => expect(diagnostics).toHaveBeenCalledTimes(3));
+    expect(diagnostics.mock.calls.map(([value]) => value)).toEqual([
+      { stage: 'received', tool: 'search_game_info', waitForResponse: true },
+      { stage: 'started', tool: 'search_game_info', waitForResponse: true },
+      { stage: 'completed', tool: 'search_game_info', waitForResponse: true, durationMs: expect.any(Number) },
+    ]);
+    expect(JSON.stringify(diagnostics.mock.calls)).not.toContain('private');
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'private-secret-name', tool_call_id: 'next', parameters: {}, expects_response: false,
+    } });
+    await vi.waitFor(() => expect(diagnostics).toHaveBeenCalledTimes(6));
+    expect(diagnostics.mock.calls[3]?.[0]).toEqual({ stage: 'received', tool: 'unknown', waitForResponse: false });
+    expect(h.socket.sent).toHaveLength(2); // No result packet when Wait for response is false.
+    expect(JSON.stringify(diagnostics.mock.calls)).not.toContain('private');
+  });
+
+  it('aborts an individual tool on timeout and never forwards its late result', async () => {
+    const diagnostics = vi.fn();
+    let signal: AbortSignal | undefined;
+    let finish: ((value: unknown) => void) | undefined;
+    const h = harness({ onToolEvent: diagnostics, tools: (_name, _parameters, toolSignal) => {
+      signal = toolSignal;
+      return new Promise<unknown>(resolve => { finish = resolve; });
+    } });
+    await h.connect();
+    vi.useFakeTimers();
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'search_game_info', tool_call_id: 'timeout', parameters: {}, expects_response: true,
+    } });
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(signal?.aborted).toBe(true);
+    expect(diagnostics).toHaveBeenLastCalledWith({ stage: 'failed', tool: 'search_game_info',
+      waitForResponse: true, durationMs: 8000, code: 'TOOL_TIMEOUT' });
+    expect(h.socket.sent.at(-1)).toMatchObject({ type: 'client_tool_result', is_error: true });
+    finish?.('private late result');
+    await Promise.resolve();
+    expect(h.socket.sent).toHaveLength(2);
+    expect(JSON.stringify(h.socket.sent)).not.toContain('private late result');
+  });
+
+  it('aborts backend tool requests on session close and sanitizes cancellation diagnostics', async () => {
+    let signal: AbortSignal | undefined;
+    const diagnostics = vi.fn();
+    const h = harness({ onToolEvent: diagnostics, tools: (_name, _parameters, toolSignal) => {
+      signal = toolSignal;
+      return new Promise<never>(() => { /* The backend request is pending until cancellation. */ });
+    } });
+    const session = await h.connect();
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'get_voice_participants', tool_call_id: 'cancelled', parameters: {},
+    } });
+    session.close();
+    await vi.waitFor(() => expect(diagnostics).toHaveBeenCalledTimes(3));
+    expect(signal?.aborted).toBe(true);
+    expect(diagnostics).toHaveBeenLastCalledWith({ stage: 'failed', tool: 'get_voice_participants',
+      waitForResponse: true, durationMs: expect.any(Number), code: 'TOOL_CANCELLED' });
+    expect(h.socket.sent).toHaveLength(1);
+  });
+
+  it('orders a voice client tool after final ASR behind a pending greeting write without blocking later audio', async () => {
+    let releaseGreeting: (() => void) | undefined;
+    let finishTool: ((result: unknown) => void) | undefined;
+    let recognized = false;
+    const tool = vi.fn((_name: string, _parameters: unknown, _signal: AbortSignal) => {
+      if (!recognized) throw new Error('voice_turn_not_recognized');
+      return new Promise<unknown>(resolve => { finishTool = resolve; });
+    });
+    const h = harness({ tools: tool });
+    h.callbacks.onAudio = vi.fn().mockImplementationOnce(() => new Promise<void>(resolve => { releaseGreeting = resolve; }));
+    h.callbacks.onUserTranscript = vi.fn(() => { recognized = true; });
+    h.callbacks.onToolActivity = vi.fn();
+    await h.connect();
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.alloc(320).toString('base64'), event_id: 1 } });
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private question', event_id: 2 } });
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'get_voice_participants', tool_call_id: 'ordered', parameters: {}, expects_response: true,
+    } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.alloc(320).toString('base64'), event_id: 3 } });
+    expect(h.callbacks.onToolActivity).toHaveBeenLastCalledWith(1); // Recovery sees the queued tool immediately.
+    expect(recognized).toBe(false);
+    expect(tool).not.toHaveBeenCalled();
+    releaseGreeting?.();
+    await vi.waitFor(() => expect(tool).toHaveBeenCalledOnce());
+    expect(recognized).toBe(true);
+    expect(h.callbacks.onAudio).toHaveBeenCalledTimes(2); // No wait for the tool's network operation.
+    finishTool?.({ available: true, participants: [] });
+    await vi.waitFor(() => expect(h.socket.sent.at(-1)).toMatchObject({
+      type: 'client_tool_result', tool_call_id: 'ordered', is_error: false,
+    }));
+    expect(h.callbacks.onToolActivity).toHaveBeenLastCalledWith(0);
+  });
+
+  it('does not execute a queued voice search after revocation while its ASR marker is waiting', async () => {
+    let release: (() => void) | undefined;
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}'));
+    vi.stubGlobal('fetch', request);
+    const search = createGameSearch({ apiKey: 'search-key-secret' });
+    const tools = vi.fn((_name: string, _parameters: unknown, signal: AbortSignal) => search('Game', 'Quest', signal));
+    const abort = new AbortController();
+    const h = harness({ signal: abort.signal, tools });
+    h.callbacks.onAudio = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    h.callbacks.onUserTranscript = vi.fn();
+    await h.connect();
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.alloc(320).toString('base64'), event_id: 1 } });
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private question' } });
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'search_game_info', tool_call_id: 'cancelled_before_start', parameters: { game: 'Game', query: 'Quest' },
+    } });
+    abort.abort();
+    release?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.callbacks.onUserTranscript).not.toHaveBeenCalled();
+    expect(tools).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    expect(h.socket.sent).toHaveLength(1);
+  });
+
+  it('starts the tool deadline at wire reception and never executes an expired queued marker', async () => {
+    let release: (() => void) | undefined;
+    const tool = vi.fn(async () => 'late result');
+    const diagnostics = vi.fn();
+    const h = harness({ tools: tool, onToolEvent: diagnostics });
+    h.callbacks.onAudio = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    h.callbacks.onToolActivity = vi.fn();
+    await h.connect();
+    vi.useFakeTimers();
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.alloc(320).toString('base64'), event_id: 1 } });
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'search_game_info', tool_call_id: 'queued_timeout', parameters: {},
+    } });
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(tool).not.toHaveBeenCalled();
+    expect(h.callbacks.onToolActivity).toHaveBeenLastCalledWith(0);
+    expect(diagnostics).toHaveBeenLastCalledWith({ stage: 'failed', tool: 'search_game_info',
+      waitForResponse: true, code: 'TOOL_TIMEOUT', durationMs: 8000 });
+    expect(h.socket.sent.at(-1)).toMatchObject({ type: 'client_tool_result', is_error: true });
+    release?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(tool).not.toHaveBeenCalled();
+    expect(h.socket.sent).toHaveLength(2);
+  });
+
+  it('bounds tool parameters and validates the wait flag before retaining an ordered marker', async () => {
+    for (const invalid of [{ parameters: { query: 'x'.repeat(4097) } }, { expects_response: 'yes' }]) {
+      const tool = vi.fn(async () => 'unused');
+      const h = harness({ tools: tool });
+      await h.connect();
+      h.socket.message({ type: 'client_tool_call', client_tool_call: {
+        tool_name: 'search_game_info', tool_call_id: 'invalid', ...invalid,
+      } });
+      expect(tool).not.toHaveBeenCalled();
+      expect(h.callbacks.onError).toHaveBeenCalledOnce();
+      expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('cancels an interrupted queued tool while preserving finalized ASR and handling ping independently', async () => {
+    let release: (() => void) | undefined;
+    const tools = vi.fn(async () => 'must not run');
+    const h = harness({ tools });
+    h.callbacks.onAudio = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    h.callbacks.onUserTranscript = vi.fn();
+    h.callbacks.onToolActivity = vi.fn();
+    await h.connect();
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.alloc(320).toString('base64'), event_id: 1 } });
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private question' } });
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'get_voice_participants', tool_call_id: 'interrupted', parameters: {},
+    } });
+    h.socket.message({ type: 'ping', ping_event: { event_id: 7 } });
+    expect(h.socket.sent.at(-1)).toEqual({ type: 'pong', event_id: 7 });
+    h.socket.message({ type: 'interruption', interruption_event: { event_id: 8 } });
+    expect(h.callbacks.onInterruption).toHaveBeenCalledOnce();
+    expect(h.callbacks.onToolActivity).toHaveBeenLastCalledWith(0);
+    release?.();
+    await vi.waitFor(() => expect(h.callbacks.onUserTranscript).toHaveBeenCalledOnce());
+    expect(tools).not.toHaveBeenCalled();
+    expect(h.socket.sent).toHaveLength(2);
   });
 
   it('fails closed on malformed output and backpressure', async () => {

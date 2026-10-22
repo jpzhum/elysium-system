@@ -40,7 +40,17 @@ export interface ConnectAgentOptions {
   /** Requires Security > First message override permission; never retried without suppression. */
   suppressFirstMessage?: boolean;
   /** Identity and authorization must come from the caller's trusted closure. */
-  tools?: (name: string, parameters: unknown) => Promise<unknown>;
+  tools?: (name: string, parameters: unknown, signal: AbortSignal) => Promise<unknown>;
+  /** Fixed tool/stage classifications only: parameters, IDs and results never enter diagnostics. */
+  onToolEvent?(event: AgentToolDiagnostic): void;
+}
+
+export interface AgentToolDiagnostic {
+  stage: 'received' | 'started' | 'completed' | 'failed';
+  tool: 'search_game_info' | 'get_voice_participants' | 'unknown';
+  waitForResponse: boolean;
+  durationMs?: number;
+  code?: 'TOOL_UNAVAILABLE' | 'TOOL_FAILED' | 'TOOL_TIMEOUT' | 'TOOL_CANCELLED';
 }
 
 export class AgentError extends Error {
@@ -288,7 +298,8 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       type Delivery = { kind: 'audio'; pcm: Buffer; eventId: number; info?: { responseId?: string } }
         | { kind: 'complete'; eventId: number }
         | { kind: 'text'; identity: AgentResponseIdentity }
-        | { kind: 'user_transcript'; identity: AgentResponseIdentity };
+        | { kind: 'user_transcript'; identity: AgentResponseIdentity }
+        | { kind: 'tool'; start(): void; cancel(): void };
       const deliveries: Delivery[] = [];
       const notify = (callback: () => void): void => { try { callback(); } catch { /* Do not expose callback data. */ } };
       const cleanup = (removeAbort: boolean): void => {
@@ -321,7 +332,10 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         // Local cancellation/revocation always discards every delivery instead.
         const recognition = preserveRecognition
           ? deliveries.filter(item => item.kind === 'user_transcript') : [];
-        for (const item of deliveries) if (item.kind === 'audio') item.pcm.fill(0);
+        for (const item of deliveries) {
+          if (item.kind === 'audio') item.pcm.fill(0);
+          else if (item.kind === 'tool') item.cancel();
+        }
         // In-flight PCM remains borrowed until the callback settles; cancellation
         // also revokes playback, whose pending write then rejects promptly.
         deliveries.length = 0;
@@ -380,6 +394,12 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
             }
             if (item.kind === 'text') {
               options.callbacks.onTextResponse?.(item.identity);
+              continue;
+            }
+            if (item.kind === 'tool') {
+              // A client tool must observe earlier ASR markers, but its network
+              // request must never hold subsequent audio or protocol progress.
+              item.start();
               continue;
             }
             if (item.kind === 'complete') {
@@ -471,50 +491,82 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         },
         close: closeOptions => end(undefined, closeOptions?.drainAudio),
       };
-      const runTool = async (call: Record<string, unknown>): Promise<void> => {
+      const queueTool = (call: Record<string, unknown>): void => {
         const name = boundedString(call.tool_name, 100);
         const id = boundedString(call.tool_call_id, 200);
+        const started = Date.now();
+        if (call.expects_response !== undefined && typeof call.expects_response !== 'boolean') {
+          throw new AgentError('invalid_agent_event');
+        }
+        const encodedParameters = JSON.stringify(call.parameters ?? {});
+        if (Buffer.byteLength(encodedParameters) > 4096) throw new AgentError('tool_parameters_too_large');
+        // Retain only this bounded canonical payload, not unrelated fields from
+        // a potentially 384 KiB provider event. At most 128 calls per session.
+        let parameters: unknown = JSON.parse(encodedParameters) as unknown;
+        const tool: AgentToolDiagnostic['tool'] = name === 'search_game_info' || name === 'get_voice_participants'
+          ? name : 'unknown';
+        const waitForResponse = call.expects_response !== false;
+        const diagnostic = (stage: AgentToolDiagnostic['stage'], code?: AgentToolDiagnostic['code']): void => {
+          notify(() => options.onToolEvent?.({ stage, tool, waitForResponse,
+            ...(stage === 'completed' || stage === 'failed' ? { durationMs: Math.max(0, Date.now() - started) } : {}),
+            ...(code ? { code } : {}) }));
+        };
+        diagnostic('received');
+        if (closed) return;
         if (toolIds.has(id)) return;
+        if (toolIds.size >= 128) throw new AgentError('agent_tool_limit');
         toolIds.add(id);
         updateToolActivity(id, true);
         if (closed) return;
-        let result = 'Ferramenta indisponível nesta sessão.';
-        let isError = true;
-        if (toolsActive < 2 && toolsUsed < 64 && options.tools && negotiated) {
+        const toolAbort = new AbortController();
+        let settled = false;
+        let active = false;
+        const failureResult = 'A ferramenta não concluiu a consulta. Não há resultado verificado.';
+        const finish = (result: string, code?: AgentToolDiagnostic['code'], reply = true): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          cancelTools.delete(cancel);
+          parameters = undefined;
+          toolAbort.abort();
+          if (active) { toolsActive--; active = false; }
+          diagnostic(code ? 'failed' : 'completed', code);
+          if (closed) return;
+          if (reply && waitForResponse) {
+            try { send({ type: 'client_tool_result', tool_call_id: id, result, is_error: Boolean(code) }); }
+            catch { end('agent_tool_error'); }
+          }
+          if (!closed) updateToolActivity(id, false);
+        };
+        const cancel = (): void => finish(failureResult, 'TOOL_CANCELLED', false);
+        const timer = setTimeout(() => finish(failureResult, 'TOOL_TIMEOUT'), 8000);
+        timer.unref();
+        cancelTools.add(cancel);
+        enqueue({ kind: 'tool', cancel, start: () => {
+          if (settled || closed) return;
+          if (Date.now() - started >= 8000) { finish(failureResult, 'TOOL_TIMEOUT'); return; }
+          if (toolsActive >= 2 || toolsUsed >= 64 || !options.tools || !negotiated) {
+            finish('Ferramenta indisponível nesta sessão.', 'TOOL_UNAVAILABLE'); return;
+          }
           toolsActive++;
           toolsUsed++;
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          let cancel: (() => void) | undefined;
+          active = true;
+          diagnostic('started');
+          if (settled || closed) return;
           try {
-            if (Buffer.byteLength(JSON.stringify(call.parameters ?? {})) > 4096) throw new AgentError('tool_parameters_too_large');
-            const aborted = new Promise<never>((_resolve, rejectTool) => {
-              cancel = () => rejectTool(new AgentError('agent_closed'));
-              cancelTools.add(cancel);
-              timer = setTimeout(() => rejectTool(new AgentError('tool_timeout')), 8000);
-              timer.unref();
-            });
-            // A synchronous callback may revoke consent and then throw. Attach the
-            // cancellation rejection to the race even in that reentrant case.
-            let operation: Promise<unknown>;
-            try { operation = options.tools(name, call.parameters ?? {}); }
-            catch { operation = Promise.reject(new AgentError('tool_failed')); }
-            const value = await Promise.race([operation, aborted]);
-            result = typeof value === 'string' ? value : JSON.stringify(value) ?? 'Sem resultado.';
-            if (Buffer.byteLength(result) > 16 * 1024) throw new AgentError('tool_result_too_large');
-            isError = false;
-          } catch {
-            result = 'A ferramenta não concluiu a consulta. Não há resultado verificado.';
-          } finally {
-            clearTimeout(timer);
-            if (cancel) cancelTools.delete(cancel);
-            toolsActive--;
-          }
-        }
-        if (toolIds.size > 128) { end('agent_tool_limit'); return; }
-        if (!closed && call.expects_response !== false) {
-          send({ type: 'client_tool_result', tool_call_id: id, result, is_error: isError });
-        }
-        if (!closed) updateToolActivity(id, false);
+            // Invocation stays synchronous with the ordered marker. Completion is
+            // detached so pending tools cannot deadlock the audio delivery pump.
+            const operation = options.tools(name, parameters, toolAbort.signal);
+            void Promise.resolve(operation).then(value => {
+              if (settled) return;
+              try {
+                const result = typeof value === 'string' ? value : JSON.stringify(value) ?? 'Sem resultado.';
+                if (Buffer.byteLength(result) > 16 * 1024) throw new AgentError('tool_result_too_large');
+                finish(result);
+              } catch { finish(failureResult, 'TOOL_FAILED'); }
+            }, () => finish(failureResult, 'TOOL_FAILED'));
+          } catch { finish(failureResult, 'TOOL_FAILED'); }
+        } });
       };
       ws.on('open', () => {
         if (closed) return;
@@ -568,6 +620,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
                 const interruption = record(event.interruption_event);
                 if (interruption.event_id !== undefined) lastInterruptId = Math.max(lastInterruptId, integer(interruption.event_id));
               }
+              for (const cancel of cancelTools) cancel();
               discardDeliveries(true);
               dispatch(() => options.callbacks.onInterruption());
               pump();
@@ -582,7 +635,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
             }
             case 'client_tool_call':
               if (!negotiated) throw new AgentError('invalid_agent_event');
-              void runTool(record(event.client_tool_call)).catch(() => end('agent_tool_error'));
+              queueTool(record(event.client_tool_call));
               break;
             case 'agent_tool_request': {
               if (!negotiated) throw new AgentError('invalid_agent_event');

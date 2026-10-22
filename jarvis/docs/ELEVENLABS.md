@@ -2,7 +2,7 @@
 
 Este roteiro prepara o agente para o worker em `jarvis/`. A configuração da conta
 e o teste em chamada real continuam necessários. Os testes locais de protocolo não
-comprovam o Gate C. Documentação oficial conferida em 21/10/2026; os nomes de menus
+comprovam o Gate C. Documentação oficial conferida em 22/10/2026; os nomes de menus
 podem mudar.
 
 ## 1. Agente, idioma e voz
@@ -62,6 +62,8 @@ Confira especialmente:
   "interruption",
   "agent_response_complete",
   "client_tool_call",
+  "agent_tool_request",
+  "agent_tool_response",
   "client_error"
 ]
 ```
@@ -150,15 +152,64 @@ completo para criação de tool na API. Não adicione `user_id`, `isOwner`, toke
 URL de destino ou comando administrativo. O nome e os parâmetros são sensíveis
 a maiúsculas. [Client tools](https://elevenlabs.io/docs/eleven-agents/customization/tools/client-tools).
 
-Configure uma chave de [Brave Search](https://api-dashboard.search.brave.com/app/documentation/web-search/get-started)
-em `JARVIS_SEARCH_API_KEY` no ambiente privado. O backend usa o endpoint fixo de
-Web Search e devolve `{game, query, answer, sources, checked_at, uncertainty}`.
-`answer` contém trechos atribuídos aos resultados; as páginas não são abertas
-nem verificadas e podem estar incorretas ou antigas. Sem chave, a tool retorna
-limitação explícita e não faz requisição. A chave não é enviada ao ElevenLabs.
+Na API atual, inspecione a tool referenciada em
+`conversation_config.agent.prompt.tool_ids` usando `GET /v1/convai/tools/{tool_id}`.
+O resultado precisa conter `tool_config.type: "client"`,
+`tool_config.name: "search_game_info"`, `tool_config.expects_response: true` e
+`tool_config.parameters` compatível com o schema dos argumentos. Habilitar o evento
+`client_tool_call` é necessário, mas não cadastra nem associa a tool ao agente.
+A resposta usa `client_tool_result`, o mesmo `tool_call_id`, `result` serializado
+e `is_error`; o worker não substitui a configuração publicada por um override.
+Configure timeout da tool de pelo menos 8 segundos para acomodar a consulta
+limitada a 6 segundos. Veja [configuração de tool na API](https://elevenlabs.io/docs/eleven-agents/api-reference/tools/create).
 
-Não cadastre n8n ou outras tools sem integração real. O backend aceita somente
-pesquisa de jogos e aplica a identidade do falante mantida na sessão.
+Configure uma chave de [Brave Search](https://api-dashboard.search.brave.com/app/documentation/web-search/get-started)
+em **Render → worker Jarvis → Environment → `JARVIS_SEARCH_API_KEY`** e faça novo
+deploy do worker. Não configure essa chave no prompt, na tool publicada nem no
+serviço Elysium. O backend usa exclusivamente
+`https://api.search.brave.com/res/v1/web/search`, com `X-Subscription-Token` no
+header, até cinco resultados e redirects desabilitados. A chave não vai ao
+ElevenLabs. Não é preciso instalar outro serviço ou cadastrar um webhook.
+
+A tool devolve `{status, game, query, answer, sources, checked_at, uncertainty}`.
+`status: "success"` significa que vieram fontes utilizáveis da API, e não que os
+fatos foram confirmados. `answer` contém trechos atribuídos aos resultados; as
+páginas não são abertas nem verificadas e podem estar incorretas ou antigas.
+As URLs retornadas perdem query e fragmento para não encaminhar tokens de links
+assinados; isso pode remover parâmetros necessários para uma página específica.
+O resultado UTF-8 completo fica abaixo de 14 KiB, dentro do limite do transporte.
+
+Sem chave, retorna `status: "missing_key"`, fontes vazias e limitação explícita,
+sem fazer requisição ou inventar pesquisa. Outros estados fixos são
+`invalid_input`, `cancelled`, `rate_limited`, `unavailable`, `timeout`,
+`invalid_reply` e `no_sources`. O agente deve informar essa limitação sem tratar
+um resultado indisponível como evidência. Nenhuma mensagem bruta do provedor é
+retornada.
+
+Há uma instância de pesquisa por worker: uma consulta em andamento e um início
+por segundo; não existe fila oculta de perguntas de pesquisa. HTTP 429 e os
+headers Brave `X-RateLimit-Remaining`/`X-RateLimit-Reset` aplicam cooldown local de
+até 120 segundos. Uma nova tentativa depende de uma consulta posterior; não há
+retry automático que prolongue o turno. O limite local não amplia a cota do plano.
+Consulte [limites Brave](https://api-dashboard.search.brave.com/documentation/guides/rate-limiting)
+e [Web Search](https://api-dashboard.search.brave.com/app/documentation/web-search/query).
+
+Os diagnósticos sanitizados distinguem recebimento, início e término da client
+tool; expõem somente nome conhecido da tool, estado fixo, tempo e número de fontes.
+Não incluem argumentos, pergunta, resultado, ID de chamada ou credenciais.
+Os marcadores de tool respeitam a ordem de áudio e reconhecimento final anteriores;
+a consulta em andamento não bloqueia os próximos blocos de áudio. O limite de
+8 segundos começa quando `client_tool_call` chega, incluindo espera atrás de
+backpressure. Uma tool vencida na fila não executa a consulta. Revogação,
+interrupção, fechamento da sessão e timeout abortam a consulta e bloqueiam resultados
+tardios. Não cadastre n8n ou outras tools sem integração real. O backend aplica
+a identidade do falante mantida na sessão para autorizar cada chamada.
+
+Para validar, pergunte por um fato atual de jogo e confirme uma execução
+`search_game_info`, estado `success`, pelo menos uma fonte e resposta audível com
+atribuição. Repita sem chave e confirme limitação explícita, sem novas fontes.
+Testes com HTTP simulado comprovam o protocolo e o tratamento de falhas; uma
+pesquisa real com a chave do Render e fontes válidas continua sendo gate manual.
 
 ## 6. Privacidade e limites
 
@@ -183,7 +234,8 @@ backpressure. A fila de entrada de PCM tem 384 KiB e até 1.024 eventos; a conex
 pausa em 256 KiB e retoma em 128 KiB. Há até três tentativas de assinatura
 somente em 429/5xx, com espera limitada e jitter. Erros de autenticação e crédito
 não são repetidos. Tools: duas concorrentes, até 64 execuções por sessão, timeout
-de 8 s e resultado até 16 KiB. A busca limita a resposta HTTP a 256 KiB e 6 s.
+de 8 s e resultado até 16 KiB. A busca limita a resposta HTTP a 256 KiB e 6 s,
+e seu resultado serializado a 14 KiB; o limite e cooldown do worker estão na seção 5.
 Fechar a sessão descarta resultados pendentes; chamadas externas das tools recebem
 o AbortSignal da sessão pela closure autenticada do backend.
 

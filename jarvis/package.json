@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node --enable-source-maps dist/index.js",
     "smoke:dave": "node --enable-source-maps dist/index.js --dave-smoke",
+    "audit:agent": "node --enable-source-maps dist/audit-agent.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src tests",
     "test": "vitest run"

@@ -12,6 +12,10 @@ Para cinco perguntas consecutivas, voz consentida e barge-in, siga o
 [roteiro V4](docs/V4_CONVERSATION_VALIDATION.md).
 Para repetição de saudação por microfone, configure First message/overrides e
 execute o [roteiro de reconhecimento da pergunta](docs/VOICE_GREETING_VALIDATION.md).
+Para identidade por turno, participantes atuais, pesquisa Brave e duplicações de
+captura, siga o [deploy e gate real V5](docs/V5_DEPLOY_VALIDATION.md). Essa revisão
+adiciona `/status` com etapas completas e `npm run audit:agent` para conferir o
+contrato publicado sem imprimir dados privados; aceitação em call permanece pendente.
 
 ## Começar localmente
 

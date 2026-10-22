@@ -30,6 +30,7 @@ export function privacyNotice(voiceMode: string, smoke = false, followupSeconds 
       : 'A captura de voz está desativada nesta configuração. Use /jarvis consent e /jarvis ask. ')
     + 'O worker não salva áudio ou transcrições; a retenção no provedor depende das configurações da conta. '
     + 'A resposta é audível para quem está na chamada. /jarvis cancel cancela suas perguntas e resposta; '
+    + 'Uma ferramenta pode informar ao agente nomes de exibição e presença na sala, sem autorizar captura de áudio de outras pessoas. '
     + '/jarvis revoke para captura/sessão/reprodução imediatamente. '
     + 'O consentimento vale só nesta chamada e é apagado ao sair, desconectar ou reiniciar.';
 }

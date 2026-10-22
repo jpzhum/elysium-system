@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { searchGameInfo } from '../src/tools/game-search.js';
+import { createGameSearch, searchGameInfo } from '../src/tools/game-search.js';
 
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('game search', () => {
   it('admits missing credentials without making any request', async () => {
     const request = vi.fn();
     vi.stubGlobal('fetch', request);
     const result = await searchGameInfo('Arc Raiders', 'onde fica a missão?');
+    expect(result.status).toBe('missing_key');
     expect(result.sources).toEqual([]);
     expect(result.uncertainty).toContain('não configurada');
     expect(request).not.toHaveBeenCalled();
@@ -21,6 +22,7 @@ describe('game search', () => {
     ] } })));
     vi.stubGlobal('fetch', request);
     const result = await searchGameInfo('Arc Raiders', 'missão da sala', 'key-secret');
+    expect(result.status).toBe('success');
     const endpoint = new URL(String(request.mock.calls[0]?.[0]));
     expect(endpoint.origin + endpoint.pathname).toBe('https://api.search.brave.com/res/v1/web/search');
     expect(endpoint.searchParams.get('q')).toBe('Arc Raiders missão da sala');
@@ -85,5 +87,113 @@ describe('game search', () => {
     expect(result.sources).toEqual([]);
     expect(result.uncertainty).toContain('limite');
     expect(JSON.stringify(result)).not.toContain('secret');
+  });
+
+  it('strips signed queries and fragments, rejects URL credentials and redacts reflected credentials', async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ web: { results: [
+      { title: 'Page', url: 'https://example.com/game?token=private-token#credential', description: 'Read key-secret.' },
+      { title: 'Dup', url: 'https://example.com/game?signature=other', description: 'Read duplicate.' },
+      { title: 'Userinfo', url: 'https://user:password@example.com/x', description: 'Read.' },
+      { title: 'Reflected key', url: 'https://example.com/key-secret', description: 'Read.' },
+    ] } })));
+    vi.stubGlobal('fetch', request);
+    const result = await searchGameInfo('Game', 'quest', 'key-secret');
+    expect(result.status).toBe('success');
+    expect(result.sources).toEqual([{ title: 'Page', url: 'https://example.com/game', snippet: 'Read [redacted].' }]);
+    expect(JSON.stringify(result)).not.toMatch(/private-token|credential|password|key-secret/);
+    expect(request).toHaveBeenCalledOnce(); // Source pages are never opened.
+  });
+
+  it('bounds worker concurrency and start rate without retaining queued queries', async () => {
+    vi.useFakeTimers();
+    let resolve: ((response: Response) => void) | undefined;
+    const request = vi.fn<typeof fetch>().mockImplementation(() => new Promise<Response>(done => { resolve = done; }));
+    vi.stubGlobal('fetch', request);
+    const diagnostics = vi.fn();
+    const search = createGameSearch({ apiKey: 'key-secret', onDiagnostic: diagnostics });
+    const first = search('Game', 'private-query');
+    expect((await search('Other game', 'other private query')).status).toBe('rate_limited');
+    await vi.advanceTimersByTimeAsync(1100);
+    expect((await search('Other game', 'still busy')).status).toBe('rate_limited');
+    resolve?.(new Response(JSON.stringify({ web: { results: [
+      { title: 'Guide', url: 'https://example.com/a', description: 'Evidence.' },
+    ] } })));
+    expect((await first).status).toBe('success');
+    request.mockResolvedValue(new Response('{}'));
+    expect((await search('Game', 'next')).status).toBe('no_sources');
+    expect((await search('Game', 'too soon')).status).toBe('rate_limited');
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(diagnostics.mock.calls[2]?.[0]).toEqual({ status: 'success', durationMs: 1100, sourceCount: 1 });
+    expect(JSON.stringify(diagnostics.mock.calls)).not.toMatch(/key-secret|private-query|example.com|Evidence/);
+  });
+
+  it('honors Brave quota windows and bounded 429 cooldown without automatic retries', async () => {
+    vi.useFakeTimers();
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response('private upstream body', {
+      status: 429, headers: { 'x-ratelimit-remaining': '0, 0', 'x-ratelimit-reset': '1, 99999999', 'retry-after': '10' },
+    }));
+    vi.stubGlobal('fetch', request);
+    const search = createGameSearch({ apiKey: 'secret' });
+    expect((await search('Game', 'quest')).status).toBe('rate_limited');
+    await vi.advanceTimersByTimeAsync(119_999);
+    expect((await search('Game', 'quest')).status).toBe('rate_limited');
+    expect(request).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    request.mockResolvedValue(new Response('{}'));
+    expect((await search('Game', 'quest')).status).toBe('no_sources');
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not spend a worker slot on cancellation, invalid input or missing credentials', async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}'));
+    vi.stubGlobal('fetch', request);
+    const abort = new AbortController();
+    abort.abort();
+    const search = createGameSearch({ apiKey: 'secret' });
+    expect((await search('Game', 'quest', abort.signal)).status).toBe('cancelled');
+    expect((await search('', 'quest')).status).toBe('invalid_input');
+    expect((await createGameSearch({})('Game', 'quest')).status).toBe('missing_key');
+    expect((await search('Game', 'quest')).status).toBe('no_sources');
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it('classifies invalid replies and network exceptions without provider text', async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response('not json key-secret'));
+    vi.stubGlobal('fetch', request);
+    expect((await searchGameInfo('Game', 'quest', 'key-secret')).status).toBe('invalid_reply');
+    request.mockRejectedValue(new Error('key-secret private network details'));
+    const result = await searchGameInfo('Game', 'quest', 'key-secret');
+    expect(result.status).toBe('unavailable');
+    expect(JSON.stringify(result)).not.toContain('key-secret');
+  });
+
+  it('bounds the serialized UTF-8 result below the client-tool transport budget', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ web: { results:
+      Array.from({ length: 5 }, (_value, index) => ({ title: '漢'.repeat(160),
+        url: `https://example.com/${index}/${'a'.repeat(1900)}`, description: '漢'.repeat(600) })),
+    } }))));
+    const result = await searchGameInfo('Game', 'quest', 'key-secret');
+    expect(result.status).toBe('success');
+    expect(result.sources.length).toBeGreaterThan(0);
+    expect(result.sources.length).toBeLessThan(5);
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(14 * 1024);
+  });
+
+  it('classifies a timed out body and releases the worker slot for a later request', async () => {
+    const timeout = new AbortController();
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal);
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(new ReadableStream<Uint8Array>()));
+    vi.stubGlobal('fetch', request);
+    const search = createGameSearch({ apiKey: 'secret' });
+    const pending = search('Game', 'quest');
+    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+    timeout.abort();
+    expect((await pending).status).toBe('timeout');
+    vi.useFakeTimers();
+    await vi.advanceTimersByTimeAsync(1000);
+    const fresh = new AbortController();
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(fresh.signal);
+    request.mockResolvedValue(new Response('{}'));
+    expect((await search('Game', 'next')).status).toBe('no_sources');
   });
 });

@@ -1,6 +1,8 @@
 import { EndBehaviorType, VoiceConnectionStatus, type AudioReceiveStream, type VoiceConnection } from "@discordjs/voice";
+import { randomUUID } from 'node:crypto';
 import { OpusDecoder } from "../audio/opus-decoder.js";
 import { rms } from "../audio/voice-activity.js";
+import type { CaptureTiming } from '../audio/capture-window.js';
 
 export interface VoiceReceiverOptions {
   ownUserId: string;
@@ -15,7 +17,7 @@ export interface VoiceReceiverOptions {
   onMetric?: (name: string, value: number) => void;
 }
 
-export interface VoiceTurnTiming {
+export interface VoiceTurnTiming extends CaptureTiming {
   readonly duringPlayback: boolean;
   readonly captureMs: number;
   readonly endDetectionMs: number;
@@ -35,6 +37,7 @@ interface IncomingTurn {
   lastVoicedAt: number;
   maxBytes: number;
   playbackToken?: number;
+  captureId: string;
 }
 
 const BYTES_PER_SECOND = 48_000 * 2 * 2;
@@ -48,6 +51,8 @@ export class VoiceReceiver {
   private readonly turns = new Map<string, IncomingTurn>();
   private started = false;
   private nextBargeInAt = 0;
+  private readonly captureEpoch = randomUUID();
+  private captureSequence = 0;
   private readonly maxBytes: number;
   private readonly onStart = (userId: string): void => this.subscribe(userId);
   private readonly onConnectionState = (_before: unknown, next: { status: string }): void => {
@@ -95,7 +100,11 @@ export class VoiceReceiver {
   }
 
   private subscribe(userId: string): void {
-    if (!this.allowed(userId) || this.turns.has(userId) || this.turns.size >= 16) return;
+    if (!this.allowed(userId)) return;
+    // Discord speaking-start is an activity notification, not a new question.
+    // Repeated starts and microphone microgaps stay in the same 600 ms VAD window.
+    if (this.turns.has(userId)) { this.metric('voice_capture_start_debounced'); return; }
+    if (this.turns.size >= 16) { this.metric('voice_capture_limit_rejected'); return; }
     const duringPlayback = this.options.isPlaying();
     const playbackToken = duringPlayback ? this.options.playbackToken?.() : undefined;
     if (duringPlayback && Date.now() < this.nextBargeInAt) {
@@ -124,6 +133,7 @@ export class VoiceReceiver {
       const now = performance.now();
       state = { stream, decoder, chunks: [], bytes: 0, voiced: false, silentBytes: 0, timeout,
         duringPlayback, playbackToken, startedAt: now, lastVoicedAt: now,
+        captureId: `${this.captureEpoch}:${++this.captureSequence}`,
         maxBytes: Math.min(this.maxBytes, maxSeconds * BYTES_PER_SECOND) };
       if (duringPlayback) this.metric('voice_barge_in_captures');
       const incoming = state;
@@ -195,6 +205,7 @@ export class VoiceReceiver {
       const timing: VoiceTurnTiming = { duringPlayback: state.duringPlayback,
         captureMs: Math.max(0, Math.round(now - state.startedAt)),
         endDetectionMs: Math.max(0, Math.round(now - state.lastVoicedAt)),
+        captureId: state.captureId, captureStartedAtMs: state.startedAt, captureEndedAtMs: now,
         ...(state.playbackToken !== undefined ? { playbackToken: state.playbackToken } : {}) };
       this.metric("voice_turn_seconds", result.length / BYTES_PER_SECOND);
       this.metric('voice_capture_ms', timing.captureMs);

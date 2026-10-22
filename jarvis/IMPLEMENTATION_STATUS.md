@@ -1,4 +1,50 @@
-# Estado da implementação — 21/10/2026
+# Estado da implementação — 22/10/2026
+
+## Revisão V5: identidade, participantes, captura, ferramentas e latência
+
+Entrega técnica local preparada. **A missão V5 permanece pendente de validação
+real** com criador/convidado, perguntas escritas, roster vivo, pesquisa com fontes,
+cinco perguntas sem duplicação e comparação de latência antes/depois.
+Não houve deploy nem audição humana desta revisão. A confirmação do operador
+refere-se à conexão, playback e ativação de voz anteriores.
+
+Texto e voz recebem as quatro variáveis de identidade/contexto, com flags
+sanitizadas por turno e atualização contextual em sessões reutilizadas. A nova
+Client Tool `get_voice_participants` usa cache do canal e origem autenticada do
+turno, sem retornar IDs/perfis nem tratar presença como consentimento de áudio.
+Deduplicação por ID/janela de captura antecede STT e fila; perguntas novas de
+conteúdo idêntico continuam aceitas. Rejeições distinguem fila global, individual
+e memória. Não foi atribuída uma causa única às duplicações de produção.
+
+Corrigida também uma corrida comprovada por teste: `client_tool_call` podia
+ultrapassar ASR pendente atrás de um write assíncrono e receber recusa indevida.
+Tools respeitam a ordem recebida sem bloquear áudio posterior; deadline, abort,
+permissões e limites continuam aplicados. Pesquisa Brave ganha limite por worker,
+fontes e estados de falha explícitos. `/status` mostra contadores e etapas de
+latência completos em páginas; pacing de upload não foi alterado sem baseline.
+
+`npm run audit:agent` consulta somente a configuração remota principal e tools
+referenciadas, emitindo flags sem conteúdo privado. Não publica mudanças nem
+comprova que o modelo segue o prompt. Neste ambiente, sua execução devolveu
+`missing_configuration` e exit 1 esperado: credenciais ElevenLabs/Discord e chave
+Brave não estavam disponíveis. Prompt publicado, contrato remoto e pesquisa real
+precisam ser verificados no Render; nenhuma busca foi simulada como real.
+
+| Verificação V5 local | Resultado |
+| --- | --- |
+| Build, typecheck e lint Node | Passaram |
+| Suíte Node | 28 arquivos; 458 testes passaram e 1 gate real skipped |
+| Suíte Python | 78 testes e 67 subtests passaram |
+| Compileall e imports do AGENTS.md | Passaram, sem conectar ao Discord |
+| `git diff --check` | Passou |
+| Elysium Python / Blueprint / dependências | Sem alterações nesta revisão |
+| Novas variáveis obrigatórias | Nenhuma; Brave usa `JARVIS_SEARCH_API_KEY` opcional já existente |
+| Configuração remota / deploy / matriz real / latência antes-depois | Pendentes no ambiente do operador |
+
+Deploy, variáveis e matriz de aceitação: [V5_DEPLOY_VALIDATION.md](docs/V5_DEPLOY_VALIDATION.md).
+Prompt/tools: [V5_AGENT_PROMPT.md](docs/V5_AGENT_PROMPT.md).
+Captura e avaliação do upload incremental: [VOICE_CAPTURE_LATENCY.md](docs/VOICE_CAPTURE_LATENCY.md).
+Os resultados das revisões abaixo são históricos, sem certificar aceitação V5.
 
 ## Revisão: saudação inicial durante perguntas por voz
 
@@ -132,11 +178,11 @@ pendente.** Especificação: `../JARVIS_ELEVENAGENTS_CODEX_FULL_ACCESS.md`.
 
 | Gate | Evidência e situação |
 | --- | --- |
-| A — instalação/build/lint/tipos/testes V4 | Verificação local em andamento; números anteriores não certificam a nova revisão. |
+| A — build/lint/tipos/testes V5 | Passou localmente: 458 testes Node e gate real skipped; 78 testes Python e 67 subtests. |
 | B — saída Discord/DAVE | Conexão e resposta audível confirmadas pelo operador antes da V4; entrada de humanos, transições e reconexões ainda exigem matriz própria. |
 | C — ElevenAgents real | `/jarvis ask` audível confirmado pelo operador; origem da conclusão ausente permanece sem causa demonstrada. |
-| D — conversação/wake/barge-in V4 | Pendente: cinco perguntas consecutivas, PT-BR, dois participantes, consentimento, eco e cancelamento em chamada. |
-| E — Render V4 | Worker existente informado pelo operador; nenhuma nova implantação desta revisão executada pelo agente. |
+| D — comportamento V5 em chamada | Pendente: duas contas, texto/voz, presença, busca real com fontes, cinco perguntas, revogação e latência comparada. |
+| E — Render V5 | Worker existente informado pelo operador; nenhuma implantação desta revisão executada pelo agente. |
 
 ## Gates na entrega inicial
 
@@ -217,10 +263,11 @@ e encerrar o processo anterior evita disputa durante implantação.
 
 ## Próximo ciclo operacional
 
-1. Enviar o commit V4 revisado à branch do worker existente e fazer deploy manual,
+1. Enviar o commit V5 revisado à branch do worker existente e fazer deploy manual,
    preservando uma instância e o Elysium Python. Conferir o SHA implantado.
-2. Executar o [gate V4](docs/V4_CONVERSATION_VALIDATION.md): cinco perguntas
-   consecutivas, fila, dois participantes, voz consentida, revogação e barge-in opcional.
+2. Auditar o agente publicado e executar o [gate V5](docs/V5_DEPLOY_VALIDATION.md):
+   duas contas por texto/voz, presença atual, pesquisa com fontes, cinco perguntas,
+   fila, revogação e latência antes/depois. Manter a matriz V4 de barge-in opcional.
 3. Executar matriz [DAVE](docs/DAVE.md): humanos antes/depois, RMS por usuário,
    `/jarvis tone`, transições MLS e reconexões; registrar versões/repetições reais.
 4. Conferir o agente pelo [guia ElevenLabs](docs/ELEVENLABS.md), testar `/ask`,

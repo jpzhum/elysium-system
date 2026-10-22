@@ -16,4 +16,6 @@ test('consent disclosure distinguishes local probe, text and external pre-wake a
   expect(privacyNotice('elevenlabs-stt', false, 18, true)).toContain('somente o proprietário');
   expect(privacyNotice('elevenlabs-stt', false, 18, true)).toContain('Use fones');
   expect(privacyNotice('elevenlabs-stt')).not.toContain('Durante respostas');
+  expect(privacyNotice('elevenlabs-stt')).toContain('nomes de exibição e presença');
+  expect(privacyNotice('elevenlabs-stt', false, 30, true).length).toBeLessThanOrEqual(2000);
 });
