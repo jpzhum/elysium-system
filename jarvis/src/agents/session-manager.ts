@@ -8,7 +8,8 @@ import { Logger, newIncident, type ErrorCode } from '../observability/metrics.js
 export interface Playback {
   readonly isPlaying: boolean;
   startStream(userId: string, sampleRate: number, owner: boolean,
-    options?: { isAllowed?: () => boolean }): PlaybackStream;
+    options?: { isAllowed?: () => boolean;
+      onProgress?: (event: 'first_packet' | 'drained' | 'resumed', elapsedMs: number) => void }): PlaybackStream;
   stopUser(userId: string): void;
   stop(): void;
 }
@@ -27,6 +28,28 @@ export interface SessionOptions {
   logger?: Logger;
   /** Production uses 20 ms pacing; injection permits cancellation tests without real waits. */
   pace?: (signal: AbortSignal) => Promise<void>;
+  maxQueuedTurns?: number;
+  maxQueuedPerUser?: number;
+  queueTtlSeconds?: number;
+  notify?: (speaker: SpeakerContext, event: TurnNotification) => void | Promise<void>;
+}
+export interface TurnReceipt { queued: boolean; position: number; turnId: string; }
+export interface TurnNotification {
+  type: 'queued' | 'started' | 'cancelled' | 'failed';
+  turnId: string;
+  position?: number;
+  reason?: 'expired' | 'revoked' | 'interrupted' | 'closed' | 'provider' | 'limit';
+}
+interface TurnRequest {
+  id: string;
+  speaker: SpeakerContext;
+  receivedAt: number;
+  dispatchAt?: number;
+  text?: string;
+  pcm?: Buffer;
+  timer?: ReturnType<typeof setTimeout>;
+  cancelled: boolean;
+  notify?: (event: TurnNotification) => void | Promise<void>;
 }
 interface Entry {
   speaker: SpeakerContext;
@@ -39,6 +62,7 @@ interface Entry {
   ingressEnded: boolean;
   playbackDone: boolean;
   recovering: boolean;
+  superseded: boolean;
   pendingTools: number;
   acceptingAudio: boolean;
   responseIds: Set<string>;
@@ -57,6 +81,13 @@ interface Entry {
   lifetime?: ReturnType<typeof setTimeout>;
   deadline?: ReturnType<typeof setTimeout>;
   upload?: AbortController;
+  request?: TurnRequest;
+  localDrained: boolean;
+  firstAudioAt?: number;
+  firstPlaybackAt?: number;
+  lastAudioAt?: number;
+  drainedAt?: number;
+  turnReleased: boolean;
 }
 export class SessionError extends Error {
   constructor(readonly code: 'consent' | 'busy' | 'limit' | 'closed') { super(code); }
@@ -66,90 +97,222 @@ export class SessionError extends Error {
 export class SessionManager {
   private readonly entries = new Map<string, Entry>();
   private readonly checking = new Map<string, AbortController>();
+  private readonly queue: TurnRequest[] = [];
+  private readonly followups = new Map<string, { consentVersion: number; channelId: string; until: number }>();
+  private active?: TurnRequest;
+  private readonly maxQueuedTurns: number;
+  private readonly maxQueuedPerUser: number;
+  private readonly queueTtlSeconds: number;
   private closed = false;
+  private available = true;
   private budgetStart = Date.now();
   private turns = 0;
-  constructor(private readonly options: SessionOptions) {}
+  constructor(private readonly options: SessionOptions) {
+    const bounded = (value: number | undefined, fallback: number, maximum: number): number =>
+      value === undefined || !Number.isFinite(value) ? fallback : Math.max(1, Math.min(maximum, Math.floor(value)));
+    this.maxQueuedTurns = bounded(options.maxQueuedTurns, 8, 16);
+    this.maxQueuedPerUser = bounded(options.maxQueuedPerUser, 2, 4);
+    this.queueTtlSeconds = bounded(options.queueTtlSeconds, 60, 120);
+  }
   get activeCount(): number { return this.entries.size; }
+  get queuedCount(): number { return this.queue.length; }
+  get queueStatus(): { waiting: number; active: boolean } { return { waiting: this.queue.length, active: !!this.active }; }
 
-  async ask(speaker: SpeakerContext, text: string): Promise<void> {
+  async ask(speaker: SpeakerContext, text: string,
+    notify?: (event: TurnNotification) => void | Promise<void>): Promise<TurnReceipt> {
     if (!text.trim() || text.length > 1800) throw new SessionError('limit');
     this.assertAllowed(speaker);
-    this.claimTurn();
-    const entry = await this.ensure(speaker);
-    this.begin(entry);
-    try { entry.session!.sendText(text); }
-    catch (error) {
-      this.providerError(entry, error instanceof AgentError ? error.code : 'agent_send_failed');
-      throw new SessionError('closed');
-    }
+    return this.enqueue({ id: newIncident(), speaker, text, notify, receivedAt: performance.now(), cancelled: false });
   }
 
-  async voiceTurn(speaker: SpeakerContext, pcm: Buffer): Promise<void> {
+  async voiceTurn(speaker: SpeakerContext, pcm: Buffer): Promise<TurnReceipt | undefined> {
     this.assertAllowed(speaker, true);
-    if (this.options.playback.isPlaying || this.checking.has(speaker.discordUserId)) return;
-    if (pcm.length > this.options.maxTurnSeconds * 48_000 * 4) throw new SessionError('limit');
+    if (this.checking.has(speaker.discordUserId)) throw new SessionError('busy');
+    if (!pcm.length || pcm.length % 4 || pcm.length > Math.min(this.options.maxTurnSeconds, 30) * 48_000 * 4
+      || this.checking.size >= this.options.maxSessions) throw new SessionError('limit');
     const existing = this.entries.get(speaker.discordUserId);
-    if (existing?.waiting || existing?.playing) return;
     const abort = new AbortController();
+    let owned: Buffer | undefined = Buffer.from(pcm);
     this.checking.set(speaker.discordUserId, abort);
     try {
-      const followup = existing && existing.speaker.consentVersion === speaker.consentVersion
-        && existing.followupUntil > Date.now();
-      if (!followup && !await this.options.detectWake(pcm, abort.signal)) return;
-      if (abort.signal.aborted || this.options.playback.isPlaying) return;
-      this.assertAllowed(speaker, true);
-      this.claimTurn();
-      const entry = await this.ensure(speaker);
-      this.begin(entry);
-      entry.upload = abort;
-      const rate = entry.session!.inputSampleRate;
-      const mono = convertPcm(pcm, 48_000, 2, rate, 1);
-      // Real-time pacing and a silence tail let ElevenAgents VAD delimit the turn.
-      const frameBytes = Math.round(rate / 50) * 2;
-      const tail = Buffer.alloc(Math.round(rate * 0.8) * 2);
-      for (const segment of [mono, tail]) {
-        for (let offset = 0; offset < segment.length; offset += frameBytes) {
-          if (!this.usable(entry) || !this.options.allowed(speaker, true) || abort.signal.aborted) return;
-          entry.session!.sendAudio(segment.subarray(offset, offset + frameBytes));
-          await (this.options.pace?.(abort.signal) ?? delay(20, undefined, { signal: abort.signal }));
-        }
+      const prior = this.followups.get(speaker.discordUserId);
+      const followup = (existing && existing.speaker.consentVersion === speaker.consentVersion
+        && existing.followupUntil > Date.now()) || (prior && prior.consentVersion === speaker.consentVersion
+          && prior.channelId === speaker.channelId && prior.until > Date.now());
+      const wakeStart = performance.now();
+      if (!followup) {
+        const activated = await this.options.detectWake(owned, abort.signal);
+        this.options.metric?.('wake_detection_ms', Math.round(performance.now() - wakeStart));
+        this.options.metric?.(activated ? 'wake_activations' : 'wake_rejections');
+        if (!activated) return;
       }
-    } catch (error) {
       if (abort.signal.aborted) return;
-      const entry = this.entries.get(speaker.discordUserId);
-      if (entry?.upload === abort) this.providerError(entry, error instanceof AgentError ? error.code : 'agent_send_failed');
-      throw error;
+      this.assertAllowed(speaker, true);
+      const request: TurnRequest = { id: newIncident(), speaker, pcm: owned,
+        receivedAt: performance.now(), cancelled: false };
+      const receipt = this.enqueue(request);
+      owned = undefined;
+      return receipt;
     } finally {
-      const entry = this.entries.get(speaker.discordUserId);
-      if (entry?.upload === abort) entry.upload = undefined;
+      owned?.fill(0);
       if (this.checking.get(speaker.discordUserId) === abort) this.checking.delete(speaker.discordUserId);
     }
   }
 
+  private enqueue(request: TurnRequest): TurnReceipt {
+    const waiting = !!this.active || this.queue.length > 0;
+    const perUser = this.queue.filter(item => item.speaker.discordUserId === request.speaker.discordUserId).length;
+    const queuedBytes = this.queue.reduce((total, item) => total + (item.pcm?.length ?? 0), 0);
+    if (waiting && (this.queue.length >= this.maxQueuedTurns || perUser >= this.maxQueuedPerUser
+      || queuedBytes + (request.pcm?.length ?? 0) > 16 * 1024 * 1024)) throw new SessionError('limit');
+    this.claimTurn();
+    this.options.metric?.('questions_received');
+    // Owners move ahead of waiting guests; the active request is never displaced.
+    const firstGuest = request.speaker.isOwner ? this.queue.findIndex(item => !item.speaker.isOwner) : -1;
+    if (firstGuest < 0) this.queue.push(request); else this.queue.splice(firstGuest, 0, request);
+    this.options.metric?.('turn_queue_depth', 1);
+    const position = waiting ? this.queue.indexOf(request) + 1 : 0;
+    this.queueReport(request, position);
+    request.timer = setTimeout(() => this.cancelQueued(request, 'expired'),
+      this.queueTtlSeconds * 1000);
+    request.timer.unref();
+    if (waiting) {
+      this.options.metric?.('questions_queued');
+      this.notify(request, { type: 'queued', position });
+    }
+    this.pump();
+    if (this.active) {
+      const entry = this.entries.get(this.active.speaker.discordUserId);
+      if (entry) this.retireForQueued(entry);
+    }
+    return { queued: waiting, position, turnId: request.id };
+  }
+
+  private pump(): void {
+    if (this.closed || !this.available || this.active) return;
+    const request = this.queue.shift();
+    if (!request) return;
+    this.options.metric?.('turn_queue_depth', -1);
+    if (request.timer) clearTimeout(request.timer);
+    this.active = request;
+    void this.dispatch(request).finally(() => this.pump());
+  }
+
+  private async dispatch(request: TurnRequest): Promise<void> {
+    let entry: Entry | undefined;
+    try {
+      this.assertAllowed(request.speaker, !!request.pcm);
+      request.dispatchAt = performance.now();
+      this.options.metric?.('question_queue_wait_ms', Math.round(request.dispatchAt - request.receivedAt));
+      this.queueReport(request, 0);
+      entry = await this.ensure(request.speaker);
+      if (request.cancelled || this.active !== request) return;
+      this.assertAllowed(request.speaker, !!request.pcm);
+      this.begin(entry, request);
+      this.options.metric?.('questions_started');
+      this.notify(request, { type: 'started' });
+      if (request.text !== undefined) {
+        entry.session!.sendText(request.text);
+        request.text = undefined;
+      } else if (request.pcm) await this.upload(entry, request.pcm);
+    } catch (error) {
+      if (!request.cancelled && this.active === request) {
+        if (entry) this.providerError(entry, error instanceof AgentError ? error.code : 'agent_send_failed');
+        else {
+          this.options.metric?.('questions_failed');
+          this.notify(request, { type: 'failed', reason: 'provider' });
+          this.active = undefined;
+        }
+      }
+    } finally { this.eraseRequest(request); }
+  }
+
+  private async upload(entry: Entry, pcm: Buffer): Promise<void> {
+    const abort = new AbortController();
+    entry.upload = abort;
+    const rate = entry.session!.inputSampleRate;
+    const mono = convertPcm(pcm, 48_000, 2, rate, 1);
+    const tail = Buffer.alloc(Math.round(rate * 0.8) * 2);
+    try {
+      const frameBytes = Math.round(rate / 50) * 2;
+      for (const segment of [mono, tail]) {
+        for (let offset = 0; offset < segment.length; offset += frameBytes) {
+          if (!this.usable(entry) || !this.options.allowed(entry.speaker, true) || abort.signal.aborted) return;
+          entry.session!.sendAudio(segment.subarray(offset, offset + frameBytes));
+          await (this.options.pace?.(abort.signal) ?? delay(20, undefined, { signal: abort.signal }));
+        }
+      }
+    } catch (error) { if (!abort.signal.aborted) throw error; }
+    finally {
+      mono.fill(0); tail.fill(0);
+      if (entry.upload === abort) entry.upload = undefined;
+      this.retireForQueued(entry);
+    }
+  }
+
+  private notify(request: TurnRequest, event: Omit<TurnNotification, 'turnId'>): void {
+    const notification = { ...event, turnId: request.id };
+    try { void Promise.resolve(request.notify ? request.notify(notification)
+      : this.options.notify?.(request.speaker, notification))
+      .catch(() => this.options.metric?.('turn_notification_failed')); }
+    catch { this.options.metric?.('turn_notification_failed'); }
+  }
+
+  private queueReport(request: TurnRequest, position: number): void {
+    this.options.logger?.event('jarvis_turn_queue_changed', 'info', {
+      incident: request.id, operation: 'agent_turn', stage: 'agent_response_wait',
+      queue_position: position, queue_depth: this.queue.length,
+      question_wait_ms: Math.round((request.dispatchAt ?? performance.now()) - request.receivedAt),
+    });
+  }
+
+  private eraseRequest(request: TurnRequest): void {
+    request.pcm?.fill(0); request.pcm = undefined; request.text = undefined;
+  }
+
+  private cancelQueued(request: TurnRequest, reason: NonNullable<TurnNotification['reason']>): void {
+    const index = this.queue.indexOf(request);
+    if (index < 0) return;
+    this.queue.splice(index, 1);
+    this.options.metric?.('turn_queue_depth', -1);
+    if (request.timer) clearTimeout(request.timer);
+    request.cancelled = true;
+    this.eraseRequest(request);
+    this.options.metric?.('questions_cancelled');
+    this.queueReport(request, 0);
+    this.notify(request, { type: 'cancelled', reason });
+  }
+
   private assertAllowed(speaker: SpeakerContext, audio = false): void {
-    if (this.closed) throw new SessionError('closed');
+    if (this.closed || !this.available) throw new SessionError('closed');
     if (!speaker.consented || !this.options.allowed(speaker, audio)) throw new SessionError('consent');
   }
 
   private async ensure(speaker: SpeakerContext): Promise<Entry> {
     let entry = this.entries.get(speaker.discordUserId);
     if (entry && (entry.speaker.consentVersion !== speaker.consentVersion
-      || entry.speaker.channelId !== speaker.channelId)) { this.remove(entry); entry = undefined; }
+      || entry.speaker.channelId !== speaker.channelId)) { this.remove(entry, false); entry = undefined; }
     if (entry) {
       if (entry.opening) await entry.opening;
       this.assertAllowed(speaker);
       if (!this.usable(entry)) throw new SessionError('closed');
+      this.options.metric?.('agent_session_reused');
       return entry;
+    }
+    // Idle contexts can be evicted independently of the global request queue.
+    // This keeps bounded per-speaker isolation without refusing a third caller.
+    if (this.entries.size >= this.options.maxSessions) {
+      const inactive = [...this.entries.values()].find(item => !item.waiting && !item.playing && !item.opening);
+      if (inactive) this.remove(inactive);
     }
     if (this.entries.size >= this.options.maxSessions) throw new SessionError('busy');
     entry = { speaker, abort: new AbortController(), waiting: false, playing: false,
-      ingressEnded: false, playbackDone: false, recovering: false, pendingTools: 0, acceptingAudio: false,
+      ingressEnded: false, playbackDone: false, recovering: false, superseded: false, pendingTools: 0, acceptingAudio: false,
       responseIds: new Set(), completedResponseIds: new Set(),
       completionIds: new Set(),
       followupUntil: 0, turnStarted: performance.now(), incident: newIncident(),
       audioChunks: 0, audioBytes: 0, textReceived: false, completionReceived: false,
-      providerClosed: false, failed: false };
+      providerClosed: false, failed: false, localDrained: false, turnReleased: true };
     this.entries.set(speaker.discordUserId, entry);
     const current = entry;
     const callbacks: AgentCallbacks = {
@@ -159,6 +322,7 @@ export class SessionManager {
         if (this.usable(current) && current.waiting && this.identifyResponse(current, identity?.responseId)) {
           current.textReceived = true;
           this.progress(current);
+          this.retireForQueued(current);
         }
       },
       onToolActivity: (pending) => {
@@ -166,6 +330,7 @@ export class SessionManager {
         current.pendingTools = pending;
         if (current.completionReceived && pending === 0) this.seal(current);
         else this.progress(current);
+        this.retireForQueued(current);
       },
       onProtocolEvent: (event) => {
         if (!this.usable(current)) return;
@@ -184,12 +349,14 @@ export class SessionManager {
     }, this.options.maxSessionSeconds * 1000);
     current.lifetime.unref();
     try {
+      const startedAt = performance.now();
       current.opening = this.options.connect(speaker, callbacks, current.abort.signal);
       const session = await current.opening;
       if (!this.usable(current)) { session.close(); throw new SessionError('consent'); }
       current.session = session;
       current.opening = undefined;
       this.options.metric?.('agent_sessions_started');
+      this.options.metric?.('agent_session_open_ms', Math.round(performance.now() - startedAt));
       this.idle(current);
       return current;
     } catch (error) {
@@ -204,24 +371,29 @@ export class SessionManager {
     this.turns++;
   }
 
-  private begin(entry: Entry): void {
+  private begin(entry: Entry, request: TurnRequest): void {
     if (!this.usable(entry)) throw new SessionError('consent');
     if (entry.waiting || entry.playing) throw new SessionError('busy');
     entry.waiting = true;
+    entry.request = request;
+    entry.turnReleased = false;
+    entry.localDrained = false;
+    entry.firstAudioAt = entry.firstPlaybackAt = entry.lastAudioAt = entry.drainedAt = undefined;
     for (const id of entry.responseIds) entry.completedResponseIds.add(id);
     entry.responseIds.clear();
     entry.stream = undefined;
     entry.ingressEnded = false;
     entry.playbackDone = false;
     entry.recovering = false;
+    entry.superseded = false;
     entry.acceptingAudio = false;
     entry.audioChunks = 0;
     entry.audioBytes = 0;
     entry.textReceived = false;
     entry.completionReceived = false;
     entry.failed = false;
-    entry.incident = newIncident();
-    entry.turnStarted = performance.now();
+    entry.incident = request.id;
+    entry.turnStarted = request.receivedAt;
     entry.followupUntil = 0;
     if (entry.idle) clearTimeout(entry.idle);
     this.progress(entry);
@@ -230,7 +402,7 @@ export class SessionManager {
   }
 
   private usable(entry: Entry): boolean {
-    return !this.closed && !entry.abort.signal.aborted
+    return !this.closed && this.available && !entry.abort.signal.aborted
       && this.entries.get(entry.speaker.discordUserId) === entry && this.options.allowed(entry.speaker);
   }
 
@@ -262,13 +434,24 @@ export class SessionManager {
     }
     entry.audioChunks++;
     entry.audioBytes += pcm.length;
+    // New ingress invalidates a previous local drain before any asynchronous
+    // write or playback observer can race with a waiting request.
+    entry.localDrained = false;
+    entry.lastAudioAt = performance.now();
+    if (entry.firstAudioAt === undefined) {
+      entry.firstAudioAt = entry.lastAudioAt;
+      this.options.metric?.('agent_first_audio_ms', Math.round(entry.firstAudioAt - entry.turnStarted));
+    }
     entry.acceptingAudio = true;
     this.progress(entry);
     try {
       if (!entry.stream) {
         entry.playing = true;
         const stream = this.options.playback.startStream(entry.speaker.discordUserId,
-          entry.session.outputSampleRate, entry.speaker.isOwner, { isAllowed: () => this.usable(entry) });
+          entry.session.outputSampleRate, entry.speaker.isOwner, {
+            isAllowed: () => this.usable(entry),
+            onProgress: (event) => this.playbackProgress(entry, event),
+          });
         entry.stream = stream;
         void stream.done.then(() => {
           if (!this.usable(entry) || entry.stream !== stream) return;
@@ -288,6 +471,7 @@ export class SessionManager {
       if (this.usable(entry)) {
         if (entry.completionReceived && !entry.pendingTools) this.seal(entry);
         else this.progress(entry);
+        this.retireForQueued(entry);
       }
     }
   }
@@ -328,11 +512,74 @@ export class SessionManager {
 
   private finishTurn(entry: Entry): void {
     if (!this.usable(entry) || !entry.ingressEnded || (entry.stream && !entry.playbackDone)) return;
+    if (entry.turnReleased) return;
+    entry.turnReleased = true;
+    this.options.metric?.('agent_turn_logical_end_ms', Math.round(performance.now() - entry.turnStarted));
+    this.report(entry, 'jarvis_agent_turn_finished');
     if (!entry.completionReceived || entry.recovering) { this.remove(entry); return; }
     this.options.metric?.('agent_turns_completed');
     if (entry.providerClosed) { this.remove(entry); return; }
     entry.followupUntil = Date.now() + this.options.followupSeconds * 1000;
+    this.rememberFollowup(entry.speaker);
     this.idle(entry);
+    this.release(entry);
+  }
+
+  private playbackProgress(entry: Entry, event: 'first_packet' | 'drained' | 'resumed'): void {
+    if (!this.usable(entry) || entry.turnReleased) return;
+    const now = performance.now();
+    if (event === 'first_packet' && entry.firstPlaybackAt === undefined) {
+      entry.firstPlaybackAt = now;
+      this.options.metric?.('agent_first_playback_ms', Math.round(now - entry.turnStarted));
+    }
+    if (event === 'drained') {
+      entry.localDrained = true;
+      entry.drainedAt = now;
+      this.options.metric?.('agent_playback_drained_ms', Math.round(now - entry.turnStarted));
+      // A perceptual follow-up window is authorization to hear this speaker's
+      // next utterance, not proof that the provider has completed generation.
+      entry.followupUntil = Date.now() + this.options.followupSeconds * 1000;
+      this.rememberFollowup(entry.speaker);
+    } else if (event === 'resumed') entry.localDrained = false;
+    this.report(entry, 'jarvis_agent_audio_progress');
+    this.retireForQueued(entry);
+  }
+
+  private retireForQueued(entry: Entry): void {
+    if (!this.queue.length || !this.usable(entry) || entry.turnReleased || entry.recovering
+      || entry.completionReceived || !entry.waiting || !entry.textReceived || !entry.audioBytes
+      || !entry.localDrained || entry.acceptingAudio || entry.pendingTools || entry.upload) return;
+    // The NEW REQUEST authorizes retiring an unconfirmed old provider turn.
+    // A quiet interval alone never does. Drain validated adapter input before
+    // ending the local stream; a fresh provider session fences all late events.
+    this.missing(entry);
+    entry.recovering = true;
+    entry.superseded = true;
+    this.options.metric?.('agent_turns_superseded');
+    this.report(entry, 'jarvis_agent_turn_superseded');
+    if (entry.deadline) clearTimeout(entry.deadline);
+    entry.session?.close({ drainAudio: true });
+  }
+
+  private release(entry: Entry): void {
+    if (!this.active || (entry.request !== this.active && this.active.speaker.discordUserId !== entry.speaker.discordUserId)) return;
+    if (entry.drainedAt !== undefined) this.options.metric?.('next_question_ready_ms',
+      Math.round(performance.now() - entry.drainedAt));
+    if (entry.lastAudioAt !== undefined) this.options.metric?.('agent_last_audio_ms',
+      Math.round(entry.lastAudioAt - entry.turnStarted));
+    this.active = undefined;
+    entry.request = undefined;
+    queueMicrotask(() => this.pump());
+  }
+
+  private rememberFollowup(speaker: SpeakerContext): void {
+    for (const [id, value] of this.followups) if (value.until <= Date.now()) this.followups.delete(id);
+    if (!this.followups.has(speaker.discordUserId) && this.followups.size >= 16) {
+      const oldest = this.followups.keys().next().value;
+      if (oldest !== undefined) this.followups.delete(oldest);
+    }
+    this.followups.set(speaker.discordUserId, { consentVersion: speaker.consentVersion,
+      channelId: speaker.channelId, until: Date.now() + this.options.followupSeconds * 1000 });
   }
 
   /** Silence is only a resource-recovery trigger, never proof of completed generation. */
@@ -375,7 +622,18 @@ export class SessionManager {
       audio_chunks: entry.audioChunks, audio_bytes: entry.audioBytes,
       text_received: entry.textReceived, completion_received: entry.completionReceived,
       ingress_ended: entry.ingressEnded, playback_drained: entry.playbackDone,
+      local_playback_drained: entry.localDrained,
       recovery: entry.recovering, pending_tools: entry.pendingTools,
+      queue_depth: this.queue.length,
+      turn_outcome: entry.failed ? 'failed' : entry.turnReleased
+        ? entry.completionReceived && !entry.recovering ? 'completed' : entry.superseded ? 'superseded' : 'unconfirmed' : undefined,
+      ...(entry.request?.dispatchAt === undefined ? {} : {
+        question_wait_ms: Math.round(entry.request.dispatchAt - entry.request.receivedAt),
+      }),
+      ...(entry.firstAudioAt === undefined ? {} : { first_audio_ms: Math.round(entry.firstAudioAt - entry.turnStarted) }),
+      ...(entry.lastAudioAt === undefined ? {} : { last_audio_ms: Math.round(entry.lastAudioAt - entry.turnStarted) }),
+      ...(entry.firstPlaybackAt === undefined ? {} : { first_playback_ms: Math.round(entry.firstPlaybackAt - entry.turnStarted) }),
+      ...(entry.drainedAt === undefined ? {} : { drain_ms: Math.round(entry.drainedAt - entry.turnStarted) }),
     });
   }
 
@@ -441,7 +699,7 @@ export class SessionManager {
   private interrupt(entry: Entry): void {
     // Closing the provider session fences late audio/completion from the old turn.
     // A new question creates a fresh session instead of trusting event arrival timing.
-    this.remove(entry);
+    this.remove(entry, true, 'interrupted');
   }
 
   private idle(entry: Entry): void {
@@ -450,9 +708,19 @@ export class SessionManager {
     entry.idle.unref();
   }
 
-  private remove(entry: Entry): void {
+  private remove(entry: Entry, release = true, reason: NonNullable<TurnNotification['reason']> = 'closed'): void {
     if (this.entries.get(entry.speaker.discordUserId) !== entry) return;
     this.entries.delete(entry.speaker.discordUserId);
+    if (release && this.active?.speaker.discordUserId === entry.speaker.discordUserId) {
+      if (!this.active.cancelled && (!entry.turnReleased || entry.failed || entry.opening)) {
+        this.options.metric?.(entry.failed ? 'questions_failed' : 'questions_cancelled');
+        this.notify(this.active, { type: entry.failed ? 'failed' : 'cancelled',
+          reason: entry.failed ? 'provider' : reason });
+      }
+      this.active.cancelled = true;
+      this.eraseRequest(this.active);
+      this.release(entry);
+    }
     entry.upload?.abort();
     entry.abort.abort();
     for (const timer of [entry.idle, entry.lifetime, entry.deadline]) if (timer) clearTimeout(timer);
@@ -462,18 +730,77 @@ export class SessionManager {
   }
 
   revoke(userId: string): void {
+    this.cancelUser(userId, 'revoked');
+  }
+
+  cancelUser(userId: string, reason: NonNullable<TurnNotification['reason']> = 'closed'): void {
+    this.followups.delete(userId);
+    for (const request of [...this.queue]) if (request.speaker.discordUserId === userId) this.cancelQueued(request, reason);
     this.checking.get(userId)?.abort();
     this.checking.delete(userId);
     const entry = this.entries.get(userId);
-    if (entry) this.remove(entry);
+    if (entry) this.remove(entry, true, reason);
+    else if (this.active?.speaker.discordUserId === userId) {
+      this.active.cancelled = true;
+      this.eraseRequest(this.active);
+      this.options.metric?.('questions_cancelled');
+      this.notify(this.active, { type: 'cancelled', reason });
+      this.active = undefined;
+      queueMicrotask(() => this.pump());
+    }
     this.options.playback.stopUser(userId);
+  }
+
+  interruptOwner(speaker: SpeakerContext): boolean {
+    this.assertAllowed(speaker, true);
+    if (!speaker.isOwner || !this.active) return false;
+    this.options.metric?.('owner_interruptions');
+    this.rememberFollowup(speaker);
+    const current = this.active.speaker.discordUserId;
+    // Owner barge-in cancels only the active turn, preserving waiting callers.
+    const entry = this.entries.get(current);
+    if (entry) this.remove(entry, true, 'interrupted');
+    else {
+      this.active.cancelled = true;
+      this.eraseRequest(this.active);
+      this.notify(this.active, { type: 'cancelled', reason: 'interrupted' });
+      this.options.metric?.('questions_cancelled');
+      this.active = undefined;
+      queueMicrotask(() => this.pump());
+    }
+    return true;
+  }
+
+  setAvailable(available: boolean): void {
+    if (this.closed) return;
+    this.available = available;
+    if (available) { this.pump(); return; }
+    this.followups.clear();
+    for (const request of [...this.queue]) this.cancelQueued(request, 'closed');
+    for (const abort of this.checking.values()) abort.abort();
+    this.checking.clear();
+    for (const entry of [...this.entries.values()]) this.remove(entry);
+    if (this.active) {
+      this.active.cancelled = true;
+      this.eraseRequest(this.active);
+      this.notify(this.active, { type: 'cancelled', reason: 'closed' });
+      this.active = undefined;
+    }
   }
 
   close(): void {
     this.closed = true;
+    this.followups.clear();
+    for (const request of [...this.queue]) this.cancelQueued(request, 'closed');
     for (const abort of this.checking.values()) abort.abort();
     this.checking.clear();
     for (const entry of this.entries.values()) this.remove(entry);
+    if (this.active) {
+      this.eraseRequest(this.active);
+      this.notify(this.active, { type: 'cancelled', reason: 'closed' });
+      this.active.cancelled = true;
+      this.active = undefined;
+    }
     this.options.playback.stop();
   }
 }

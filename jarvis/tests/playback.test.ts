@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import { setImmediate as tick } from 'node:timers/promises';
 import { AudioPlayerStatus, type AudioPlayer, type AudioResource, type VoiceConnection } from '@discordjs/voice';
-import { test } from 'vitest';
+import { test, vi } from 'vitest';
 import { PlaybackQueue, type PlaybackOptions } from '../src/audio/playback.js';
 import { StreamingPcm } from '../src/audio/streaming-pcm.js';
 import { OpusDecoder } from '../src/audio/opus-decoder.js';
@@ -347,4 +347,42 @@ test('real voice player survives more than five missing frames and resumes the s
   assert.ok(packets.filter(value => value.length > 3).length > beforeResume);
   assert.equal(player.state.status, AudioPlayerStatus.Idle);
   queue.stop();
+});
+
+test('open-stream local drain reopens listening without inventing EOF, then resumes on new PCM', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const observations: string[] = [];
+  const { queue, player } = setup();
+  try {
+    const stream = queue.startStream('a', 16_000, false, {
+      onProgress: event => { observations.push(event); },
+    });
+    const token = queue.currentStreamToken;
+    await stream.write(tone(1_600));
+    const resource = player.current!;
+    for (let i = 0; i < 4; i++) await packet(resource);
+    for (let i = 0; i < 4; i++) { resource.playStream.read(); await tick(); }
+    await vi.advanceTimersByTimeAsync(249);
+    assert.deepEqual(observations, ['first_packet']);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.deepEqual(observations, ['first_packet', 'drained']);
+    assert.equal(queue.isAudible, false);
+    assert.equal(queue.isPlaying, true);
+    let done = false; void stream.done.then(() => { done = true; });
+    await tick(); assert.equal(done, false);
+    assert.ok(token === undefined); // Streams obtain their identity after the first accepted write.
+    const activeToken = queue.currentStreamToken;
+    assert.equal(typeof activeToken, 'number');
+    await stream.write(tone(640));
+    assert.equal(queue.isAudible, true);
+    assert.equal(queue.currentStreamToken, activeToken);
+    assert.deepEqual(observations, ['first_packet', 'drained', 'resumed']);
+    await packet(resource);
+    stream.end(); await drain(player); await stream.done;
+    assert.equal(queue.currentStreamToken, undefined);
+    const next = queue.startStream('a', 16_000, false);
+    await next.write(tone(640));
+    assert.notEqual(queue.currentStreamToken, activeToken);
+    next.cancel(); await assert.rejects(next.done);
+  } finally { queue.stop(); vi.useRealTimers(); }
 });

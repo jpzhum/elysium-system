@@ -4,10 +4,23 @@ export class Metrics {
   private readonly counters = new Map<string, number>();
   add = (name: string, value = 1): void => {
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(name) || !Number.isFinite(value)) return;
-    if (!this.counters.has(name) && this.counters.size >= 128) return;
+    if (!this.counters.has(name) && this.counters.size >= 256) return;
     this.counters.set(name, (this.counters.get(name) ?? 0) + value);
   };
   snapshot(): Record<string, number> { return Object.fromEntries(this.counters); }
+  /** Durations are aggregates with a sample count, not invented percentiles. */
+  record = (name: string, value = 1): void => {
+    if (!name.endsWith('_ms')) { this.add(name, value); return; }
+    if (!/^[a-z][a-z0-9_]{0,51}$/.test(name) || !Number.isFinite(value) || value < 0 || value > 3_600_000) return;
+    this.add(name, value);
+    this.add(`${name}_samples`);
+    this.set(`${name}_last`, value);
+    this.set(`${name}_min`, Math.min(this.counters.get(`${name}_min`) ?? value, value));
+    this.set(`${name}_max`, Math.max(this.counters.get(`${name}_max`) ?? value, value));
+  };
+  private set(name: string, value: number): void {
+    if (this.counters.has(name) || this.counters.size < 256) this.counters.set(name, value);
+  }
 }
 
 export type LogLevel = 'info' | 'warn' | 'error';
@@ -93,8 +106,18 @@ export interface DiagnosticFields {
   completion_received?: boolean;
   ingress_ended?: boolean;
   playback_drained?: boolean;
+  local_playback_drained?: boolean;
   recovery?: boolean;
   pending_tools?: number;
+  queue_position?: number;
+  queue_depth?: number;
+  turn_outcome?: 'completed' | 'superseded' | 'unconfirmed' | 'cancelled' | 'failed';
+  question_wait_ms?: number;
+  first_audio_ms?: number;
+  last_audio_ms?: number;
+  first_playback_ms?: number;
+  drain_ms?: number;
+  next_question_ready_ms?: number;
 }
 
 const events = new Set([
@@ -109,6 +132,7 @@ const events = new Set([
   'voice_websocket_close', 'voice_connection_disconnected', 'voice_dave_state', 'voice_join_failed',
   'jarvis_agent_turn_started', 'jarvis_agent_turn_failed', 'jarvis_agent_response_complete',
   'jarvis_agent_playback_completed', 'jarvis_agent_turn_recovering',
+  'jarvis_turn_queue_changed', 'jarvis_agent_turn_superseded', 'jarvis_agent_turn_finished', 'jarvis_agent_audio_progress',
 ]);
 
 export function newIncident(): string { return randomBytes(4).toString('hex').toUpperCase(); }
@@ -135,6 +159,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
   for (const [key, options] of [
     ['command', ['join']], ['operation', ['agent_turn']], ['stage', diagnosticStages], ['category', errorCategories],
     ['code', errorCodes], ['voice_status', voiceStatuses], ['previous_voice_status', voiceStatuses],
+    ['turn_outcome', ['completed', 'superseded', 'unconfirmed', 'cancelled', 'failed']],
     ['platform', ['win32', 'linux', 'darwin']], ['arch', ['x64', 'arm64']],
   ] as const) {
     const value = diagnosticValue(fields, key);
@@ -143,7 +168,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
   for (const key of [
     'dave_enabled', 'dave_available', 'dave_ready', 'transport_aes_gcm',
     'permission_view', 'permission_connect', 'permission_speak', 'permission_full',
-    'text_received', 'completion_received', 'ingress_ended', 'playback_drained', 'recovery',
+    'text_received', 'completion_received', 'ingress_ended', 'playback_drained', 'local_playback_drained', 'recovery',
   ]) {
     const value = diagnosticValue(fields, key);
     if (typeof value === 'boolean') result[key] = value;
@@ -152,8 +177,11 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['duration_ms', 0, 86_400_000], ['stage_duration_ms', 0, 86_400_000], ['timeout_ms', 0, 300_000],
     ['network_status', 0, 6], ['previous_network_status', 0, 6],
     ['websocket_close_code', 1_000, 4_999], ['disconnect_reason', 0, 4],
-    ['dave_protocol_version', 0, 65_535], ['diagnostics_version', 1, 3], ['pending_tools', 0, 128],
+    ['dave_protocol_version', 0, 65_535], ['diagnostics_version', 1, 4], ['pending_tools', 0, 128],
     ['audio_chunks', 0, 1_000_000], ['audio_bytes', 0, 128_000_000],
+    ['queue_position', 0, 32], ['queue_depth', 0, 32],
+    ['question_wait_ms', 0, 3_600_000], ['first_audio_ms', 0, 3_600_000], ['last_audio_ms', 0, 3_600_000],
+    ['first_playback_ms', 0, 3_600_000], ['drain_ms', 0, 3_600_000], ['next_question_ready_ms', 0, 3_600_000],
   ] as const) {
     const value = diagnosticValue(fields, key);
     if (integer(value, minimum, maximum)) result[key] = value;

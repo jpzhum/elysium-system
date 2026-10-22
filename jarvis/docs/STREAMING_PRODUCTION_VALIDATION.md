@@ -3,7 +3,10 @@
 A aceitação operacional exige que uma pessoa ouça o Jarvis na chamada real do
 Discord. Build, testes, HTTP 200, contadores positivos e conclusão local do player
 não comprovam essa audição. Este roteiro prepara essa validação; não registra um
-deploy nem um teste audível já realizado.
+deploy nem um teste audível já realizado pelo agente. Posteriormente, no pedido
+V4, o operador confirmou saída progressiva audível em produção. O gate de cinco
+perguntas consecutivas e voz consentida da revisão V4 continua pendente; siga
+[V4_CONVERSATION_VALIDATION.md](V4_CONVERSATION_VALIDATION.md).
 
 ## Evidência que motivou a mudança
 
@@ -89,13 +92,23 @@ decorrido nunca são registrados como prova de que o agente terminou de gerar.
 Uma nova pergunta após recuperação abre uma sessão nova, impedindo que saída
 tardia do turno anterior seja atribuída ao próximo.
 
+Na V4, se uma pergunta está aguardando, mensagem textual recebida, drenagem
+local e ausência de ferramenta conhecida pendente permitem retirar a sessão
+anterior sem esperar 45 s. O transporte corta entrada e drena blocos aceitos
+antes da fronteira; só depois inicia a próxima pergunta. O resultado fica sem
+confirmação, inclusive se outra mensagem ou ferramenta remota ainda pudesse ser
+gerada. Essa política não preserva automaticamente o contexto remoto da sessão
+encerrada nem transforma silêncio em geração concluída.
+
 Fechamento remoto ou erro de rede também encerram a sessão e permitem drenar o
 áudio válido aceito antes dessa fronteira. Sem um sinal explícito recebido, a
 geração permanece sem confirmação. São falhas primárias
 classificadas; o fechamento local de limpeza não deve duplicá-las. Isso difere
 de revogação, saída da sala ou expiração, que cancelam imediatamente o player.
-Follow-up na sessão existente só é autorizado depois da conclusão explícita e
-do esvaziamento do player; a recuperação não abre essa janela.
+Na V4, a drenagem local pode abrir uma janela de follow-up apenas para ouvir a
+próxima fala do mesmo participante sem repetir wake. Essa autorização não
+confirma geração integral. Reutilização de contexto depende da sessão válida;
+retirar uma sessão sem conclusão pode abrir outra sem o contexto anterior.
 
 Ferramentas pendentes não autorizam declarar o turno concluído e suspendem a
 recuperação por ociosidade. O limite absoluto da sessão continua aplicável:
@@ -137,7 +150,7 @@ as referências nesses casos. Os históricos em memória também têm limite.
    Não rode outra instância com o mesmo bot/guild durante o teste.
 5. Mantenha credenciais no Environment privado e `JARVIS_LOG_LEVEL=info` para a
    validação. Não imprima configurações nem ative dumps brutos de WebSocket.
-6. Confirme `jarvis_ready` com `diagnostics_version: 3`. Esse sinal confirma inicialização, não valida saída
+6. Confirme `jarvis_ready` com `diagnostics_version: 4`. Esse sinal confirma inicialização, não valida saída
    audível, entrada DAVE ou conclusão de resposta.
 
 O serviço Elysium Python, seus intents, permissões e contratos persistentes
@@ -203,6 +216,7 @@ falha de provedor.
 | Falha WebSocket | Código sanitizado e política de encerramento visíveis; sem loops ou erro secundário de limpeza |
 | Resposta longa e pausas | Buffer limitado, ordem íntegra, sem cortar a fala por uma pausa curta |
 | Nova pergunta após recuperação | Sessão nova; eventos antigos não retomam áudio |
+| Pergunta aguardando após fala já consumida | Retirada da sessão sem conclusão, quando o gate V4 permite; sem aguardar indevidamente 45 s e sem alegar geração completa |
 
 Não provoque deliberadamente uma queda de rede ou consumo prolongado em produção
 para substituir testes isolados. Use a matriz real para operações autorizadas e
@@ -234,4 +248,6 @@ IDs de participantes, chaves, credenciais ou URLs assinadas para logs ou issues.
 Use apenas incidentes de oito hexadecimais, categorias, códigos e contadores
 sanitizados. Os resultados automatizados estão em
 [IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md); o gate de audição
-permanece pendente até uma pessoa executar esta validação.
+V4 permanece pendente até uma pessoa executar a validação de cinco perguntas e
+voz consentida. A audição da revisão anterior foi confirmada pelo operador no
+pedido V4; não foi repetida pelo agente durante esta revisão.

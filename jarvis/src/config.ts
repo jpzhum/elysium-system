@@ -14,9 +14,13 @@ const schema = z.object({
   ELEVENLABS_AGENT_ID: z.string().trim().min(1).max(200).optional(),
   ELEVENLABS_API_KEY: z.string().trim().min(1).optional(),
   JARVIS_VOICE_INPUT: z.enum(['disabled', 'elevenlabs-stt']).default('disabled'),
+  JARVIS_BARGE_IN_ENABLED: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
   JARVIS_WAKE_WORD: z.string().trim().min(2).max(30).default('Jarvis'),
   JARVIS_FOLLOWUP_SECONDS: integer(18, 0, 30),
   JARVIS_MAX_ACTIVE_SESSIONS: integer(2, 1, 8),
+  JARVIS_MAX_QUEUED_TURNS: integer(8, 1, 16),
+  JARVIS_MAX_QUEUED_PER_USER: integer(2, 1, 4),
+  JARVIS_QUESTION_QUEUE_TTL_SECONDS: integer(60, 10, 120),
   JARVIS_SESSION_IDLE_SECONDS: integer(45, 20, 180),
   JARVIS_MAX_AUDIO_SECONDS_PER_TURN: integer(12, 1, 30),
   JARVIS_MAX_SESSION_SECONDS: integer(300, 30, 900),
@@ -46,6 +50,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env, daveSmo
   }
   if (cleaned.JARVIS_CONSENT_STORAGE_URL) {
     throw new ConfigError(['JARVIS_CONSENT_STORAGE_URL (persistência ainda não implementada)']);
+  }
+  if (config.JARVIS_BARGE_IN_ENABLED && (daveSmoke || config.JARVIS_VOICE_INPUT !== 'elevenlabs-stt')) {
+    throw new ConfigError(['JARVIS_BARGE_IN_ENABLED (requer JARVIS_VOICE_INPUT=elevenlabs-stt)']);
   }
   return Object.freeze({ ...config, daveSmoke });
 }

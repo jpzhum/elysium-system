@@ -141,7 +141,7 @@ function setup(maxTurnSeconds = 2) {
     canReceive: (userId) => consent.has(userId),
     isPlaying: () => playing,
     maxTurnSeconds,
-    onTurn: (userId, pcm) => { turns.push({ userId, pcm }); },
+    onTurn: (userId, pcm) => { turns.push({ userId, pcm: Buffer.from(pcm) }); },
     onMetric: (name) => { metrics.push(name); },
   });
   receiver.start();

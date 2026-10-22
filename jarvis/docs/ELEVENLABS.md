@@ -70,6 +70,14 @@ houve texto, sem guardar seu conteúdo, para detectar uma resposta sem áudio.
 Metadata de inicialização e ping são tratados pelo protocolo; não precisam ser
 inventados em overrides. Para diagnóstico e validação audível, siga
 [STREAMING_PRODUCTION_VALIDATION.md](STREAMING_PRODUCTION_VALIDATION.md).
+Na V4, uma nova pergunta pode provocar retirada da sessão anterior depois de
+mensagem textual, drenagem local e nenhuma ferramenta conhecida pendente. Essa
+decisão de disponibilidade drena áudio já aceito, mas mantém a geração anterior
+sem confirmação; não usa o fim do texto para certificar fim do turno. Uma sessão
+nova não recupera automaticamente o contexto da sessão encerrada.
+O follow-up após drenagem local autoriza ouvir a próxima fala do mesmo
+participante sem repetir wake; não certifica conclusão do provedor.
+Confira o [gate V4 de cinco perguntas e voz consentida](V4_CONVERSATION_VALIDATION.md).
 Veja [Client events](https://elevenlabs.io/docs/eleven-agents/customization/events/client-events)
 e [WebSocket API](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket).
 
@@ -184,3 +192,8 @@ o AbortSignal da sessão pela closure autenticada do backend.
    para envio pré-ativação. O fallback `/jarvis ask` não aprova os Gates B ou D.
 6. Anote latência e falhas reais, sem anexar voz, transcrição, credenciais ou URL
    assinada ao relatório. Nenhum teste real é declarado aprovado por este guia.
+
+O operador confirmou que a versão de streaming já respondeu audivelmente por
+`/ask` na chamada real. Isso não aprova os novos turnos consecutivos, wake PT-BR
+ou barge-in V4; execute o [roteiro V4](V4_CONVERSATION_VALIDATION.md) no worker
+existente após deploy manual e registre o SHA implantado.

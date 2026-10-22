@@ -1,12 +1,15 @@
 # JARVIS Voice
 
 Bot Discord independente, em Node/TypeScript, com ElevenAgents como cérebro,
-ASR e voz. Elysium continua no serviço Python. Implementação técnica local;
-recepção DAVE, conversas reais e deploy ainda precisam ser validados. Consulte
+ASR e voz. Elysium continua no serviço Python. O operador confirmou conexão e
+resposta audível de `/ask` em produção. A revisão V4 de turnos consecutivos,
+fila e voz experimental ainda exige validação real. Consulte
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) antes de operar.
 
 Para falhas de `/join`, timeout de resposta ou ausência de som no Render, consulte
 [o roteiro de diagnóstico e validação audível](docs/RENDER_INCIDENTS.md).
+Para cinco perguntas consecutivas, voz consentida e barge-in, siga o
+[roteiro V4](docs/V4_CONVERSATION_VALIDATION.md).
 
 ## Começar localmente
 
@@ -81,12 +84,20 @@ um tom sintético de 1 s para separar playback Discord da resposta ElevenLabs.
 | `/jarvis consent` | Participante na sala: aceita perguntas escritas |
 | `/jarvis consent audio:true` | Aceite adicional para diagnóstico/voz experimental |
 | `/jarvis revoke` | Qualquer usuário: cancela sua captura, sessão e resposta |
+| `/jarvis cancel` | Participante: cancela suas perguntas na fila, sessão e resposta; mantém seu consentimento |
 | `/jarvis ask texto:...` | Participante consentido na mesma sala: pergunta escrita |
 
 Participantes não precisam de autorização individual para perguntas. Administração
 é aplicada pelo backend comparando IDs; nomes e pedidos falados não concedem
 poderes. O bot sai quando não restam humanos. Sair da sala, desconectar ou
 reiniciar exige consentimento novo. Revogar também cancela trabalho pendente.
+
+Perguntas são serializadas na chamada, com fila limitada e aviso privado ao
+solicitante quando precisam esperar ou são canceladas. Por padrão, cabem oito
+perguntas em espera e até duas por participante; a espera expira em 60 s. O
+proprietário ganha prioridade entre itens em espera e não corta uma resposta
+ativa de convidado. Limite excedido recebe rejeição explícita. Revogação, saída
+e cancelamento impedem execução posterior de tarefas daquele participante.
 
 ## ElevenLabs
 
@@ -121,38 +132,66 @@ transcrita Jarvis/Járvis/Djárvis ativa uma sessão ElevenAgents para o falante
 o turno original segue em PCM mono negociado, em chunks com pacing e silêncio
 final para VAD. Não há streaming permanente do canal inteiro.
 
-O follow-up dura 18 s por padrão após conclusão explícita e playback, só para aquele falante. Enquanto
-Jarvis reproduz áudio, a captura é suprimida para reduzir eco; barge-in de voz
-durante playback não está implementado. Interrupções do provedor cancelam o upload
-e o áudio daquele turno. PCM recebido segue progressivamente para Opus/Discord,
+O follow-up dura 18 s por padrão após a drenagem local, só para aquele falante.
+Essa janela autoriza sua próxima fala sem repetir wake; não confirma conclusão
+do provedor. Uma sessão com conclusão explícita pode ser reutilizada; sem esse
+sinal, a pergunta seguinte segue a recuperação e pode abrir outra sessão.
+Durante playback a captura normal é suprimida para reduzir eco.
+O barge-in experimental, habilitado separadamente por
+`JARVIS_BARGE_IN_ENABLED=true`, permite apenas ao proprietário com consentimento
+de áudio interromper usando os comandos exatos “Jarvis, parar” ou “Jarvis,
+cancela”. Não concede autorização por texto ou por declaração verbal. Esse modo
+envia ao STT externo trechos consentidos também durante playback, com limite de
+duração, cooldown e teto compartilhado de verificações. Fones são recomendados
+na validação; as proteções locais não equivalem a cancelamento acústico de eco.
+O comando fica vinculado ao stream ouvido durante a captura; um resultado STT
+tardio não pode interromper uma resposta nova.
+O padrão permanece desabilitado e exige `JARVIS_VOICE_INPUT=elevenlabs-stt`.
+
+Interrupções do provedor cancelam o upload e o áudio daquele turno. PCM recebido segue progressivamente para Opus/Discord,
 com conversão contínua, buffers limitados e backpressure. Não é preciso esperar
-`agent_response_complete` para ouvir. Dono ganha prioridade na fila de respostas,
-sem interromper convidados no meio da fala.
+`agent_response_complete` para ouvir.
 
 Conclusão da geração, fim do recebimento e fim da reprodução são estados distintos.
-Se a conclusão faltar, 45 s sem progresso e sem ferramenta pendente disparam uma
-recuperação: fecha o transporte, drena áudio válido e registra resultado não
-confirmado, sem follow-up. Silêncio não confirma geração completa. Revogação,
+Se a conclusão faltar e houver outra pergunta esperando, a aplicação pode retirar
+a sessão anterior quando recebeu a mensagem textual, a saída local drenou e não
+há ferramenta conhecida pendente. Fecha o transporte antigo, drena o áudio aceito
+antes do corte e só então inicia a próxima pergunta em sessão isolada. Registra
+substituição sem conclusão confirmada; não declara o turno completo por silêncio.
+Isso pode abandonar geração futura não sinalizada e não preserva automaticamente
+o contexto ElevenAgents entre sessões. Não existe memória compartilhada ou
+reconstrução local de transcrições.
+
+Sem nova pergunta, 45 s sem progresso e sem ferramenta pendente disparam a
+recuperação existente, com áudio válido drenado e resultado não confirmado, sem
+follow-up. Revogação,
 desconexão e expiração cancelam imediatamente. Veja a
-[validação real no Render](docs/STREAMING_PRODUCTION_VALIDATION.md) e a
+[validação V4 no Render](docs/V4_CONVERSATION_VALIDATION.md) e a
 [pesquisa do SDK oficial](docs/ELEVENLABS_STREAMING_RESEARCH.md).
 
-O reconhecimento fonético real em PT-BR, falsos wakes, qualidade VAD, perda de
-frames DAVE e latência ainda não foram medidos. Os testes de grafias usam texto
-sintético. Não existe meta de 4 s ou custo/hora comprovado. O bug DAVE upstream
-permanece risco até executar a matriz real; `/ask` não aprova voz de entrada.
+O reconhecimento fonético real em PT-BR, falsos wakes, eco, qualidade VAD e
+latência da revisão V4 ainda não foram medidos. Os testes de grafias usam texto
+sintético; `/ask` audível não aprova entrada de voz. A avaliação de wake acústico
+local está no [roteiro V4](docs/V4_CONVERSATION_VALIDATION.md): Porcupine é um
+candidato para português; openWakeWord documenta inglês e restrições distintas
+para modelos prontos. Nenhum substitui o STT nesta revisão sem benchmark e
+análise de licença. Não há latência inferior a dois segundos comprovada.
 
 ## Limites, privacidade e parada
 
 | Configuração | Padrão |
 | --- | --- |
 | `JARVIS_MAX_ACTIVE_SESSIONS` | 2 sessões por worker |
+| `JARVIS_MAX_QUEUED_TURNS` | 8 perguntas aguardando por sala |
+| `JARVIS_MAX_QUEUED_PER_USER` | 2 perguntas aguardando por participante |
+| `JARVIS_QUESTION_QUEUE_TTL_SECONDS` | 60 s em espera; configurável até 120 s |
 | `JARVIS_MAX_AUDIO_SECONDS_PER_TURN` | 12 s por turno recebido |
 | `JARVIS_MAX_SESSION_SECONDS` | 300 s por sessão |
 | `JARVIS_SESSION_IDLE_SECONDS` | 45 s após resposta |
 | `JARVIS_FOLLOWUP_SECONDS` | 18 s após playback |
 | `JARVIS_MAX_TURNS_PER_HOUR` | 120 tentativas por sessão de sala |
 | `JARVIS_MAX_WAKE_CHECKS_PER_MINUTE` | 6 verificações externas por worker |
+| `JARVIS_BARGE_IN_ENABLED` | `false`; requer modo `elevenlabs-stt` e aceite de áudio |
 | `JARVIS_LOG_LEVEL` | `info`; aceita `warn`/`error` |
 
 O limite de turnos é reservado antes de abrir uma sessão paga; falhas de conexão
@@ -170,8 +209,10 @@ Saving/Data Retention e STT; ausência de gravação local não garante retenç�
 na ElevenLabs. Revogar impede novos envios, mas não recolhe áudio já enviado.
 
 Logs mostram só eventos técnicos, horário e incidentes de oito hexadecimais
-maiúsculos. `/status` mostra contadores, não valores de créditos ou métricas de
-latência inventadas. No diagnóstico, apenas o criador vê contadores por Discord
+maiúsculos. As etapas medem fila, abertura/reutilização, primeiro áudio, início e
+drenagem de playback e liberação do turno; ausência de evento não vira duração
+inventada. `/status` mostra contadores e durações locais agregadas, sem afirmar
+latência acústica ou crédito disponível. No diagnóstico, apenas o criador vê contadores por Discord
 ID em resposta privada, para verificar atribuição; não se imprime conteúdo falado.
 SIGINT/SIGTERM cancelam recepção, uploads, WS, sessões, playback e conexão Discord,
 com prazo de saída de 8 s. Não execute duas instâncias com o mesmo bot/guild.
@@ -186,16 +227,15 @@ uma credencial do worker. Salas existentes não são migradas automaticamente.
 `npm ci && npm run build`, `npm run start` e uma instância. O serviço Python
 existente foi preservado. O worker não requer HTTP público ou disco.
 
-**Não sincronize o Blueprint para criar o serviço antes de revisar o custo e
-autorizar a contratação/deploy.** `autoDeployTrigger: off` desliga deploys
-automáticos posteriores; não impede a criação/deploy inicial do worker pago.
-No dashboard do Render, escolha plano/região após os testes, configure as cinco
-variáveis privadas e demais opcionais, mantenha uma instância e faça deploy manual
-autorizado. Uma implantação com sobreposição de instâncias pode disputar a conexão
+O worker já existente recebe deploy manual do commit revisado. Preserve
+plano/região, variáveis privadas e uma instância; não sincronize o Blueprint para
+criar outro serviço. `autoDeployTrigger: off` desliga deploys automáticos
+posteriores, mas não impede criação inicial de worker. Uma implantação com sobreposição de instâncias pode disputar a conexão
 do mesmo bot; confirme que o processo anterior terminou antes de iniciar o teste.
 Não foi criado ou contratado serviço remoto durante esta implementação.
 
-Após deploy, valide `/status`, `/tone`, `/ask`, matriz DAVE, duas pessoas, wake,
-revogação, reconexão e reinicialização. Não aprove o Gate E apenas pelo build.
+Após deploy, valide cinco perguntas consecutivas, `/status`, `/tone`, `/ask`,
+matriz DAVE, duas pessoas, wake, revogação, barge-in opcional e reconexão. O
+[gate V4](docs/V4_CONVERSATION_VALIDATION.md) exige chamada real; build não o aprova.
 Veja [Render Workers](https://render.com/docs/background-workers) e
 [Blueprint spec](https://render.com/docs/blueprint-spec).

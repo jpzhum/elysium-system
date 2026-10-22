@@ -118,7 +118,8 @@ function setup(pendingPlayback = false) {
   };
   const finishPlayback = () => { allowFinish = true; for (const stream of streams) stream.finish(); };
   return { manager, speaker, socket, metrics, logs, audio, text, complete, ping, tool,
-    playback, copies, streams, consent, finishPlayback, failed, detectWake };
+    playback, copies, streams, consent, finishPlayback, failed, detectWake,
+    ask: async () => { const receipt = await manager.ask(speaker, secret); await settle(); return receipt; } };
 }
 
 afterEach(() => {
@@ -128,7 +129,7 @@ afterEach(() => {
 
 test('documented audio starts before completion and repeated event IDs preserve all PCM in arrival order', async () => {
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.text(); h.audio(1, 1); h.audio(1, 3);
   await settle();
   expect(h.copies).toEqual([Buffer.from([1, 0, 2, 0]), Buffer.from([3, 0, 4, 0])]);
@@ -147,7 +148,7 @@ test('documented audio starts before completion and repeated event IDs preserve 
 test('missing completion recovers after inactivity, drains valid audio and never claims a successful conversation turn', async () => {
   vi.useFakeTimers();
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); await settle();
   expect(h.copies).toHaveLength(1);
   await vi.advanceTimersByTimeAsync(44_000);
@@ -168,14 +169,14 @@ test('missing completion recovers after inactivity, drains valid audio and never
   expect(h.playback.startStream).toHaveBeenCalledOnce();
 });
 
-test('generation completion and local playback drain are independent, and new asks stay busy until both', async () => {
+test('generation completion and playback drain are independent; new asks are queued until local drain', async () => {
   const h = setup(true);
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); h.complete(); await settle();
   expect(h.streams[0]!.ended).toBe(true);
   expect(h.metrics.snapshot().agent_responses_completed).toBe(1);
   expect(h.metrics.snapshot().agent_turns_completed ?? 0).toBe(0);
-  await expect(h.manager.ask(h.speaker, secret)).rejects.toMatchObject({ code: 'busy' });
+  await expect(h.manager.ask(h.speaker, secret)).resolves.toMatchObject({ queued: true, position: 1 });
   h.finishPlayback(); await settle();
   expect(h.metrics.snapshot()).toMatchObject({ playback_completed: 1, agent_turns_completed: 1 });
 });
@@ -183,7 +184,7 @@ test('generation completion and local playback drain are independent, and new as
 test('no provider output identifies the primary timeout without cleanup creating a second provider error', async () => {
   vi.useFakeTimers();
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   await vi.advanceTimersByTimeAsync(45_001); await settle();
   expect(h.failed('AGENT_RESPONSE_TIMEOUT')).toMatchObject({ text_received: false, audio_chunks: 0 });
   expect(h.metrics.snapshot().agent_errors ?? 0).toBe(0);
@@ -193,7 +194,7 @@ test('no provider output identifies the primary timeout without cleanup creating
 test.each([true, false])('detects text without audio, with completion=%s', async completed => {
   vi.useFakeTimers();
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.text();
   if (completed) h.complete();
   else await vi.advanceTimersByTimeAsync(45_001);
@@ -205,7 +206,7 @@ test.each([true, false])('detects text without audio, with completion=%s', async
 
 test('explicit completion with no text and no audio is an empty response', async () => {
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.complete(); await settle();
   expect(h.failed('AGENT_EMPTY_RESPONSE')).toMatchObject({ completion_received: true });
   expect(h.metrics.snapshot().agent_responses_completed).toBe(1);
@@ -214,7 +215,7 @@ test('explicit completion with no text and no audio is an empty response', async
 
 test('malformed completion cancels progressive output without accepting a fabricated generation end', async () => {
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); await settle();
   h.socket.event({ type: 'agent_response_complete', agent_response_complete_event: { event_id: secret } });
   await settle();
@@ -228,7 +229,7 @@ test('malformed completion cancels progressive output without accepting a fabric
 test.each(['close', 'error'])('premature WebSocket %s drains validated queued audio and records one primary error', async kind => {
   vi.useFakeTimers();
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(1, 1); h.audio(1, 3);
   if (kind === 'close') h.socket.close();
   else h.socket.emit('error', new Error(secret));
@@ -245,7 +246,7 @@ test.each(['close', 'error'])('premature WebSocket %s drains validated queued au
 test('a primary provider error stays singular even when teardown emits close', async () => {
   vi.useFakeTimers();
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.socket.event({ type: 'client_error', error_event: { code: 401, message: secret } });
   await vi.advanceTimersByTimeAsync(46_000); await settle();
   h.failed('AGENT_AUTHENTICATION_FAILED');
@@ -255,7 +256,7 @@ test('a primary provider error stays singular even when teardown emits close', a
 
 test('socket closure after explicit completion preserves queued full output', async () => {
   const h = setup(true);
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); h.complete(); await settle();
   h.socket.close(); await settle();
   expect(h.metrics.snapshot().playback_completed ?? 0).toBe(0);
@@ -267,7 +268,7 @@ test('socket closure after explicit completion preserves queued full output', as
 
 test('revocation cancels progressive and queued output immediately and fences late provider events', async () => {
   const h = setup(true);
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); await settle();
   h.consent.revoke(h.speaker.discordUserId);
   h.manager.revoke(h.speaker.discordUserId);
@@ -281,9 +282,9 @@ test('revocation cancels progressive and queued output immediately and fences la
 
 test('an old duplicate completion cannot seal the next question but does not block progressive audio', async () => {
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); h.complete(3); await settle();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); h.complete(3); await settle();
   expect(h.playback.startStream).toHaveBeenCalledTimes(2);
   expect(h.streams[1]!.ended).toBe(false);
@@ -295,7 +296,7 @@ test('an old duplicate completion cannot seal the next question but does not blo
 test('pending tools suspend response inactivity recovery and multiple messages remain on one ordered stream', async () => {
   vi.useFakeTimers();
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.text(); h.audio(); h.tool(true); await settle();
   for (let interval = 0; interval < 3; interval++) { await vi.advanceTimersByTimeAsync(35_000); h.ping(); }
   expect(h.manager.activeCount).toBe(1);
@@ -309,7 +310,7 @@ test('pending tools suspend response inactivity recovery and multiple messages r
 
 test('completion received while a tool is pending waits for its response before ending ingress', async () => {
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); h.tool(true); h.complete(); await settle();
   expect(h.streams[0]!.ended).toBe(false);
   expect(h.metrics.snapshot().agent_responses_completed).toBe(1);
@@ -321,7 +322,7 @@ test('completion received while a tool is pending waits for its response before 
 test('hard session TTL bounds pending tools and cancels output even when pings keep the provider alive', async () => {
   vi.useFakeTimers();
   const h = setup(true);
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); h.tool(true); await settle();
   for (let interval = 0; interval < 8; interval++) { await vi.advanceTimersByTimeAsync(35_000); h.ping(); }
   await vi.advanceTimersByTimeAsync(20_001); await settle();
@@ -334,14 +335,14 @@ test('hard session TTL bounds pending tools and cancels output even when pings k
 test('audio progress supports long generation while transport pings alone do not reset response inactivity', async () => {
   vi.useFakeTimers();
   const h = setup();
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   h.audio(); await settle();
   await vi.advanceTimersByTimeAsync(30_000); h.audio(1, 3); await settle();
   await vi.advanceTimersByTimeAsync(30_000); h.audio(1, 5); h.complete(); await settle();
   expect(h.copies).toHaveLength(3);
   expect(h.metrics.snapshot()).toMatchObject({ playback_completed: 1, agent_turns_completed: 1 });
   expect(h.metrics.snapshot().agent_response_timeouts ?? 0).toBe(0);
-  await h.manager.ask(h.speaker, secret);
+  await h.ask();
   await vi.advanceTimersByTimeAsync(40_000); h.ping();
   await vi.advanceTimersByTimeAsync(5_001); await settle();
   h.failed('AGENT_RESPONSE_TIMEOUT');
@@ -349,7 +350,7 @@ test('audio progress supports long generation while transport pings alone do not
 
 test('local playback backpressure is not mistaken for provider inactivity', async () => {
   vi.useFakeTimers();
-  const h = setup(); await h.manager.ask(h.speaker, secret);
+  const h = setup(); await h.ask();
   h.audio(); await settle();
   let release!: () => void;
   const capacity = new Promise<void>((resolve) => { release = resolve; });
@@ -366,7 +367,7 @@ test('local playback backpressure is not mistaken for provider inactivity', asyn
 
 test('provider heartbeat failure drains valid audio and keeps one specific primary diagnostic', async () => {
   vi.useFakeTimers();
-  const h = setup(); await h.manager.ask(h.speaker, secret);
+  const h = setup(); await h.ask();
   h.audio(); h.tool(true); await settle();
   await vi.advanceTimersByTimeAsync(100_001); await settle();
   h.failed('AGENT_HEARTBEAT_TIMEOUT');

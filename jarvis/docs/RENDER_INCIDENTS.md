@@ -14,6 +14,11 @@ bytes, mas o Jarvis os reteve até falhar em 45 segundos. Há áudio disponível
 o bloqueio local estava na dependência exclusiva do evento de conclusão.
 A causa de o provedor não emitir esse evento continua sem comprovação.
 
+No pedido V4, o operador confirmou que a reprodução progressiva já funciona em
+chamada real e que `/ask` responde com voz. O incidente seguinte é o bloqueio
+indevido da próxima pergunta enquanto o turno continua sem conclusão. Essa
+confirmação não aprova a fila, o wake ou o barge-in da V4.
+
 Defeito comprovado no código anterior: timeout removia a sessão, abortava o WS e
 o callback desse cancelamento incrementava `agent_errors` incondicionalmente.
 Assim, o timeout podia gerar um erro secundário sem outra falha do provedor.
@@ -41,10 +46,17 @@ backpressure. O SDK oficial também inicia playback sem esperar conclusão.
 esvaziamento local da reprodução são estados separados. Nenhum silêncio ou
 timeout confirma geração completa. Após 45 s sem progresso e sem ferramenta
 pendente, a recuperação fecha o transporte, drena os blocos válidos recebidos e
-encerra o resultado como **não confirmado**, sem follow-up. Ferramentas pendentes
+encerra o resultado como **não confirmado**. Ferramentas pendentes
 esperam os limites absolutos; expiração, revogação e desconexão cancelam a reprodução.
+Na V4, uma pergunta em espera também pode retirar a sessão anterior após mensagem
+textual, saída local drenada e nenhuma ferramenta conhecida pendente. O áudio
+aceito antes do corte drena; a nova sessão fica isolada e o resultado anterior
+permanece sem confirmação. Outra mensagem futura ou ferramenta não sinalizada
+pode ser abandonada; o contexto remoto não é preservado automaticamente.
+A janela de follow-up após drenagem autoriza reconhecer nova fala consentida do
+mesmo participante, sem confirmar o fim da geração.
 Veja a [pesquisa oficial e do SDK](ELEVENLABS_STREAMING_RESEARCH.md) e o
-[roteiro completo de validação](STREAMING_PRODUCTION_VALIDATION.md).
+[roteiro V4 de cinco perguntas e voz](V4_CONVERSATION_VALIDATION.md).
 
 ## Preparar e implantar a revisão
 
@@ -61,7 +73,7 @@ Veja a [pesquisa oficial e do SDK](ELEVENLABS_STREAMING_RESEARCH.md) e o
    instância. Não execute outra cópia local com o mesmo token/guild.
 5. Use `JARVIS_LOG_LEVEL=info` para acompanhar as etapas. Falhas também são
    registradas em nível `error`, com o snapshot relevante mesmo se info for filtrado.
-6. Confirme `jarvis_ready` com `diagnostics_version: 3` nos logs do processo novo.
+6. Confirme `jarvis_ready` com `diagnostics_version: 4` nos logs do processo novo.
    Esse marcador confirma a instrumentação, não conexão de voz ou resposta audível.
 
 Não há variável nova obrigatória. Credenciais continuam exclusivamente no
@@ -116,6 +128,10 @@ em [VOICE_NEGOTIATION_NOTES.md](VOICE_NEGOTIATION_NOTES.md).
    reprodução local terminou sem rejeição; não mede o que uma pessoa ouviu.
 7. Teste revogação durante espera/playback: não pode haver novo upload/reprodução
    após revogar. Repita com outro participante, respeitando seu próprio aceite.
+8. Faça cinco perguntas consecutivas sem esperar 45 s entre elas, acompanhando
+   `questions_received`, `questions_queued`, `questions_started`, cancelamentos e
+   `agent_turns_superseded`. Valide voz e barge-in separadamente conforme o
+   [roteiro V4](V4_CONVERSATION_VALIDATION.md).
 
 | Observação nova | Interpretação verificável / próxima checagem |
 | --- | --- |

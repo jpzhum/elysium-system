@@ -5,6 +5,29 @@ const base = { JARVIS_DISCORD_TOKEN: 'fictional-discord-token-for-tests', JARVIS
   JARVIS_GUILD_ID: '100000000000000002', ELEVENLABS_AGENT_ID: 'agent_test', ELEVENLABS_API_KEY: 'fictional-api-key' };
 test('default is no voice capture; Elysium variables are unrelated', () => {
   expect(loadConfig(base).JARVIS_VOICE_INPUT).toBe('disabled');
+  expect(loadConfig(base).JARVIS_BARGE_IN_ENABLED).toBe(false);
+  expect(loadConfig(base).JARVIS_MAX_QUEUED_TURNS).toBe(8);
+  expect(loadConfig(base).JARVIS_MAX_QUEUED_PER_USER).toBe(2);
+  expect(loadConfig(base).JARVIS_QUESTION_QUEUE_TTL_SECONDS).toBe(60);
+});
+
+test('barge-in is an explicit opt-in requiring experimental external voice input', () => {
+  expect(loadConfig({ ...base, JARVIS_VOICE_INPUT: 'elevenlabs-stt', JARVIS_BARGE_IN_ENABLED: 'false' })
+    .JARVIS_BARGE_IN_ENABLED).toBe(false);
+  expect(loadConfig({ ...base, JARVIS_VOICE_INPUT: 'elevenlabs-stt', JARVIS_BARGE_IN_ENABLED: 'true' })
+    .JARVIS_BARGE_IN_ENABLED).toBe(true);
+  expect(() => loadConfig({ ...base, JARVIS_BARGE_IN_ENABLED: 'true' })).toThrow(ConfigError);
+  expect(() => loadConfig({ ...base, JARVIS_BARGE_IN_ENABLED: 'yes' })).toThrow(ConfigError);
+  expect(() => loadConfig({ ...base, JARVIS_VOICE_INPUT: 'elevenlabs-stt', JARVIS_BARGE_IN_ENABLED: 'true' }, true))
+    .toThrow(ConfigError);
+});
+
+test.each([
+  ['JARVIS_MAX_QUEUED_TURNS', '17'], ['JARVIS_MAX_QUEUED_TURNS', '0'],
+  ['JARVIS_MAX_QUEUED_PER_USER', '5'], ['JARVIS_MAX_QUEUED_PER_USER', '0'],
+  ['JARVIS_QUESTION_QUEUE_TTL_SECONDS', '9'], ['JARVIS_QUESTION_QUEUE_TTL_SECONDS', '121'],
+])('rejects unbounded or ineffective question queues: %s', (key, value) => {
+  expect(() => loadConfig({ ...base, [key]: value })).toThrow(ConfigError);
 });
 test.each(['not-a-discord-id', '18446744073709551616', '1', '-100000000000000001'])('invalid snowflake cannot leak value: %s', (id) => {
   try { loadConfig({ ...base, JARVIS_OWNER_USER_ID: id }); throw new Error('unexpected'); }

@@ -12,11 +12,12 @@ import { ConsentStore } from '../policy/consent.js';
 import { speakerContext, type SpeakerContext } from '../policy/identity.js';
 import { promptVariables } from '../agents/prompt-context.js';
 import { connectAgent } from '../agents/elevenlabs-client.js';
-import { SessionError, SessionManager } from '../agents/session-manager.js';
+import { SessionError, SessionManager, type TurnNotification, type TurnReceipt } from '../agents/session-manager.js';
 import { ElevenWakeDetector } from '../agents/wake-detector.js';
 import { searchGameInfo } from '../tools/game-search.js';
 import { PlaybackQueue } from '../audio/playback.js';
 import { rms } from '../audio/voice-activity.js';
+import { PlaybackEchoGuard } from '../audio/echo-guard.js';
 import { VoiceConnectionManager } from './voice-connection.js';
 import { VoiceReceiver } from './voice-receiver.js';
 import { jarvisCommand, privacyNotice } from './commands.js';
@@ -29,6 +30,8 @@ interface Room {
   playback: PlaybackQueue;
   sessions: SessionManager;
   probe: Map<string, { turns: number; seconds: number; rms: number }>;
+  echo: PlaybackEchoGuard;
+  interruptions: Map<string, AbortController>;
 }
 
 export class JarvisBot {
@@ -43,7 +46,7 @@ export class JarvisBot {
 
   constructor(private readonly config: Config, private readonly logger: Logger) {
     this.wake = new ElevenWakeDetector(config.ELEVENLABS_API_KEY ?? '', config.JARVIS_WAKE_WORD,
-      config.JARVIS_MAX_WAKE_CHECKS_PER_MINUTE, this.metrics.add);
+      config.JARVIS_MAX_WAKE_CHECKS_PER_MINUTE, this.metrics.record);
     this.client.once(Events.ClientReady, () => {
       void this.ready().catch(() => { this.logger.event('command_registration_failed', 'error'); void this.stop(); });
     });
@@ -69,7 +72,7 @@ export class JarvisBot {
     if (this.closed) return;
     // Create/upsert only Jarvis; do not bulk replace other application commands.
     await guild.commands.create(jarvisCommand.toJSON());
-    this.logger.event(this.config.daveSmoke ? 'dave_probe_ready' : 'jarvis_ready', 'info', { diagnostics_version: 3 });
+    this.logger.event(this.config.daveSmoke ? 'dave_probe_ready' : 'jarvis_ready', 'info', { diagnostics_version: 4 });
   }
 
   private async reply(interaction: ChatInputCommandInteraction, content: string, ephemeral = true): Promise<void> {
@@ -108,7 +111,8 @@ export class JarvisBot {
     const diagnostic = command === 'join' ? new JoinDiagnostics(this.logger) : undefined;
     try {
       if (command === 'privacy') {
-        await this.reply(interaction, privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke, this.config.JARVIS_FOLLOWUP_SECONDS)); return;
+        await this.reply(interaction, privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke,
+          this.config.JARVIS_FOLLOWUP_SECONDS, this.config.JARVIS_BARGE_IN_ENABLED)); return;
       }
       if (command === 'status') {
         const room = this.room;
@@ -119,12 +123,15 @@ export class JarvisBot {
         }
         const snapshot = this.metrics.snapshot();
         // Streaming evidence remains visible even when legacy counters fill the reply.
-        const streaming = ['audio_stream_started', 'audio_chunks_received', 'audio_chunks_played',
+        const streaming = ['questions_received', 'questions_queued', 'questions_cancelled', 'turn_queue_depth',
+          'agent_turns_superseded', 'agent_first_audio_ms_last', 'agent_first_playback_ms_last',
+          'next_question_ready_ms_last', 'audio_stream_started', 'audio_chunks_received', 'audio_chunks_played',
           'audio_stream_buffer_bytes', 'playback_started', 'playback_completed', 'agent_response_received',
           'agent_response_complete_received', 'turn_completion_missing', 'playback_failed'];
         const counters = JSON.stringify({ ...Object.fromEntries(streaming.map((name) => [name, snapshot[name] ?? 0])), ...snapshot });
         await this.reply(interaction, `${room ? 'Conectado' : 'Desconectado'}; modo: ${this.config.daveSmoke
-          ? 'diagnóstico DAVE local' : this.config.JARVIS_VOICE_INPUT}; sessões: ${room?.sessions.activeCount ?? 0}.`
+          ? 'diagnóstico DAVE local' : this.config.JARVIS_VOICE_INPUT}; sessões: ${room?.sessions.activeCount ?? 0};`
+          + ` perguntas na fila: ${room?.sessions.queuedCount ?? 0}; interrupção por voz: ${this.config.JARVIS_BARGE_IN_ENABLED ? 'experimental' : 'desativada'}.`
           + `\nContadores (não estimam créditos): ${counters}${probe}`.slice(0, 1750)); return;
       }
       if (command === 'revoke') {
@@ -141,7 +148,8 @@ export class JarvisBot {
         diagnostic!.stage('channel_lookup');
         await this.join(interaction, diagnostic);
         diagnostic!.stage('join_reply');
-        await this.reply(interaction, 'Jarvis conectado. ' + privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke, this.config.JARVIS_FOLLOWUP_SECONDS), false);
+        await this.reply(interaction, 'Jarvis conectado. ' + privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke,
+          this.config.JARVIS_FOLLOWUP_SECONDS, this.config.JARVIS_BARGE_IN_ENABLED), false);
         diagnostic!.success();
         return;
       }
@@ -151,6 +159,10 @@ export class JarvisBot {
         await this.reply(interaction, 'Jarvis desconectado; consentimentos e buffers apagados.'); return;
       }
       const room = this.requireRoom(interaction);
+      if (command === 'cancel') {
+        room.sessions.cancelUser(interaction.user.id);
+        await this.reply(interaction, 'Suas perguntas pendentes e sua resposta em andamento foram canceladas.'); return;
+      }
       if (command === 'tone') {
         authorize(interaction.user.id, 'configure', this.config.JARVIS_OWNER_USER_ID);
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -168,7 +180,8 @@ export class JarvisBot {
         this.revoke(room, interaction.user.id);
         room.consent.grant(interaction.user.id, audio);
         await this.reply(interaction, (audio ? 'Aceite de áudio registrado. ' : 'Aceite de perguntas escritas registrado. ')
-          + privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke, this.config.JARVIS_FOLLOWUP_SECONDS)); return;
+          + privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke,
+            this.config.JARVIS_FOLLOWUP_SECONDS, this.config.JARVIS_BARGE_IN_ENABLED)); return;
       }
       if (command === 'ask') {
         if (this.config.daveSmoke) { await this.reply(interaction, 'Diagnóstico DAVE não conecta à ElevenLabs.'); return; }
@@ -176,8 +189,22 @@ export class JarvisBot {
         const speaker = this.context(room, interaction.member);
         if (!speaker.consented) { await this.reply(interaction, 'Leia /jarvis privacy e aceite com /jarvis consent.'); return; }
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        await room.sessions.ask(speaker, interaction.options.getString('texto', true));
-        await this.reply(interaction, 'Pergunta enviada. A resposta será falada nesta chamada.');
+        let acknowledge!: () => void;
+        const acknowledged = new Promise<void>((resolve) => { acknowledge = resolve; });
+        let receipt: TurnReceipt | undefined;
+        try {
+          receipt = await room.sessions.ask(speaker, interaction.options.getString('texto', true), async (event) => {
+            if (event.type === 'queued') return;
+            await acknowledged;
+            // Replies contain only status. Do not re-send questions or provider text.
+            if (event.type === 'started' && (!receipt?.queued || this.closed || this.room !== room)) return;
+            const content = this.turnNotice(event);
+            if (content) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+          });
+          await this.reply(interaction, receipt.queued
+            ? `Pergunta enfileirada (posição ${receipt.position}). Avisarei quando começar ou for cancelada.`
+            : 'Pergunta aceita. A resposta será falada nesta chamada.');
+        } finally { acknowledge(); }
       }
     } catch (error) {
       // Report before attempting a Discord response, which can fail independently.
@@ -256,11 +283,13 @@ export class JarvisBot {
       connection = await this.voice.join(channel, diagnostic);
       if (this.closed || this.epoch !== epoch) { this.voice.leave(); throw new SessionError('closed'); }
       diagnostic?.stage('playback_setup');
+      const echo = new PlaybackEchoGuard();
       const playback = new PlaybackQueue(connection, { maxQueue: 4, maxSeconds: 120,
-        maxBufferBytes: 384 * 1024, onMetric: this.metrics.add });
+        maxBufferBytes: 384 * 1024, onMetric: this.metrics.record,
+        onPcmFrame: (pcm) => { if (this.config.JARVIS_BARGE_IN_ENABLED) echo.remember(pcm); } });
       const consent = new ConsentStore();
       // Closure is assigned before any receiver subscriptions are started.
-      const room = { channel, consent, playback, probe: new Map() } as Room;
+      const room = { channel, consent, playback, echo, probe: new Map(), interruptions: new Map() } as Room;
       initialized = room;
       diagnostic?.stage('session_setup');
       room.sessions = new SessionManager({
@@ -285,18 +314,30 @@ export class JarvisBot {
         maxTurnSeconds: this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN,
         maxSessionSeconds: this.config.JARVIS_MAX_SESSION_SECONDS,
         idleSeconds: this.config.JARVIS_SESSION_IDLE_SECONDS, followupSeconds: this.config.JARVIS_FOLLOWUP_SECONDS,
-        maxTurnsPerHour: this.config.JARVIS_MAX_TURNS_PER_HOUR, metric: this.metrics.add, logger: this.logger,
+        maxTurnsPerHour: this.config.JARVIS_MAX_TURNS_PER_HOUR, metric: this.metrics.record, logger: this.logger,
+        maxQueuedTurns: this.config.JARVIS_MAX_QUEUED_TURNS,
+        maxQueuedPerUser: this.config.JARVIS_MAX_QUEUED_PER_USER,
+        queueTtlSeconds: this.config.JARVIS_QUESTION_QUEUE_TTL_SECONDS,
+        notify: async (speaker, event) => {
+          if (event.type === 'started') return;
+          if ((this.room !== room || this.closed) && event.type !== 'cancelled' && event.type !== 'failed') return;
+          const content = this.turnNotice(event);
+          if (content) await channel.send({ content: `<@${speaker.discordUserId}> ${content}`, allowedMentions: { parse: [] } });
+        },
       });
       diagnostic?.stage('receiver_setup');
       room.receiver = new VoiceReceiver(connection, {
         ownUserId: this.client.user!.id, maxTurnSeconds: this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN,
-        isPlaying: () => playback.isPlaying,
+        isPlaying: () => playback.isAudible,
+        playbackToken: () => playback.currentStreamToken,
+        canBargeIn: (id) => this.config.JARVIS_BARGE_IN_ENABLED && !this.config.daveSmoke
+          && id === this.config.JARVIS_OWNER_USER_ID && this.room === room && Boolean(consent.get(id)?.audio),
         canReceive: (id) => {
           const member = channel.members.get(id);
           return this.room === room && Boolean(member && !member.user.bot && consent.get(id)?.audio)
             && (this.config.daveSmoke || this.config.JARVIS_VOICE_INPUT === 'elevenlabs-stt');
         },
-        onTurn: (id, pcm) => {
+        onTurn: async (id, pcm, timing) => {
           const member = channel.members.get(id);
           if (!member || this.room !== room || !consent.get(id)?.audio) return;
           if (this.config.daveSmoke) {
@@ -305,12 +346,29 @@ export class JarvisBot {
             room.probe.set(id, { turns: prior.turns + 1, seconds: prior.seconds + pcm.length / 192_000, rms: rms(pcm) });
             return;
           }
-          void room.sessions.voiceTurn(this.context(room, member), pcm).catch(() => this.metrics.add('voice_turn_rejected'));
-        }, onMetric: this.metrics.add,
+          if (timing.duringPlayback) {
+            await this.voiceInterruption(room, member, pcm, timing.playbackToken);
+            return;
+          }
+          try { await room.sessions.voiceTurn(this.context(room, member), pcm); }
+          catch {
+            this.metrics.add('voice_turn_rejected');
+            if (this.room === room && consent.get(id)?.audio) {
+              await channel.send({ content: `<@${id}> Não foi possível aceitar a pergunta de voz. Confira /jarvis status ou use /jarvis ask.`,
+                allowedMentions: { parse: [] } }).catch(() => this.metrics.add('turn_notification_failed'));
+            }
+          }
+        }, onMetric: this.metrics.record,
       });
       this.room = room;
       connection.on('stateChange', (_oldState, state) => {
         if (state.status === VoiceConnectionStatus.Destroyed && this.room === room) this.reset();
+        else if (this.room === room && state.status === VoiceConnectionStatus.Disconnected) {
+          for (const abort of room.interruptions.values()) abort.abort();
+          room.interruptions.clear();
+          room.echo.clear();
+          room.sessions.setAvailable(false);
+        } else if (this.room === room && state.status === VoiceConnectionStatus.Ready) room.sessions.setAvailable(true);
       });
       room.receiver.start();
       this.metrics.add('voice_joins');
@@ -324,6 +382,7 @@ export class JarvisBot {
           () => initialized?.receiver?.stop(),
           () => initialized?.sessions?.close(),
           () => initialized?.playback.stop(),
+          () => initialized?.echo.clear(),
           () => this.voice.leave(),
         ];
         for (const action of cleanup) {
@@ -338,6 +397,8 @@ export class JarvisBot {
   }
 
   private revoke(room: Room, userId: string): void {
+    room.interruptions.get(userId)?.abort();
+    room.interruptions.delete(userId);
     room.consent.revoke(userId);
     room.receiver.stopUser(userId);
     room.sessions.revoke(userId);
@@ -348,13 +409,44 @@ export class JarvisBot {
     const room = this.room;
     this.room = undefined;
     if (room) {
+      for (const abort of room.interruptions.values()) abort.abort();
+      room.interruptions.clear();
       room.consent.clear();
       room.receiver.stop();
       room.sessions.close();
       room.playback.stop();
       room.probe.clear();
+      room.echo.clear();
     }
     this.voice.leave();
+  }
+
+  private turnNotice(event: TurnNotification): string | undefined {
+    if (event.type === 'queued') return `Pergunta de voz enfileirada (posição ${event.position ?? 1}).`;
+    if (event.type === 'started') return 'Sua pergunta saiu da fila e está sendo atendida.';
+    if (event.type === 'failed') return 'Não foi possível responder à sua pergunta. Tente novamente ou confira /jarvis status.';
+    if (event.reason === 'expired') return 'Sua pergunta foi cancelada porque o prazo na fila expirou.';
+    if (event.type === 'cancelled') return 'Sua pergunta ou resposta pendente foi cancelada.';
+    return undefined;
+  }
+
+  private async voiceInterruption(room: Room, member: GuildMember, pcm: Buffer, playbackToken?: number): Promise<void> {
+    const speaker = this.context(room, member);
+    if (!this.config.JARVIS_BARGE_IN_ENABLED || member.id !== this.config.JARVIS_OWNER_USER_ID
+      || !speaker.isOwner || !this.allowed(room, speaker, true) || room.interruptions.has(member.id)
+      || playbackToken === undefined || room.playback.currentStreamToken !== playbackToken || !room.playback.isAudible) return;
+    if (room.echo.isLikelyEcho(pcm)) { this.metrics.add('barge_in_echo_rejected'); return; }
+    const abort = new AbortController();
+    room.interruptions.set(member.id, abort);
+    try {
+      const result = await this.wake.inspect(pcm, abort.signal, { allowInterruption: true });
+      if (!abort.signal.aborted && this.allowed(room, speaker, true) && result.interrupt
+        && room.playback.currentStreamToken === playbackToken && room.playback.isAudible
+        && this.voice.connection?.state.status === VoiceConnectionStatus.Ready) {
+        room.sessions.interruptOwner(speaker);
+      } else this.metrics.add('barge_in_not_confirmed');
+    } catch { if (!abort.signal.aborted) this.metrics.add('barge_in_failed'); }
+    finally { if (room.interruptions.get(member.id) === abort) room.interruptions.delete(member.id); }
   }
   async stop(): Promise<void> {
     if (this.closed) return;

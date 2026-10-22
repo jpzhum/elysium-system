@@ -4,6 +4,7 @@ interface Options {
   maxSeconds: number;
   onBufferDelta?: (delta: number) => void;
   onChunkPlayed?: () => void;
+  onConversionMs?: (milliseconds: number) => void;
 }
 
 /** Bounded mono PCM ingress and continuous windowed-sinc resampling to 48 kHz stereo. */
@@ -16,6 +17,7 @@ export class StreamingPcm {
   private ended = false;
   private cancelled = false;
   private writing = false;
+  private waitingInput = false;
   private wake: (() => void) | undefined;
   private capacity: (() => void) | undefined;
   private readonly radius: number;
@@ -26,6 +28,8 @@ export class StreamingPcm {
   }
   get hasInput(): boolean { return this.samples > 0 || this.ended; }
   get bufferedBytes(): number { return this.bytes; }
+  /** No further complete frame can be generated without new input; not generation completion. */
+  get waitingForInput(): boolean { return this.waitingInput; }
 
   async write(pcm: Buffer, allowed: () => boolean): Promise<void> {
     if (!pcm.length || pcm.length % 2 !== 0) throw new Error('Formato PCM de reprodução inválido.');
@@ -69,6 +73,11 @@ export class StreamingPcm {
   async *frames(): AsyncGenerator<Buffer> {
     let frame = Buffer.alloc(960 * 4);
     let frameSamples = 0;
+    let computingSince: number | undefined = performance.now();
+    const measure = () => {
+      if (computingSince !== undefined) this.options.onConversionMs?.(Math.max(0, performance.now() - computingSince));
+      computingSince = undefined;
+    };
     try {
       while (!this.cancelled) {
         const total = Math.floor(this.samples * 48_000 / this.sampleRate);
@@ -76,7 +85,11 @@ export class StreamingPcm {
         if (this.ended && this.outputFrame >= total) break;
         // Lookahead preserves filter state across arbitrary provider chunk boundaries.
         if (!this.ended && Math.floor(position) + this.radius >= this.samples) {
+          measure();
+          this.waitingInput = true;
           await new Promise<void>((resolve) => { this.wake = resolve; });
+          this.waitingInput = false;
+          computingSince = performance.now();
           continue;
         }
         const value = this.interpolate(position);
@@ -87,15 +100,21 @@ export class StreamingPcm {
         this.release(Math.floor(this.outputFrame * this.sampleRate / 48_000) - this.radius + 1);
         if (this.ended && this.outputFrame >= total) this.release(Infinity);
         if (frameSamples === 960) {
+          measure();
           yield frame;
+          computingSince = performance.now();
           frame = Buffer.alloc(960 * 4);
           frameSamples = 0;
         }
       }
       // Only an explicit ingress end pads the final partial frame, never a gap.
-      if (!this.cancelled && frameSamples > 0) yield frame;
+      if (!this.cancelled && frameSamples > 0) {
+        measure();
+        yield frame;
+        computingSince = performance.now();
+      }
       if (!this.cancelled) this.release(Infinity);
-    } finally { frame.fill(0); }
+    } finally { this.waitingInput = false; measure(); frame.fill(0); }
   }
 
   private interpolate(position: number): number {

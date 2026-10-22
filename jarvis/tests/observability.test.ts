@@ -97,7 +97,7 @@ describe('bounded structured operational logging', () => {
     state.logger.event('jarvis_ready', 'info', {
       duration_ms: NaN, stage_duration_ms: -1, timeout_ms: Infinity, network_status: -1, previous_network_status: 7,
       websocket_close_code: 5_000, disconnect_reason: 1.5, dave_protocol_version: 65_536,
-      diagnostics_version: 4, pending_tools: 129,
+      diagnostics_version: 5, pending_tools: 129,
     });
     expect(Object.keys(state.records()[0]!)).toEqual(['time', 'level', 'event', 'incident']);
   });
@@ -257,7 +257,29 @@ test('stream gauges return to zero and fixed metric cardinality is bounded', () 
   const metrics = new Metrics();
   metrics.add('audio_stream_buffer_bytes', 384);
   metrics.add('audio_stream_buffer_bytes', -384);
-  for (let i = 0; i < 200; i++) metrics.add(`counter_${i}`);
+  for (let i = 0; i < 400; i++) metrics.add(`counter_${i}`);
   expect(metrics.snapshot().audio_stream_buffer_bytes).toBe(0);
-  expect(Object.keys(metrics.snapshot())).toHaveLength(128);
+  expect(Object.keys(metrics.snapshot())).toHaveLength(256);
+});
+
+test('latency samples retain units, count, extrema and last value without invented percentiles', () => {
+  const metrics = new Metrics();
+  metrics.record('opus_encode_ms', 0.25); metrics.record('opus_encode_ms', 0.75);
+  metrics.record('opus_encode_ms', -1); metrics.record('opus_encode_ms', NaN);
+  metrics.record('opus_encode_ms', Infinity); metrics.record('opus_encode_ms', 3_600_001);
+  metrics.record('turn_queue_depth', 2); metrics.record('turn_queue_depth', -2);
+  expect(metrics.snapshot()).toEqual({ opus_encode_ms: 1, opus_encode_ms_samples: 2,
+    opus_encode_ms_last: 0.75, opus_encode_ms_min: 0.25, opus_encode_ms_max: 0.75, turn_queue_depth: 0 });
+});
+
+test('queue and local drain diagnostics accept only bounded, reviewed state', () => {
+  const state = capture();
+  state.logger.event('jarvis_agent_turn_superseded', 'info', { queue_depth: 2, queue_position: 1,
+    local_playback_drained: true, playback_drained: false, turn_outcome: 'superseded',
+    first_audio_ms: 100, first_playback_ms: 140, last_audio_ms: 900, drain_ms: 950, next_question_ready_ms: 80 });
+  expect(state.records()[0]).toMatchObject({ local_playback_drained: true, playback_drained: false,
+    turn_outcome: 'superseded', queue_depth: 2, first_audio_ms: 100 });
+  state.logger.event('jarvis_turn_queue_changed', 'info', { queue_depth: 100, queue_position: -1,
+    turn_outcome: 'PRIVATE' as 'completed', first_audio_ms: NaN, question_wait_ms: -1 });
+  expect(Object.keys(state.records()[1]!)).toEqual(['time', 'level', 'event', 'incident']);
 });

@@ -15,6 +15,12 @@ export interface PlaybackStream {
   cancel(): void;
 }
 
+export interface PlaybackStreamOptions {
+  isAllowed?: () => boolean;
+  /** Local consumption observations, never confirmation of provider generation. */
+  onProgress?: (event: 'first_packet' | 'drained' | 'resumed', elapsedMs: number) => void;
+}
+
 export interface PlaybackOptions {
   maxQueue?: number;
   maxSeconds?: number;
@@ -22,10 +28,13 @@ export interface PlaybackOptions {
   /** Absolute resource lifetime, including queue and generation gaps. */
   maxWallMs?: number;
   onMetric?: (name: string, value: number) => void;
+  /** Ephemeral PCM reference; the recipient must finish synchronously or copy it. */
+  onPcmFrame?: (stereo48k: Buffer) => void;
   player?: AudioPlayer;
 }
 
 interface Playback {
+  token: number;
   userId: string;
   isOwner: boolean;
   source: StreamingPcm;
@@ -35,6 +44,11 @@ interface Playback {
   resource?: AudioResource;
   stream?: Readable;
   deadline?: NodeJS.Timeout;
+  drainTimer?: NodeJS.Timeout;
+  created: number;
+  firstPacket: boolean;
+  drained: boolean;
+  onProgress?: PlaybackStreamOptions['onProgress'];
   finished: boolean;
   settled: boolean;
   consumedChunks: number;
@@ -53,12 +67,14 @@ class GuardedStream extends Readable {
     private readonly allowed: () => boolean,
     private readonly denied: () => void,
     private readonly consumed: (packet: Buffer) => void,
+    private readonly starved: () => void,
   ) { super({ objectMode: true, highWaterMark: 2 }); }
 
   override read(size?: number): Buffer | null {
     if (!this.allowed()) { this.denied(); return null; }
     const packet = super.read(size) as Buffer | null;
     if (packet) this.consumed(packet);
+    else this.starved();
     return packet;
   }
 
@@ -88,6 +104,7 @@ export class PlaybackQueue {
   private active: Playback | undefined;
   private stopped = false;
   private disconnected = false;
+  private streamSequence = 0;
   private readonly maxQueue: number;
   private readonly maxSeconds: number;
   private readonly maxBufferBytes: number;
@@ -133,9 +150,12 @@ export class PlaybackQueue {
   }
 
   get isPlaying(): boolean { return this.active !== undefined || this.waiting.length > 0; }
+  /** An open provider stream can be locally drained while still awaiting generation. */
+  get isAudible(): boolean { return this.active !== undefined && !this.active.drained; }
+  get currentStreamToken(): number | undefined { return this.active?.token; }
 
   startStream(userId: string, sampleRate: number, isOwner: boolean,
-    options: { isAllowed?: () => boolean } = {}): PlaybackStream {
+    options: PlaybackStreamOptions = {}): PlaybackStream {
     if (this.stopped) this.rejectStart('Fila de áudio encerrada.', true);
     if (this.disconnected) this.rejectStart('Conexão de voz indisponível para reprodução.', true);
     if (this.waiting.length + Number(this.active !== undefined) >= this.maxQueue) this.rejectStart('Fila de áudio cheia.');
@@ -145,13 +165,16 @@ export class PlaybackQueue {
     const done = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
     void done.catch(() => undefined);
     const item: Playback = {
+      token: ++this.streamSequence,
       userId, isOwner, resolve, reject, finished: false, settled: false,
       consumedChunks: 0, packetChunks: new WeakMap(),
+      created: performance.now(), firstPacket: false, drained: false, onProgress: options.onProgress,
       allowed: () => !this.stopped && !this.disconnected && !item.settled && (options.isAllowed?.() ?? true),
       source: new StreamingPcm(sampleRate, {
         maxBufferBytes: this.maxBufferBytes, maxSeconds: this.maxSeconds,
         onBufferDelta: (delta) => this.options.onMetric?.('audio_stream_buffer_bytes', delta),
         onChunkPlayed: () => { item.consumedChunks++; },
+        onConversionMs: (value) => this.options.onMetric?.('pcm_conversion_ms', value),
       }),
     };
     const guestIndex = this.waiting.findIndex((queued) => !queued.isOwner);
@@ -164,6 +187,7 @@ export class PlaybackQueue {
       write: async (pcm) => {
         try {
           if (!item.allowed()) throw new PlaybackCancelledError();
+          this.resume(item);
           const writing = item.source.write(pcm, item.allowed);
           this.pump();
           await writing;
@@ -219,10 +243,15 @@ export class PlaybackQueue {
     try {
       item.stream = new GuardedStream(this.encode(item), item.allowed,
         () => this.complete(item, new PlaybackCancelledError()), (packet) => {
+          this.resume(item);
+          if (!item.firstPacket) {
+            item.firstPacket = true;
+            this.progress(item, 'first_packet');
+          }
           const count = item.packetChunks.get(packet) ?? 0;
           if (count) this.options.onMetric?.('audio_chunks_played', count);
           item.packetChunks.delete(packet);
-        });
+        }, () => this.starved(item));
       item.stream.on('error', () => this.complete(item, new Error('Falha ao preparar reprodução.')));
       item.resource = createAudioResource(item.stream, { inputType: StreamType.Opus });
       this.player.play(item.resource);
@@ -237,7 +266,10 @@ export class PlaybackQueue {
       for await (const frame of item.source.frames()) {
         try {
           if (!item.allowed()) throw new PlaybackCancelledError();
+          this.options.onPcmFrame?.(frame);
+          const encodingStarted = performance.now();
           const packet = codec.encode(frame, 960);
+          this.options.onMetric?.('opus_encode_ms', Math.max(0, performance.now() - encodingStarted));
           item.packetChunks.set(packet, item.consumedChunks);
           item.consumedChunks = 0;
           yield packet;
@@ -251,6 +283,7 @@ export class PlaybackQueue {
     if (item.settled) return;
     item.settled = true;
     if (item.deadline) clearTimeout(item.deadline);
+    if (item.drainTimer) clearTimeout(item.drainTimer);
     const wasActive = this.active === item;
     if (wasActive) this.active = undefined;
     const index = this.waiting.indexOf(item);
@@ -279,5 +312,29 @@ export class PlaybackQueue {
   private rejectStart(message: string, cancelled = false): never {
     this.options.onMetric?.(cancelled ? 'playback_cancelled' : 'playback_failed', 1);
     throw new Error(message);
+  }
+
+  private progress(item: Playback, event: 'first_packet' | 'drained' | 'resumed'): void {
+    if (!item.allowed()) return;
+    item.onProgress?.(event, Math.max(0, performance.now() - item.created));
+  }
+
+  private resume(item: Playback): void {
+    if (item.drainTimer) clearTimeout(item.drainTimer);
+    item.drainTimer = undefined;
+    if (item.drained) { item.drained = false; this.progress(item, 'resumed'); }
+  }
+
+  private starved(item: Playback): void {
+    if (!item.firstPacket || item.finished || item.drained || item.drainTimer || !item.source.waitingForInput) return;
+    // Debounce brief packet gaps. This observation cannot complete generation.
+    // A queued next question, not this timer, authorizes retiring an unknown turn.
+    item.drainTimer = setTimeout(() => {
+      item.drainTimer = undefined;
+      if (!item.allowed() || !item.source.waitingForInput || item.stream?.readableLength || item.finished) return;
+      item.drained = true;
+      this.progress(item, 'drained');
+    }, 250);
+    item.drainTimer.unref();
   }
 }
