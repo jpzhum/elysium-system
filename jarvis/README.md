@@ -5,6 +5,9 @@ ASR e voz. Elysium continua no serviço Python. Implementação técnica local;
 recepção DAVE, conversas reais e deploy ainda precisam ser validados. Consulte
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) antes de operar.
 
+Para falhas de `/join`, timeout de resposta ou ausência de som no Render, consulte
+[o roteiro de diagnóstico e validação audível](docs/RENDER_INCIDENTS.md).
+
 ## Começar localmente
 
 Requer Node >=22.12 (ambiente verificado: 24.19.0), npm e uma aplicação Discord

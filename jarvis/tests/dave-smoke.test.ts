@@ -62,7 +62,7 @@ test("leaving during pending join cancels Ready waits; errors never expose paylo
   connectionMocks.join.mockReturnValueOnce(connection);
   const manager = new VoiceConnectionManager();
   const joining = manager.join(testChannel);
-  const rejected = assert.rejects(joining, /Não foi possível/);
+  const rejected = assert.rejects(joining, /JOIN_CANCELLED/);
   manager.leave();
   await rejected;
   assert.equal(connection.listenerCount(VoiceConnectionStatus.Ready), 0);

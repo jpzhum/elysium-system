@@ -12,7 +12,10 @@ export interface AgentSession {
 
 export interface AgentCallbacks {
   onAudio(pcm: Buffer, eventId: number): void;
-  onResponseComplete(): void;
+  onResponseComplete(eventId?: number): void;
+  /** Content-free signals only. Never forward the provider's text to diagnostics. */
+  onTextResponse?(): void;
+  onProtocolEvent?(event: 'audio' | 'agent_response' | 'agent_response_complete' | 'client_error'): void;
   onInterruption(): void;
   onClose(): void;
   onError(code: string): void;
@@ -276,7 +279,8 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
           }
         } else if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
       };
-      const onAbort = (): void => end('agent_aborted');
+      // A local close/revocation after negotiation is not a provider failure.
+      const onAbort = (): void => end(negotiated ? undefined : 'agent_aborted');
       const dispatch = (callback: () => void): void => {
         try { callback(); }
         catch { end('agent_callback_error'); }
@@ -376,6 +380,8 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               break;
             }
             case 'audio': {
+              dispatch(() => options.callbacks.onProtocolEvent?.('audio'));
+              if (closed) return;
               if (!negotiated) throw new AgentError('audio_before_metadata');
               const audio = record(event.audio_event);
               const encoded = boundedString(audio.audio_base_64, Math.ceil(MAX_PCM_BYTES / 3) * 4);
@@ -395,15 +401,20 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               if (!negotiated) throw new AgentError('invalid_agent_event');
               dispatch(() => options.callbacks.onInterruption());
               break;
-            case 'agent_response_complete':
+            case 'agent_response_complete': {
+              dispatch(() => options.callbacks.onProtocolEvent?.('agent_response_complete'));
+              if (closed) return;
               if (!negotiated) throw new AgentError('invalid_agent_event');
-              integer(record(event.agent_response_complete_event).event_id);
-              dispatch(() => options.callbacks.onResponseComplete());
+              const eventId = integer(record(event.agent_response_complete_event).event_id);
+              dispatch(() => options.callbacks.onResponseComplete(eventId));
               break;
+            }
             case 'client_tool_call':
               void runTool(record(event.client_tool_call)).catch(() => end('agent_tool_error'));
               break;
             case 'client_error': {
+              dispatch(() => options.callbacks.onProtocolEvent?.('client_error'));
+              if (closed) return;
               const error = record(event.error_event);
               end(statusCode(typeof error.code === 'number' ? error.code : 0));
               break;
@@ -411,12 +422,25 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
             case 'queue_status':
               if (record(event.queue_status_event).status !== 'admitted') end('agent_concurrency_limit');
               break;
-            // Text and transcripts are deliberately neither retained nor forwarded.
-            case 'agent_response':
+            case 'agent_response': {
+              dispatch(() => options.callbacks.onProtocolEvent?.('agent_response'));
+              if (closed) return;
+              const response = record(event.agent_response_event);
+              if (typeof response.agent_response !== 'string') throw new AgentError('invalid_agent_event');
+              if (response.agent_response.trim()) dispatch(() => options.callbacks.onTextResponse?.());
+              break;
+            }
+            case 'agent_chat_response_part': {
+              const part = record(event.text_response_part);
+              if (part.type === 'delta' && typeof part.text === 'string' && part.text.trim()) {
+                dispatch(() => options.callbacks.onTextResponse?.());
+              }
+              break;
+            }
+            // Transcripts and response text are deliberately not retained or logged.
             case 'user_transcript':
             case 'tentative_user_transcript':
             case 'agent_response_correction':
-            case 'agent_chat_response_part':
             case 'agent_reasoning_response_part':
             case 'vad_score':
               break;

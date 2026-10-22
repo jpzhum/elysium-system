@@ -204,7 +204,7 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     const session = await h.connect();
     controller.abort();
     expect(h.callbacks.onClose).toHaveBeenCalledOnce();
-    expect(h.callbacks.onError).toHaveBeenCalledWith('agent_aborted');
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
     expect(() => session.sendText('pergunta')).toThrowError('agent_closed');
     h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AAAA', event_id: 4 } });
     expect(h.callbacks.onAudio).not.toHaveBeenCalled();
@@ -292,7 +292,7 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     await Promise.resolve();
     expect(h.socket.sent).toHaveLength(1);
     expect(h.callbacks.onClose).toHaveBeenCalledOnce();
-    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_aborted');
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
   });
 
   it('sanitizes callback exceptions and repeated remote client errors without any logging', async () => {
@@ -349,7 +349,7 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     h.socket.message({ type: 'client_tool_call', client_tool_call: { tool_name: 'search_game_info', tool_call_id: 'sync', parameters: {} } });
     await Promise.resolve();
     await Promise.resolve();
-    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_aborted');
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
     expect(h.callbacks.onClose).toHaveBeenCalledOnce();
     expect(h.socket.sent).toHaveLength(1);
   });

@@ -2,9 +2,11 @@ import {
   ChannelType, Client, Events, GatewayIntentBits, MessageFlags, PermissionFlagsBits,
   type ChatInputCommandInteraction, type GuildMember, type VoiceChannel,
 } from 'discord.js';
-import { VoiceConnectionStatus } from '@discordjs/voice';
+import { VoiceConnectionStatus, type VoiceConnection } from '@discordjs/voice';
 import type { Config } from '../config.js';
 import { Logger, Metrics } from '../observability/metrics.js';
+import { DiagnosticError, JoinDiagnostics, sanitizeError } from '../observability/diagnostics.js';
+import { inspectVoiceRuntime } from '../observability/voice-runtime.js';
 import { authorize, AuthorizationError } from '../policy/authorization.js';
 import { ConsentStore } from '../policy/consent.js';
 import { speakerContext, type SpeakerContext } from '../policy/identity.js';
@@ -67,7 +69,7 @@ export class JarvisBot {
     if (this.closed) return;
     // Create/upsert only Jarvis; do not bulk replace other application commands.
     await guild.commands.create(jarvisCommand.toJSON());
-    this.logger.event(this.config.daveSmoke ? 'dave_probe_ready' : 'jarvis_ready');
+    this.logger.event(this.config.daveSmoke ? 'dave_probe_ready' : 'jarvis_ready', 'info', { diagnostics_version: 2 });
   }
 
   private async reply(interaction: ChatInputCommandInteraction, content: string, ephemeral = true): Promise<void> {
@@ -103,6 +105,7 @@ export class JarvisBot {
       await this.reply(interaction, 'Jarvis está disponível somente no servidor configurado.'); return;
     }
     const command = interaction.options.getSubcommand();
+    const diagnostic = command === 'join' ? new JoinDiagnostics(this.logger) : undefined;
     try {
       if (command === 'privacy') {
         await this.reply(interaction, privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke, this.config.JARVIS_FOLLOWUP_SECONDS)); return;
@@ -124,12 +127,17 @@ export class JarvisBot {
         await this.reply(interaction, 'Consentimento revogado; sua captura, sessão e resposta foram canceladas.'); return;
       }
       if (command === 'join') {
+        diagnostic!.stage('authorize');
         authorize(interaction.user.id, 'join', this.config.JARVIS_OWNER_USER_ID);
         const requestEpoch = this.epoch;
+        diagnostic!.stage('interaction_ack');
         await interaction.deferReply();
         if (this.closed || this.epoch !== requestEpoch) throw new SessionError('closed');
-        await this.join(interaction);
+        diagnostic!.stage('channel_lookup');
+        await this.join(interaction, diagnostic);
+        diagnostic!.stage('join_reply');
         await this.reply(interaction, 'Jarvis conectado. ' + privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke, this.config.JARVIS_FOLLOWUP_SECONDS), false);
+        diagnostic!.success();
         return;
       }
       if (command === 'leave') {
@@ -167,53 +175,88 @@ export class JarvisBot {
         await this.reply(interaction, 'Pergunta enviada. A resposta será falada nesta chamada.');
       }
     } catch (error) {
+      // Report before attempting a Discord response, which can fail independently.
+      diagnostic?.failure(error);
       let message: string;
-      if (error instanceof AuthorizationError) message = error.message;
+      if (error instanceof AuthorizationError) message = 'Ação reservada ao criador autenticado do Jarvis.';
       else if (error instanceof SessionError) {
         message = error.code === 'consent' ? 'Renove o consentimento para continuar.'
           : error.code === 'busy' ? 'Jarvis está atendendo. Aguarde o fim da resposta e tente novamente.'
             : error.code === 'limit' ? 'Limite de uso atingido. Aguarde antes de tentar novamente.'
               : 'A sessão foi encerrada. Tente novamente.';
       } else {
-        const id = this.logger.event('jarvis_command_failed', 'warn');
-        message = error instanceof Error && error.message === 'same_channel'
+        const id = diagnostic?.incident ?? this.logger.event('jarvis_command_failed', 'warn');
+        message = (error instanceof Error && error.message === 'same_channel')
+          || (error instanceof DiagnosticError && error.code === 'CHANNEL_NOT_FOUND')
           ? 'Entre na mesma chamada que Jarvis antes de usar este comando.'
-          : error instanceof Error && error.message === 'voice_permissions'
+          : error instanceof DiagnosticError && error.code === 'CHANNEL_RESTRICTED'
+            ? 'Este canal de voz não é o canal configurado para Jarvis.'
+          : error instanceof DiagnosticError && error.code === 'CHANNEL_FULL'
+            ? 'O canal de voz está lotado. Libere uma vaga e tente novamente.'
+          : error instanceof DiagnosticError && error.category === 'permissions'
             ? 'Sem permissão Connect, View Channel ou Speak. Revise as permissões deste canal.'
             : `Não foi possível concluir. Verifique a configuração e tente novamente. Incidente ${id}.`;
       }
-      await this.reply(interaction, message);
+      // Always give join failures the same correlation ID, including expected denials.
+      if (diagnostic && !message.includes(diagnostic.incident)) message += ` Incidente ${diagnostic.incident}.`;
+      try { await this.reply(interaction, message); }
+      catch (responseError) {
+        if (!diagnostic) throw responseError;
+        diagnostic.event('interaction_response_failed', 'error', { stage: 'join_reply', ...sanitizeError(responseError) });
+      }
     }
   }
 
-  private async join(interaction: Interaction): Promise<void> {
+  private async join(interaction: Interaction, diagnostic?: JoinDiagnostics): Promise<void> {
     if (this.joining) throw new SessionError('busy');
     if (this.closed) throw new SessionError('closed');
     // Lock before the first await: /leave must invalidate even a pending fetchMe().
     this.joining = true;
     const preparationEpoch = this.epoch;
+    let connection: VoiceConnection | undefined;
+    let initialized: Room | undefined;
     try {
+      diagnostic?.stage('channel_lookup');
       const channel = interaction.member.voice.channel;
-      if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('same_channel');
+      if (!channel || channel.type !== ChannelType.GuildVoice) throw new DiagnosticError('channel', 'CHANNEL_NOT_FOUND');
+      diagnostic?.stage('channel_restriction');
       if (this.config.JARVIS_DEFAULT_VOICE_CHANNEL_ID && channel.id !== this.config.JARVIS_DEFAULT_VOICE_CHANNEL_ID) {
-        throw new Error('same_channel');
+        throw new DiagnosticError('channel', 'CHANNEL_RESTRICTED');
       }
       if (this.room?.channel.id === channel.id) return;
+      diagnostic?.stage('member_fetch');
       const me = interaction.guild.members.me ?? await interaction.guild.members.fetchMe();
       if (this.closed || this.epoch !== preparationEpoch) throw new SessionError('closed');
+      diagnostic?.stage('permissions');
       const permissions = channel.permissionsFor(me);
-      if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
-        throw new Error('voice_permissions');
+      const view = permissions?.has(PermissionFlagsBits.ViewChannel) ?? false;
+      const connect = permissions?.has(PermissionFlagsBits.Connect) ?? false;
+      const speak = permissions?.has(PermissionFlagsBits.Speak) ?? false;
+      diagnostic?.event('jarvis_join_step', 'info', { permission_view: view, permission_connect: connect, permission_speak: speak });
+      if (!view || !connect || !speak) {
+        throw new DiagnosticError('permissions', 'DISCORD_MISSING_PERMISSIONS');
       }
-      if (channel.full && !permissions.has(PermissionFlagsBits.MoveMembers)) throw new Error('voice_permissions');
+      diagnostic?.stage('channel_capacity');
+      diagnostic?.event('jarvis_join_step', 'info', { permission_full: channel.full });
+      if (channel.full && !permissions?.has(PermissionFlagsBits.MoveMembers)) throw new DiagnosticError('channel', 'CHANNEL_FULL');
+      diagnostic?.stage('runtime_probe');
+      if (diagnostic) await inspectVoiceRuntime(diagnostic);
+      // Neither a delayed lookup nor a native probe may reconnect after /leave.
+      if (this.closed || this.epoch !== preparationEpoch) throw new SessionError('closed');
+      if (interaction.member.voice.channel?.id !== channel.id) throw new DiagnosticError('cancelled', 'JOIN_CANCELLED');
+      diagnostic?.stage('previous_room_cleanup');
       this.reset();
       const epoch = this.epoch;
-      const connection = await this.voice.join(channel);
+      diagnostic?.stage('voice_connect');
+      connection = await this.voice.join(channel, diagnostic);
       if (this.closed || this.epoch !== epoch) { this.voice.leave(); throw new SessionError('closed'); }
+      diagnostic?.stage('playback_setup');
       const playback = new PlaybackQueue(connection, { maxQueue: 4, maxSeconds: 30, onMetric: this.metrics.add });
       const consent = new ConsentStore();
       // Closure is assigned before any receiver subscriptions are started.
       const room = { channel, consent, playback, probe: new Map() } as Room;
+      initialized = room;
+      diagnostic?.stage('session_setup');
       room.sessions = new SessionManager({
         connect: (speaker, callbacks, signal) => connectAgent({
           apiKey: this.config.ELEVENLABS_API_KEY!, agentId: this.config.ELEVENLABS_AGENT_ID!,
@@ -236,8 +279,9 @@ export class JarvisBot {
         maxTurnSeconds: this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN,
         maxSessionSeconds: this.config.JARVIS_MAX_SESSION_SECONDS,
         idleSeconds: this.config.JARVIS_SESSION_IDLE_SECONDS, followupSeconds: this.config.JARVIS_FOLLOWUP_SECONDS,
-        maxTurnsPerHour: this.config.JARVIS_MAX_TURNS_PER_HOUR, metric: this.metrics.add,
+        maxTurnsPerHour: this.config.JARVIS_MAX_TURNS_PER_HOUR, metric: this.metrics.add, logger: this.logger,
       });
+      diagnostic?.stage('receiver_setup');
       room.receiver = new VoiceReceiver(connection, {
         ownUserId: this.client.user!.id, maxTurnSeconds: this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN,
         isPlaying: () => playback.isPlaying,
@@ -264,6 +308,26 @@ export class JarvisBot {
       });
       room.receiver.start();
       this.metrics.add('voice_joins');
+    } catch (error) {
+      // Failed setup must not leave a connected bot with half-initialized resources.
+      // Guard by connection ownership so a cancelled attempt cannot destroy a successor.
+      if (connection && this.voice.connection === connection) {
+        if (this.room === initialized) this.room = undefined;
+        const cleanup = [
+          () => initialized?.consent.clear(),
+          () => initialized?.receiver?.stop(),
+          () => initialized?.sessions?.close(),
+          () => initialized?.playback.stop(),
+          () => this.voice.leave(),
+        ];
+        for (const action of cleanup) {
+          try { action(); }
+          catch (cleanupError) {
+            diagnostic?.event('jarvis_voice_error', 'error', { stage: 'previous_room_cleanup', ...sanitizeError(cleanupError) });
+          }
+        }
+      }
+      throw error;
     } finally { this.joining = false; }
   }
 

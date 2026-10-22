@@ -140,7 +140,7 @@ test.each(['leave', 'stop'] as const)(
       expect(fetchMe).not.toHaveBeenCalled();
       expect(connect).not.toHaveBeenCalled();
       expect(editReply).toHaveBeenCalledWith(expect.objectContaining({
-        content: 'A sessão foi encerrada. Tente novamente.',
+        content: expect.stringContaining('A sessão foi encerrada. Tente novamente.'),
       }));
     } finally {
       acknowledgement.resolve(undefined);

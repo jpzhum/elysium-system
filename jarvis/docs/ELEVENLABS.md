@@ -46,14 +46,14 @@ negociados. Aceita PCM mono de 16 bits little-endian em 8000, 16000, 22050, 2400
 um override de formato não documentado. Discord é convertido a partir de PCM
 48 kHz estéreo; bytes MP3 e µ-law não são tratados como PCM.
 
-Em `conversation_config.conversation.client_events`, preserve os eventos de
-áudio/protocolo e habilite explicitamente:
+Em `conversation_config.conversation.client_events`, preserve os eventos de áudio,
+texto e tools usados pelo agente e habilite explicitamente `agent_response_complete`.
+Confira especialmente:
 
 ```json
 [
-  "conversation_initiation_metadata",
-  "ping",
   "audio",
+  "agent_response",
   "interruption",
   "agent_response_complete",
   "client_tool_call",
@@ -63,7 +63,11 @@ Em `conversation_config.conversation.client_events`, preserve os eventos de
 
 `agent_response_complete` indica conclusão da resposta, incluindo tools.
 `agent_response` contém texto e não é tratado como término do áudio. Transcripts,
-correções e texto recebidos são ignorados pelo adapter; não são registrados.
+correções e texto recebidos não são registrados. O adapter sinaliza somente que
+houve texto, sem guardar seu conteúdo, para detectar uma resposta sem áudio.
+Metadata de inicialização e ping são tratados pelo protocolo; não precisam ser
+inventados em overrides. Para diagnóstico e validação audível, siga
+[RENDER_INCIDENTS.md](RENDER_INCIDENTS.md).
 Veja [Client events](https://elevenlabs.io/docs/eleven-agents/customization/events/client-events)
 e [WebSocket API](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket).
 

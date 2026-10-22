@@ -1,5 +1,21 @@
 # Estado da implementação — 21/10/2026
 
+## Revisão de diagnóstico de produção
+
+Instrumentados `/jarvis join`, negociação de voz/DAVE e fluxo ElevenAgents até
+playback. A revisão corrige a contagem de erro secundário no encerramento local,
+detecta texto sem áudio/conclusão ausente/fechamento prematuro e só libera áudio
+após conclusão explícita válida. Build, typecheck, lint e 230 testes Node passaram;
+um gate real segue skipped. Python: 78 testes e 67 subtests passaram. Elysium não
+foi alterado nesta revisão. Veja [o runbook Render](docs/RENDER_INCIDENTS.md).
+
+O proprietário relatou Discord conectado e HTTP/WS ElevenLabs iniciados em
+produção, mas nenhum áudio audível. Os contadores anteriores não determinam a
+causa. A nova instrumentação precisa de outra tentativa no Render; esta revisão
+não fez deploy nem comprovou a conexão de voz ou resposta audível real.
+
+## Registro da entrega inicial
+
 **Entrega técnica local implementada e verificada. Aceitação em chamada e produção
 pendente.** Especificação: `../JARVIS_ELEVENAGENTS_CODEX_FULL_ACCESS.md`.
 
