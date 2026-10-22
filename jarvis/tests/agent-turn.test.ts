@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, expect, test, vi } from 'vitest';
 import { createAgentConnector, type AgentDependencies } from '../src/agents/elevenlabs-client.js';
-import { SessionManager, type Playback } from '../src/agents/session-manager.js';
+import { SessionManager, type Playback, type SessionOptions } from '../src/agents/session-manager.js';
 import type { PlaybackStream } from '../src/audio/playback.js';
 import { Logger, Metrics } from '../src/observability/metrics.js';
 import { ConsentStore } from '../src/policy/consent.js';
@@ -22,7 +22,7 @@ class Socket extends EventEmitter {
 const active: SessionManager[] = [];
 async function settle(): Promise<void> { for (let step = 0; step < 30; step++) await Promise.resolve(); }
 
-function setup(pendingPlayback = false) {
+function setup(pendingPlayback = false, pace?: SessionOptions['pace']) {
   const socket = new Socket();
   const metrics = new Metrics();
   const logs: Record<string, unknown>[] = [];
@@ -95,7 +95,7 @@ function setup(pendingPlayback = false) {
     allowed: (context, audio) => consent.isCurrent(context.discordUserId, context.consentVersion, audio),
     detectWake, playback, maxSessions: 2, maxTurnSeconds: 12,
     maxSessionSeconds: 300, idleSeconds: 45, followupSeconds: 18, maxTurnsPerHour: 100,
-    metric: metrics.add, logger: new Logger('info', (line) => logs.push(JSON.parse(line))),
+    metric: metrics.add, logger: new Logger('info', (line) => logs.push(JSON.parse(line))), pace,
   });
   active.push(manager);
   const audio = (id = 1, value = 1) => socket.event({ type: 'audio', audio_event: {
@@ -143,6 +143,36 @@ test('documented audio starts before completion and repeated event IDs preserve 
     agent_response_complete_events_received: 1, agent_text_events_received: 1 });
   expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
   expect(JSON.stringify(h.logs)).not.toContain(secret);
+});
+
+test('real wire recognition gates a microphone response and keeps capture-to-response diagnostics correlated', async () => {
+  vi.useFakeTimers();
+  const h = setup(false, async () => undefined); h.detectWake.mockResolvedValue(true);
+  const receipt = await h.manager.voiceTurn(h.speaker, Buffer.alloc(19_200, 1), { captureMs: 700, endDetectionMs: 600 });
+  await settle();
+  h.text(); h.audio(1, 90); h.complete(1); await settle();
+  expect(h.copies).toHaveLength(0);
+  await vi.advanceTimersByTimeAsync(1_500);
+  h.socket.event({ type: 'tentative_user_transcript', user_transcription_event: { user_transcript: secret } });
+  await settle();
+  expect(h.metrics.snapshot().agent_user_turns_recognized ?? 0).toBe(0);
+  h.socket.event({ type: 'user_transcript', user_transcription_event: { user_transcript: secret, event_id: 10 } });
+  h.socket.event({ type: 'agent_response', agent_response_event: { agent_response: secret, event_id: 11 } });
+  h.audio(11, 4); h.complete(11); await settle();
+  expect(h.copies).toEqual([Buffer.from([4, 0, 5, 0])]);
+  expect(h.metrics.snapshot()).toMatchObject({ agent_user_turns_recognized: 1, agent_responses_after_recognition: 1,
+    agent_initial_audio_discarded: 1, agent_turns_completed: 1, voice_wake_activations: 1 });
+  const stages = ['jarvis_voice_captured', 'jarvis_wake_detected', 'jarvis_agent_input_started',
+    'jarvis_agent_input_sent', 'jarvis_agent_user_turn_recognized', 'jarvis_agent_response_observed'];
+  for (const event of stages) {
+    expect(h.logs.filter(line => line.event === event), event).toMatchObject([{ incident: receipt!.turnId, input_kind: 'voice' }]);
+  }
+  expect(h.logs.find(line => line.event === 'jarvis_agent_input_sent')).toMatchObject({
+    input_audio_finished: true, input_sample_rate: 16000, silence_tail_ms: 800, input_audio_chunks: 45,
+    input_audio_bytes: 28_800, user_turn_recognized: false, speaker_verified: true, consent_current: true,
+  });
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
+  expect(JSON.stringify(h.logs)).not.toContain('fixture-private-id');
 });
 
 test('missing completion recovers after inactivity, drains valid audio and never claims a successful conversation turn', async () => {

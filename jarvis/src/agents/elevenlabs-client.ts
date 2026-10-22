@@ -22,6 +22,8 @@ export interface AgentCallbacks {
   onResponseComplete(eventId?: number): void | Promise<void>;
   /** Content-free signals only. Never forward the provider's text to diagnostics. */
   onTextResponse?(identity?: AgentResponseIdentity): void;
+  /** A nonempty final ASR utterance was recognized; the transcript never leaves this adapter. */
+  onUserTranscript?(identity?: AgentResponseIdentity): void;
   onToolActivity?(pending: number): void;
   onProtocolEvent?(event: 'audio' | 'agent_response' | 'agent_response_complete' | 'client_error'): void;
   onInterruption(): void;
@@ -35,7 +37,7 @@ export interface ConnectAgentOptions {
   dynamicVariables: Record<string, string | number | boolean>;
   callbacks: AgentCallbacks;
   signal?: AbortSignal;
-  /** Requires the first-message override to be enabled in the agent dashboard. */
+  /** Requires Security > First message override permission; never retried without suppression. */
   suppressFirstMessage?: boolean;
   /** Identity and authorization must come from the caller's trusted closure. */
   tools?: (name: string, parameters: unknown) => Promise<unknown>;
@@ -284,7 +286,9 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       const pendingToolIds = new Set<string>();
       const cancelTools = new Set<() => void>();
       type Delivery = { kind: 'audio'; pcm: Buffer; eventId: number; info?: { responseId?: string } }
-        | { kind: 'complete'; eventId: number };
+        | { kind: 'complete'; eventId: number }
+        | { kind: 'text'; identity: AgentResponseIdentity }
+        | { kind: 'user_transcript'; identity: AgentResponseIdentity };
       const deliveries: Delivery[] = [];
       const notify = (callback: () => void): void => { try { callback(); } catch { /* Do not expose callback data. */ } };
       const cleanup = (removeAbort: boolean): void => {
@@ -310,12 +314,18 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         cleanup(true);
         notify(() => options.callbacks.onClose());
       };
-      const discardDeliveries = (): void => {
+      const discardDeliveries = (preserveRecognition = false): void => {
         deliveryEpoch++;
+        // An interruption invalidates agent output, not speech already recognized
+        // from the user. Keep only content-free ASR markers behind a slow write.
+        // Local cancellation/revocation always discards every delivery instead.
+        const recognition = preserveRecognition
+          ? deliveries.filter(item => item.kind === 'user_transcript') : [];
         for (const item of deliveries) if (item.kind === 'audio') item.pcm.fill(0);
         // In-flight PCM remains borrowed until the callback settles; cancellation
         // also revokes playback, whose pending write then rejects promptly.
         deliveries.length = 0;
+        deliveries.push(...recognition);
         ingressBytes = 0;
         resumeIngress();
       };
@@ -362,6 +372,16 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         while (deliveries.length > 0 && epoch === deliveryEpoch && !finalized) {
           const item = deliveries.shift()!;
           try {
+            if (item.kind === 'user_transcript') {
+              // Preserve wire order with PCM so greeting audio queued before ASR
+              // cannot be reclassified as an answer when a slow write resumes.
+              options.callbacks.onUserTranscript?.(item.identity);
+              continue;
+            }
+            if (item.kind === 'text') {
+              options.callbacks.onTextResponse?.(item.identity);
+              continue;
+            }
             if (item.kind === 'complete') {
               // A completion waits for prior writes to be accepted, not for playback
               // to finish. Its own callback cannot block later protocol progress.
@@ -548,8 +568,9 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
                 const interruption = record(event.interruption_event);
                 if (interruption.event_id !== undefined) lastInterruptId = Math.max(lastInterruptId, integer(interruption.event_id));
               }
-              discardDeliveries();
+              discardDeliveries(true);
               dispatch(() => options.callbacks.onInterruption());
+              pump();
               break;
             case 'agent_response_complete': {
               dispatch(() => options.callbacks.onProtocolEvent?.('agent_response_complete'));
@@ -583,11 +604,17 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               updateToolActivity(boundedString(call.tool_call_id, 200), pending);
               break;
             }
-            case 'client_error': {
+            case 'client_error':
+            case 'error': {
               dispatch(() => options.callbacks.onProtocolEvent?.('client_error'));
               if (closed) return;
               const error = record(event.error_event);
-              end(statusCode(typeof error.code === 'number' ? error.code : 0));
+              const status = typeof error.code === 'number' ? error.code : 0;
+              // The API has no documented, stable override-specific error code.
+              // Identify rejected initiation without copying arbitrary provider text
+              // or claiming that override permission is the proven cause.
+              end(!negotiated && options.suppressFirstMessage && (status === 400 || status === 422)
+                ? 'agent_initiation_rejected' : statusCode(status));
               break;
             }
             case 'queue_status':
@@ -598,18 +625,31 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               if (closed) return;
               const response = record(event.agent_response_event);
               if (typeof response.agent_response !== 'string') throw new AgentError('invalid_agent_event');
-              if (response.agent_response.trim()) dispatch(() => options.callbacks.onTextResponse?.(responseIdentity(response)));
+              if (response.agent_response.trim()) enqueue({ kind: 'text', identity: responseIdentity(response) });
               break;
             }
             case 'agent_chat_response_part': {
               const part = record(event.text_response_part);
               if (part.type === 'delta' && typeof part.text === 'string' && part.text.trim()) {
-                dispatch(() => options.callbacks.onTextResponse?.(responseIdentity(part)));
+                enqueue({ kind: 'text', identity: responseIdentity(part) });
+              }
+              break;
+            }
+            case 'user_transcript': {
+              if (!negotiated) throw new AgentError('invalid_agent_event');
+              const transcript = record(event.user_transcription_event);
+              if (typeof transcript.user_transcript !== 'string'
+                || Buffer.byteLength(transcript.user_transcript) > MAX_MESSAGE_BYTES) {
+                throw new AgentError('invalid_agent_event');
+              }
+              // user_transcript is the finalized utterance in the ElevenAgents
+              // protocol; tentative events must never unlock response playback.
+              if (transcript.user_transcript.trim()) {
+                enqueue({ kind: 'user_transcript', identity: responseIdentity(transcript) });
               }
               break;
             }
             // Transcripts and response text are deliberately not retained or logged.
-            case 'user_transcript':
             case 'tentative_user_transcript':
             case 'agent_response_correction':
             case 'agent_reasoning_response_part':
@@ -627,9 +667,10 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         response.resume();
         end(statusCode(response.statusCode ?? 0));
       });
-      ws.on('close', () => {
+      ws.on('close', (code?: number) => {
         clearTimeout(closeTimer);
-        if (!closed) end(negotiated ? undefined : 'agent_closed_before_metadata', true);
+        if (!closed) end(negotiated ? undefined
+          : options.suppressFirstMessage && code === 1008 ? 'agent_initiation_rejected' : 'agent_closed_before_metadata', true);
       });
       options.signal?.addEventListener('abort', onAbort, { once: true });
       if (options.signal?.aborted) onAbort();

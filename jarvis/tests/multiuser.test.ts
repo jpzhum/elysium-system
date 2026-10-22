@@ -391,7 +391,11 @@ describe('speaker authorization and cancellation', () => {
   test('provider interruption aborts paced upload and allows a fresh next request', async () => {
     let first = true;
     const h = harness({ pace: async () => {
-      if (first) { first = false; h.callbacks.get('guest')!.onInterruption(); }
+      if (first) {
+        first = false;
+        h.callbacks.get('guest')!.onUserTranscript?.({ eventId: 1 });
+        h.callbacks.get('guest')!.onInterruption();
+      }
     } });
     await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(48_000)); await settle();
     const oldSession = h.sessions.get('guest')!;

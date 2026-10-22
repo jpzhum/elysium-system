@@ -3,7 +3,7 @@ import { AgentError, type AgentCallbacks, type AgentSession } from './elevenlabs
 import { convertPcm } from '../audio/pcm-conversion.js';
 import type { PlaybackStream } from '../audio/playback.js';
 import type { SpeakerContext } from '../policy/identity.js';
-import { Logger, newIncident, type ErrorCode } from '../observability/metrics.js';
+import { Logger, newIncident, type DiagnosticFields, type ErrorCode } from '../observability/metrics.js';
 
 export interface Playback {
   readonly isPlaying: boolean;
@@ -51,6 +51,7 @@ interface TurnRequest {
   cancelled: boolean;
   notify?: (event: TurnNotification) => void | Promise<void>;
 }
+interface CaptureTiming { captureMs: number; endDetectionMs: number; }
 interface Entry {
   speaker: SpeakerContext;
   abort: AbortController;
@@ -88,6 +89,17 @@ interface Entry {
   lastAudioAt?: number;
   drainedAt?: number;
   turnReleased: boolean;
+  voiceInput: boolean;
+  userTurnRecognized: boolean;
+  recognizedUserEventIds: Set<number>;
+  inputAudioChunks: number;
+  inputAudioBytes: number;
+  inputAudioFinished: boolean;
+  rejectedAudioIds: Set<number>;
+  rejectedResponseIds: Set<string>;
+  sessionReused: boolean;
+  initialAudioReported: boolean;
+  initialResponseReported: boolean;
 }
 export class SessionError extends Error {
   constructor(readonly code: 'consent' | 'busy' | 'limit' | 'closed') { super(code); }
@@ -125,12 +137,18 @@ export class SessionManager {
     return this.enqueue({ id: newIncident(), speaker, text, notify, receivedAt: performance.now(), cancelled: false });
   }
 
-  async voiceTurn(speaker: SpeakerContext, pcm: Buffer): Promise<TurnReceipt | undefined> {
+  async voiceTurn(speaker: SpeakerContext, pcm: Buffer, timing?: CaptureTiming): Promise<TurnReceipt | undefined> {
     this.assertAllowed(speaker, true);
     if (this.checking.has(speaker.discordUserId)) throw new SessionError('busy');
     if (!pcm.length || pcm.length % 4 || pcm.length > Math.min(this.options.maxTurnSeconds, 30) * 48_000 * 4
       || this.checking.size >= this.options.maxSessions) throw new SessionError('limit');
     const existing = this.entries.get(speaker.discordUserId);
+    const incident = newIncident();
+    this.options.metric?.('voice_turns_captured');
+    this.inputReport(incident, 'jarvis_voice_captured', 'voice_capture', {
+      capture_bytes: pcm.length, capture_ms: Math.round(pcm.length / 192_000 * 1000),
+      ...(timing ? { capture_wait_ms: timing.captureMs, end_detection_ms: timing.endDetectionMs } : {}),
+    });
     const abort = new AbortController();
     let owned: Buffer | undefined = Buffer.from(pcm);
     this.checking.set(speaker.discordUserId, abort);
@@ -143,12 +161,14 @@ export class SessionManager {
       if (!followup) {
         const activated = await this.options.detectWake(owned, abort.signal);
         this.options.metric?.('wake_detection_ms', Math.round(performance.now() - wakeStart));
-        this.options.metric?.(activated ? 'wake_activations' : 'wake_rejections');
+        this.options.metric?.(activated ? 'voice_wake_activations' : 'wake_rejections');
+        this.inputReport(incident, 'jarvis_wake_detected', 'wake_detection', { wake_detected: activated, followup: false,
+          duration_ms: Math.max(0, Math.round(performance.now() - wakeStart)) });
         if (!activated) return;
-      }
+      } else this.inputReport(incident, 'jarvis_wake_detected', 'wake_detection', { wake_detected: false, followup: true });
       if (abort.signal.aborted) return;
       this.assertAllowed(speaker, true);
-      const request: TurnRequest = { id: newIncident(), speaker, pcm: owned,
+      const request: TurnRequest = { id: incident, speaker, pcm: owned,
         receivedAt: performance.now(), cancelled: false };
       const receipt = this.enqueue(request);
       owned = undefined;
@@ -205,7 +225,7 @@ export class SessionManager {
       request.dispatchAt = performance.now();
       this.options.metric?.('question_queue_wait_ms', Math.round(request.dispatchAt - request.receivedAt));
       this.queueReport(request, 0);
-      entry = await this.ensure(request.speaker);
+      entry = await this.ensure(request.speaker, request);
       if (request.cancelled || this.active !== request) return;
       this.assertAllowed(request.speaker, !!request.pcm);
       this.begin(entry, request);
@@ -233,19 +253,30 @@ export class SessionManager {
     const rate = entry.session!.inputSampleRate;
     const mono = convertPcm(pcm, 48_000, 2, rate, 1);
     const tail = Buffer.alloc(Math.round(rate * 0.8) * 2);
+    this.report(entry, 'jarvis_agent_input_started');
     try {
       const frameBytes = Math.round(rate / 50) * 2;
       for (const segment of [mono, tail]) {
         for (let offset = 0; offset < segment.length; offset += frameBytes) {
           if (!this.usable(entry) || !this.options.allowed(entry.speaker, true) || abort.signal.aborted) return;
-          entry.session!.sendAudio(segment.subarray(offset, offset + frameBytes));
+          const chunk = segment.subarray(offset, offset + frameBytes);
+          // Set the phase before sendAudio: providers/tests may emit synchronously.
+          entry.inputAudioChunks++;
+          entry.inputAudioBytes += chunk.length;
+          entry.session!.sendAudio(chunk);
+          this.options.metric?.('agent_input_audio_chunks');
+          this.options.metric?.('agent_input_audio_bytes', chunk.length);
           await (this.options.pace?.(abort.signal) ?? delay(20, undefined, { signal: abort.signal }));
         }
       }
+      entry.inputAudioFinished = true;
+      this.report(entry, 'jarvis_agent_input_sent');
     } catch (error) { if (!abort.signal.aborted) throw error; }
     finally {
       mono.fill(0); tail.fill(0);
       if (entry.upload === abort) entry.upload = undefined;
+      if ((entry.inputAudioFinished && entry.completionReceived && !entry.pendingTools)
+        || (entry.providerClosed && entry.audioBytes > 0)) this.seal(entry);
       this.retireForQueued(entry);
     }
   }
@@ -288,7 +319,7 @@ export class SessionManager {
     if (!speaker.consented || !this.options.allowed(speaker, audio)) throw new SessionError('consent');
   }
 
-  private async ensure(speaker: SpeakerContext): Promise<Entry> {
+  private async ensure(speaker: SpeakerContext, request: TurnRequest): Promise<Entry> {
     let entry = this.entries.get(speaker.discordUserId);
     if (entry && (entry.speaker.consentVersion !== speaker.consentVersion
       || entry.speaker.channelId !== speaker.channelId)) { this.remove(entry, false); entry = undefined; }
@@ -297,6 +328,7 @@ export class SessionManager {
       this.assertAllowed(speaker);
       if (!this.usable(entry)) throw new SessionError('closed');
       this.options.metric?.('agent_session_reused');
+      entry.sessionReused = true;
       return entry;
     }
     // Idle contexts can be evicted independently of the global request queue.
@@ -310,17 +342,44 @@ export class SessionManager {
       ingressEnded: false, playbackDone: false, recovering: false, superseded: false, pendingTools: 0, acceptingAudio: false,
       responseIds: new Set(), completedResponseIds: new Set(),
       completionIds: new Set(),
-      followupUntil: 0, turnStarted: performance.now(), incident: newIncident(),
+      followupUntil: 0, turnStarted: request.receivedAt, incident: request.id,
       audioChunks: 0, audioBytes: 0, textReceived: false, completionReceived: false,
-      providerClosed: false, failed: false, localDrained: false, turnReleased: true };
+      providerClosed: false, failed: false, localDrained: false, turnReleased: true,
+      voiceInput: request.pcm !== undefined, userTurnRecognized: false, inputAudioChunks: 0, inputAudioBytes: 0,
+      recognizedUserEventIds: new Set(),
+      inputAudioFinished: false, rejectedAudioIds: new Set(), rejectedResponseIds: new Set(), sessionReused: false,
+      initialAudioReported: false, initialResponseReported: false };
     this.entries.set(speaker.discordUserId, entry);
     const current = entry;
     const callbacks: AgentCallbacks = {
-      onAudio: (audio, _eventId, info) => this.audio(current, audio, info?.responseId),
+      onAudio: (audio, eventId, info) => this.audio(current, audio, eventId, info?.responseId),
       onResponseComplete: (id) => this.complete(current, id),
+      onUserTranscript: (identity) => {
+        if (!this.usable(current)) return;
+        if (identity?.eventId !== undefined) {
+          if (current.recognizedUserEventIds.has(identity.eventId)) {
+            this.options.metric?.('agent_stale_user_turns'); return;
+          }
+          if (!this.quarantineId(current, current.recognizedUserEventIds, identity.eventId)) return;
+        }
+        if (!current.waiting || !current.voiceInput || !current.inputAudioChunks) {
+          this.options.metric?.('agent_unsolicited_user_turns'); return;
+        }
+        if (current.userTurnRecognized) return;
+        current.userTurnRecognized = true;
+        this.options.metric?.('agent_user_turns_recognized');
+        this.report(current, 'jarvis_agent_user_turn_recognized');
+        this.progress(current);
+      },
       onTextResponse: (identity) => {
+        if (this.blockInitial(current, identity?.eventId, identity?.responseId)) return;
         if (this.usable(current) && current.waiting && this.identifyResponse(current, identity?.responseId)) {
+          const first = !current.textReceived;
           current.textReceived = true;
+          if (first) {
+            if (current.voiceInput) this.options.metric?.('agent_responses_after_recognition');
+            this.report(current, 'jarvis_agent_response_observed');
+          }
           this.progress(current);
           this.retireForQueued(current);
         }
@@ -357,6 +416,7 @@ export class SessionManager {
       current.opening = undefined;
       this.options.metric?.('agent_sessions_started');
       this.options.metric?.('agent_session_open_ms', Math.round(performance.now() - startedAt));
+      this.report(current, 'jarvis_agent_session_ready');
       this.idle(current);
       return current;
     } catch (error) {
@@ -376,6 +436,14 @@ export class SessionManager {
     if (entry.waiting || entry.playing) throw new SessionError('busy');
     entry.waiting = true;
     entry.request = request;
+    entry.voiceInput = request.pcm !== undefined;
+    entry.userTurnRecognized = false;
+    entry.inputAudioChunks = entry.inputAudioBytes = 0;
+    entry.inputAudioFinished = false;
+    // Keep the greeting identifiers observed while a fresh socket was opening.
+    // Later turns reset this quarantine; IDs are not assumed monotonic or unique chunks.
+    if (entry.sessionReused) entry.rejectedAudioIds.clear();
+    entry.initialAudioReported = entry.initialResponseReported = false;
     entry.turnReleased = false;
     entry.localDrained = false;
     entry.firstAudioAt = entry.firstPlaybackAt = entry.lastAudioAt = entry.drainedAt = undefined;
@@ -406,6 +474,39 @@ export class SessionManager {
       && this.entries.get(entry.speaker.discordUserId) === entry && this.options.allowed(entry.speaker);
   }
 
+  private inputReport(incident: string, event: string, stage: 'voice_capture' | 'wake_detection', fields: DiagnosticFields): void {
+    this.options.logger?.event(event, 'info', {
+      ...fields, incident, operation: 'agent_turn', stage, input_kind: 'voice', speaker_verified: true, consent_current: true,
+    });
+  }
+
+  /** ASR confirms a user's utterance; startup output cannot stand in for that signal. */
+  private blockInitial(entry: Entry, eventId?: number, responseId?: string, audio = false): boolean {
+    if (!this.usable(entry)) return true;
+    const beforeRecognition = entry.voiceInput && !entry.userTurnRecognized;
+    const quarantined = (entry.voiceInput && eventId !== undefined && entry.rejectedAudioIds.has(eventId))
+      || (responseId !== undefined && entry.rejectedResponseIds.has(responseId));
+    if (!beforeRecognition && !quarantined) return false;
+    if (beforeRecognition) {
+      if (!this.quarantineId(entry, entry.rejectedAudioIds, eventId)
+        || !this.quarantineId(entry, entry.rejectedResponseIds, responseId)) return true;
+    }
+    this.options.metric?.(audio ? 'agent_initial_audio_discarded' : 'agent_initial_response_discarded');
+    if (audio ? !entry.initialAudioReported : !entry.initialResponseReported) {
+      if (audio) entry.initialAudioReported = true; else entry.initialResponseReported = true;
+      this.report(entry, 'jarvis_agent_initial_output_discarded');
+    }
+    return true;
+  }
+
+  private quarantineId<T>(entry: Entry, set: Set<T>, id: T | undefined): boolean {
+    if (id === undefined) return true;
+    // Store identities only in bounded process memory, never in diagnostics.
+    if (set.size >= 128 && !set.has(id)) { this.fail(entry, 'AGENT_INVALID_EVENT'); return false; }
+    set.add(id);
+    return true;
+  }
+
   /** Correlate only identifiers actually supplied; audio IDs are not chunk sequence numbers. */
   private identifyResponse(entry: Entry, responseId?: string): boolean {
     if (responseId === undefined) return true;
@@ -419,10 +520,11 @@ export class SessionManager {
     return true;
   }
 
-  private async audio(entry: Entry, pcm: Buffer, responseId?: string): Promise<void> {
+  private async audio(entry: Entry, pcm: Buffer, eventId: number, responseId?: string): Promise<void> {
     if (!this.usable(entry)) return;
     this.options.metric?.('audio_chunks_received');
     this.options.metric?.('audio_bytes_received', pcm.length);
+    if (this.blockInitial(entry, eventId, responseId, true)) return;
     if (!entry.waiting || entry.ingressEnded || !entry.session) {
       this.options.metric?.('audio_chunks_discarded'); return;
     }
@@ -477,7 +579,9 @@ export class SessionManager {
   }
 
   private complete(entry: Entry, eventId?: number): void {
-    if (!this.usable(entry) || !entry.waiting) return;
+    if (!this.usable(entry)) return;
+    if (this.blockInitial(entry, eventId)) return;
+    if (!entry.waiting) return;
     if (eventId !== undefined && entry.completionIds.has(eventId)) {
       this.options.metric?.('agent_duplicate_completions'); return;
     }
@@ -486,17 +590,22 @@ export class SessionManager {
       entry.completionIds.add(eventId);
     }
     entry.completionReceived = true;
-    entry.upload?.abort();
     if (entry.deadline) clearTimeout(entry.deadline);
     this.options.metric?.('agent_response_complete_received');
     this.options.metric?.('agent_responses_completed');
     this.report(entry, 'jarvis_agent_response_complete');
+    // A provider response must not truncate recorded microphone input. Output
+    // remains progressive while the complete capture and VAD tail finish uploading.
+    if (entry.voiceInput && !entry.inputAudioFinished) {
+      this.options.metric?.('agent_completion_during_input'); return;
+    }
     if (!entry.pendingTools) this.seal(entry);
   }
 
   /** Ingress closure is separate from generation confirmation and local drain. */
   private seal(entry: Entry): void {
-    if (!this.usable(entry) || entry.ingressEnded || entry.acceptingAudio) return;
+    if (!this.usable(entry) || entry.ingressEnded || entry.acceptingAudio
+      || (entry.voiceInput && !entry.inputAudioFinished && entry.upload !== undefined)) return;
     if (entry.completionReceived && !entry.audioBytes) {
       this.options.metric?.('agent_no_audio_responses');
       if (entry.textReceived) this.options.metric?.('agent_text_without_audio');
@@ -592,7 +701,10 @@ export class SessionManager {
       if (!this.usable(entry) || !entry.waiting) return;
       this.options.metric?.('agent_response_timeouts');
       this.missing(entry);
-      if (entry.audioBytes > 0) {
+      if (entry.voiceInput && !entry.userTurnRecognized) {
+        this.options.metric?.('agent_user_turn_missing');
+        this.fail(entry, 'AGENT_USER_TURN_MISSING');
+      } else if (entry.audioBytes > 0) {
         entry.recovering = true;
         this.report(entry, 'jarvis_agent_turn_recovering', 'AGENT_COMPLETION_MISSING');
         // Provider intake stops; validated writes queued before close are drained.
@@ -615,7 +727,11 @@ export class SessionManager {
   private report(entry: Entry, event: string, code?: ErrorCode): void {
     this.options.logger?.event(event, code ? 'error' : 'info', {
       incident: entry.incident, operation: 'agent_turn',
-      stage: entry.playing ? 'playback' : entry.textReceived && !entry.audioBytes ? 'agent_audio_wait'
+      stage: event === 'jarvis_agent_input_started' || event === 'jarvis_agent_input_sent' ? 'agent_audio_upload'
+        : event === 'jarvis_agent_session_ready' ? 'agent_connect'
+        : event === 'jarvis_agent_user_turn_recognized' ? 'agent_user_recognition'
+        : entry.voiceInput && !entry.userTurnRecognized ? 'agent_user_recognition'
+        : entry.playing ? 'playback' : entry.textReceived && !entry.audioBytes ? 'agent_audio_wait'
         : entry.waiting ? 'agent_response_wait' : 'agent_connect',
       ...(code ? { code, category: code === 'PLAYBACK_FAILED' ? 'playback' : 'agent' } : {}),
       duration_ms: Math.max(0, Math.round(performance.now() - entry.turnStarted)),
@@ -624,6 +740,12 @@ export class SessionManager {
       ingress_ended: entry.ingressEnded, playback_drained: entry.playbackDone,
       local_playback_drained: entry.localDrained,
       recovery: entry.recovering, pending_tools: entry.pendingTools,
+      input_kind: entry.voiceInput ? 'voice' : 'text', user_turn_recognized: entry.userTurnRecognized,
+      input_audio_chunks: entry.inputAudioChunks, input_audio_bytes: entry.inputAudioBytes,
+      input_audio_finished: entry.inputAudioFinished, silence_tail_ms: entry.voiceInput ? 800 : 0,
+      ...(entry.session ? { input_sample_rate: entry.session.inputSampleRate, output_sample_rate: entry.session.outputSampleRate } : {}),
+      session_reused: entry.sessionReused, speaker_verified: true,
+      consent_current: this.options.allowed(entry.speaker, entry.voiceInput),
       queue_depth: this.queue.length,
       turn_outcome: entry.failed ? 'failed' : entry.turnReleased
         ? entry.completionReceived && !entry.recovering ? 'completed' : entry.superseded ? 'superseded' : 'unconfirmed' : undefined,
@@ -668,6 +790,7 @@ export class SessionManager {
       agent_callback_error: 'AGENT_CALLBACK_ERROR', agent_backpressure: 'AGENT_BACKPRESSURE',
       agent_audio_backpressure: 'AGENT_BACKPRESSURE',
       agent_heartbeat_timeout: 'AGENT_HEARTBEAT_TIMEOUT',
+      agent_initiation_rejected: 'AGENT_INITIATION_REJECTED',
     };
     const safeCode = Object.hasOwn(codes, code) ? codes[code]! : 'AGENT_PROVIDER_ERROR';
     if ((code === 'agent_transport_error' || code === 'agent_heartbeat_timeout') && entry.waiting) {
@@ -682,6 +805,17 @@ export class SessionManager {
   private providerClose(entry: Entry): void {
     if (this.entries.get(entry.speaker.discordUserId) !== entry) return;
     entry.providerClosed = true;
+    if (entry.voiceInput && entry.upload && !entry.inputAudioFinished) {
+      entry.upload.abort();
+      this.options.metric?.('agent_input_incomplete');
+      entry.recovering = true;
+      if (!entry.failed) {
+        this.options.metric?.('agent_errors');
+        this.primaryError(entry, 'AGENT_INPUT_INCOMPLETE');
+      }
+      // The upload's finally releases the ingress guard and seals valid output.
+      // A partial input must not become a completed conversational turn.
+    }
     if (entry.completionReceived && entry.playing) { this.seal(entry); return; }
     if (entry.waiting || entry.opening) {
       if (!entry.recovering) {
@@ -697,6 +831,14 @@ export class SessionManager {
   }
 
   private interrupt(entry: Entry): void {
+    // The provider can interrupt its initial output upon detecting incoming speech.
+    // Like the SDK's output.interrupt(), this must not cut off the user's upload.
+    if (this.usable(entry) && entry.waiting && entry.voiceInput && !entry.userTurnRecognized
+      && entry.inputAudioChunks > 0 && !entry.stream && !entry.playing) {
+      this.options.metric?.('agent_input_interruptions');
+      this.report(entry, 'jarvis_agent_initial_output_discarded');
+      return;
+    }
     // Closing the provider session fences late audio/completion from the old turn.
     // A new question creates a fresh session instead of trusting event arrival timing.
     this.remove(entry, true, 'interrupted');

@@ -4,11 +4,18 @@ import { loadConfig, ConfigError } from '../src/config.js';
 const base = { JARVIS_DISCORD_TOKEN: 'fictional-discord-token-for-tests', JARVIS_OWNER_USER_ID: '100000000000000001',
   JARVIS_GUILD_ID: '100000000000000002', ELEVENLABS_AGENT_ID: 'agent_test', ELEVENLABS_API_KEY: 'fictional-api-key' };
 test('default is no voice capture; Elysium variables are unrelated', () => {
+  expect(loadConfig(base).JARVIS_SUPPRESS_FIRST_MESSAGE).toBe(true);
   expect(loadConfig(base).JARVIS_VOICE_INPUT).toBe('disabled');
   expect(loadConfig(base).JARVIS_BARGE_IN_ENABLED).toBe(false);
   expect(loadConfig(base).JARVIS_MAX_QUEUED_TURNS).toBe(8);
   expect(loadConfig(base).JARVIS_MAX_QUEUED_PER_USER).toBe(2);
   expect(loadConfig(base).JARVIS_QUESTION_QUEUE_TTL_SECONDS).toBe(60);
+});
+
+test('first-message policy is explicit and never enables unrelated overrides', () => {
+  expect(loadConfig({ ...base, JARVIS_SUPPRESS_FIRST_MESSAGE: 'true' }).JARVIS_SUPPRESS_FIRST_MESSAGE).toBe(true);
+  expect(loadConfig({ ...base, JARVIS_SUPPRESS_FIRST_MESSAGE: 'false' }).JARVIS_SUPPRESS_FIRST_MESSAGE).toBe(false);
+  expect(() => loadConfig({ ...base, JARVIS_SUPPRESS_FIRST_MESSAGE: 'yes' })).toThrow(ConfigError);
 });
 
 test('barge-in is an explicit opt-in requiring experimental external voice input', () => {

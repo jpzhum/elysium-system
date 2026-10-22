@@ -1,5 +1,9 @@
 # Verificar os incidentes do Jarvis no Render
 
+Para saudação repetida ao usar o microfone, siga também
+[VOICE_GREETING_VALIDATION.md](VOICE_GREETING_VALIDATION.md), incluindo a
+permissão de First message override e o evento final `user_transcript`.
+
 ## O que está comprovado
 
 O incidente `07090582` registrou apenas `jarvis_command_failed` em `/jarvis join`.
@@ -73,7 +77,7 @@ Veja a [pesquisa oficial e do SDK](ELEVENLABS_STREAMING_RESEARCH.md) e o
    instância. Não execute outra cópia local com o mesmo token/guild.
 5. Use `JARVIS_LOG_LEVEL=info` para acompanhar as etapas. Falhas também são
    registradas em nível `error`, com o snapshot relevante mesmo se info for filtrado.
-6. Confirme `jarvis_ready` com `diagnostics_version: 4` nos logs do processo novo.
+6. Confirme `jarvis_ready` com `diagnostics_version: 5` nos logs do processo novo.
    Esse marcador confirma a instrumentação, não conexão de voz ou resposta audível.
 
 Não há variável nova obrigatória. Credenciais continuam exclusivamente no

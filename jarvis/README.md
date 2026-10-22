@@ -10,6 +10,8 @@ Para falhas de `/join`, timeout de resposta ou ausência de som no Render, consu
 [o roteiro de diagnóstico e validação audível](docs/RENDER_INCIDENTS.md).
 Para cinco perguntas consecutivas, voz consentida e barge-in, siga o
 [roteiro V4](docs/V4_CONVERSATION_VALIDATION.md).
+Para repetição de saudação por microfone, configure First message/overrides e
+execute o [roteiro de reconhecimento da pergunta](docs/VOICE_GREETING_VALIDATION.md).
 
 ## Começar localmente
 
@@ -103,8 +105,13 @@ e cancelamento impedem execução posterior de tarefas daquele participante.
 
 Siga [docs/ELEVENLABS.md](docs/ELEVENLABS.md): agente privado, voz existente
 autorizada, português, PCM negociado e evento `agent_response_complete` habilitado.
-Copie [agent-system-prompt.md](agent-system-prompt.md) para System prompt e deixe
-First message vazio. Não permita override de prompt/tools.
+Copie [agent-system-prompt.md](agent-system-prompt.md) para System prompt. O worker
+solicita primeira mensagem vazia por padrão; permita somente o override **First
+message** em Security. Não permita override de prompt/tools. Se a conta não
+autorizar esse campo, publique First message vazio e configure deliberadamente
+`JARVIS_SUPPRESS_FIRST_MESSAGE=false`; não existe fallback automático após uma
+recusa. Inclua `user_transcript` nos client events para comprovar reconhecimento
+da pergunta dentro do ElevenAgents, sem registrar a transcrição.
 
 Signed URLs são obtidas no worker a cada sessão; API key e URLs nunca aparecem
 nos logs. Cada falante tem sessão própria, aberta sob demanda. O bot não mistura
@@ -131,6 +138,13 @@ um detector acústico local. Há limite global de verificações por minuto. A g
 transcrita Jarvis/Járvis/Djárvis ativa uma sessão ElevenAgents para o falante;
 o turno original segue em PCM mono negociado, em chunks com pacing e silêncio
 final para VAD. Não há streaming permanente do canal inteiro.
+O turno enviado inclui a pergunta completa capturada, sem recortar tudo após um
+timestamp presumido da wake word. O fim de captura usa 600 ms de silêncio, RMS
+mínimo de 0,008 e teto de 12 s por padrão; 600 ms não é a duração total da captura.
+O upload usa frames de 20 ms e acrescenta 0,8 s de silêncio. Esses ajustes locais
+não substituem o VAD/turn-taking configurado no agente. Os sinais de reconhecimento
+e de resposta têm etapas distintas: uma saudação espontânea não comprova que a
+fala do usuário virou mensagem conversacional.
 
 O follow-up dura 18 s por padrão após a drenagem local, só para aquele falante.
 Essa janela autoriza sua próxima fala sem repetir wake; não confirma conclusão
@@ -182,6 +196,7 @@ análise de licença. Não há latência inferior a dois segundos comprovada.
 | Configuração | Padrão |
 | --- | --- |
 | `JARVIS_MAX_ACTIVE_SESSIONS` | 2 sessões por worker |
+| `JARVIS_SUPPRESS_FIRST_MESSAGE` | `true`; exige permitir somente First message override no agente |
 | `JARVIS_MAX_QUEUED_TURNS` | 8 perguntas aguardando por sala |
 | `JARVIS_MAX_QUEUED_PER_USER` | 2 perguntas aguardando por participante |
 | `JARVIS_QUESTION_QUEUE_TTL_SECONDS` | 60 s em espera; configurável até 120 s |

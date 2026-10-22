@@ -13,6 +13,7 @@ const schema = z.object({
   JARVIS_DEFAULT_VOICE_CHANNEL_ID: snowflake.optional(),
   ELEVENLABS_AGENT_ID: z.string().trim().min(1).max(200).optional(),
   ELEVENLABS_API_KEY: z.string().trim().min(1).optional(),
+  JARVIS_SUPPRESS_FIRST_MESSAGE: z.enum(['true', 'false']).default('true').transform((value) => value === 'true'),
   JARVIS_VOICE_INPUT: z.enum(['disabled', 'elevenlabs-stt']).default('disabled'),
   JARVIS_BARGE_IN_ENABLED: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
   JARVIS_WAKE_WORD: z.string().trim().min(2).max(30).default('Jarvis'),

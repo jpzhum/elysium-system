@@ -1,5 +1,48 @@
 # Estado da implementação — 21/10/2026
 
+## Revisão: saudação inicial durante perguntas por voz
+
+O operador confirmou conexão, playback ElevenLabs e entrada de voz, mas relatou
+saudação repetida no lugar de resposta. O ponto `connectAgent()` do bot não
+informava a supressão já implementada no adapter, permitindo a primeira mensagem
+publicada em cada sessão nova. O worker passa a pedir primeira mensagem vazia por
+padrão, com `JARVIS_SUPPRESS_FIRST_MESSAGE=true` e permissão restrita de override
+First message na conta. Não há fallback automático que reabilite a saudação se o
+provedor negar o ajuste. A alternativa explícita exige agente publicado com
+First message vazio antes de definir a variável como `false`.
+
+O reconhecimento do turno conversacional é observado por `user_transcript`
+válido, sem registrar conteúdo. Captura, wake/follow-up, sessão aberta/reutilizada,
+upload PCM, reconhecimento e geração têm sinais sanitizados correlacionados pelo
+incidente local; saída anterior ao reconhecimento não vale como resposta à fala.
+O áudio capturado completo continua enviado em frames com pacing e silêncio
+final, mantendo ElevenAgents responsável por ASR, inteligência e voz.
+
+A wake word não força nova conexão: sessões válidas do mesmo Discord ID são
+reutilizadas. Recuperação V4 de turno sem conclusão pode abrir sessão nova para
+isolar a próxima pergunta; não conserva contexto remoto automaticamente. Playback
+progressivo, consentimento, limites, permissões e Elysium são preservados.
+
+Validação de produção e configuração: [VOICE_GREETING_VALIDATION.md](docs/VOICE_GREETING_VALIDATION.md).
+**Pendente: ouvir a resposta quatro a “Jarvis, quanto é dois mais dois?” em uma
+chamada real, repetir perguntas consecutivas e testar dois participantes.** Não
+houve deploy nem audição humana desta revisão. Os números V4 abaixo são histórico.
+
+| Verificação da correção de saudação | Resultado |
+| --- | --- |
+| Build, typecheck e lint Node | Passaram |
+| Suíte Node | 23 arquivos; 371 testes passaram e 1 gate real skipped |
+| Suíte Python | 78 testes e 67 subtests passaram |
+| Compileall e imports do AGENTS.md | Passaram, sem conectar ao Discord |
+| Elysium Python e Blueprint Render | Sem alterações |
+| Pergunta dois mais dois / sessão nova / consecutivas reais | Pendentes de deploy e audição humana |
+
+As regressões incluem saudação durante conexão/upload, ASR final versus
+tentativo/ausente/antigo, callbacks tardios, reutilização em cinco perguntas,
+frames PCM e silêncio final em 8/16/24 kHz e interrupção inicial sem cortar a
+fala. Resposta precoce também não aborta a captura já gravada. Os testes não
+comprovam reconhecimento semântico ou resposta correta em uma call real.
+
 ## Revisão V4: fila e disponibilidade entre perguntas
 
 O operador confirmou que o Jarvis já conecta no Render e que `/jarvis ask`

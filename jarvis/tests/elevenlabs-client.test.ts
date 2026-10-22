@@ -78,10 +78,55 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     expect(h.request).toHaveBeenCalledTimes(2);
   });
 
-  it('only requests a silent first message when explicitly enabled', async () => {
+  it('only requests a silent first message when explicitly enabled, without broad overrides', async () => {
     const h = harness({ suppressFirstMessage: true });
     await h.connect();
-    expect(h.socket.sent[0]).toHaveProperty('conversation_config_override.agent.first_message', '');
+    expect(h.socket.sent[0]?.conversation_config_override).toEqual({ agent: { first_message: '' } });
+    const disabled = harness({ suppressFirstMessage: false });
+    await disabled.connect();
+    expect(disabled.socket.sent[0]).not.toHaveProperty('conversation_config_override');
+  });
+
+  it.each(['client_error', 'error'])('sanitizes %s initiation rejection and never retries without the requested override', async type => {
+    const h = harness({ suppressFirstMessage: true }, false);
+    const pending = h.connect();
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'agent_initiation_rejected' });
+    await vi.waitFor(() => expect(h.createSocket).toHaveBeenCalled());
+    h.socket.open();
+    h.socket.message({ type, error_event: {
+      code: 422, error_type: 'private override details',
+      message: 'private transcript; api-secret; first_message override not allowed',
+    } });
+    await rejected;
+    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_initiation_rejected');
+    expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+    expect(h.request).toHaveBeenCalledOnce();
+    expect(h.createSocket).toHaveBeenCalledOnce();
+    expect(h.socket.sent).toHaveLength(1);
+    expect(h.socket.sent[0]?.conversation_config_override).toEqual({ agent: { first_message: '' } });
+  });
+
+  it('sanitizes a policy close before silent-session negotiation without reading its reason', async () => {
+    const h = harness({ suppressFirstMessage: true }, false);
+    const pending = h.connect();
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'agent_initiation_rejected' });
+    await vi.waitFor(() => expect(h.createSocket).toHaveBeenCalled());
+    h.socket.open();
+    h.socket.readyState = 3;
+    h.socket.emit('close', 1008, Buffer.from('private credential and transcript'));
+    await rejected;
+    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_initiation_rejected');
+    expect(h.request).toHaveBeenCalledOnce();
+  });
+
+  it('preserves authentication classification when silent-session initiation is denied with 403', async () => {
+    const h = harness({ suppressFirstMessage: true }, false);
+    const pending = h.connect();
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'agent_authentication_failed' });
+    await vi.waitFor(() => expect(h.createSocket).toHaveBeenCalled());
+    h.socket.open();
+    h.socket.message({ type: 'client_error', error_event: { code: 403, message: 'private policy reason' } });
+    await rejected;
   });
 
   it('waits for negotiated metadata and rejects unsupported formats before accepting audio', async () => {
@@ -116,7 +161,7 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     expect(() => session.sendAudio(Buffer.from([1]))).toThrow(AgentError);
   });
 
-  it('forwards PCM, interruption and true completion while ignoring text transcripts', async () => {
+  it('forwards PCM, interruption and true completion without exposing transcript content', async () => {
     const h = harness();
     const received: Buffer[] = [];
     h.callbacks.onAudio = vi.fn(pcm => { received.push(Buffer.from(pcm)); });
@@ -132,6 +177,87 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     expect(h.callbacks.onAudio).toHaveBeenCalledWith(Buffer.alloc(pcm.length), 2);
     expect(h.callbacks.onInterruption).toHaveBeenCalledOnce();
     expect(h.callbacks.onResponseComplete).toHaveBeenCalledOnce();
+  });
+
+  it('signals finalized nonempty ASR utterances using only optional protocol identity', async () => {
+    const h = harness();
+    h.callbacks.onUserTranscript = vi.fn();
+    await h.connect();
+    h.socket.message({ type: 'user_transcript', user_transcription_event: {
+      user_transcript: 'Jarvis, private speech never forwarded', event_id: 17, response_id: 'response_fixture',
+      secret_metadata: 'not forwarded',
+    } });
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'another private utterance' } });
+    expect(h.callbacks.onUserTranscript).toHaveBeenNthCalledWith(1, { eventId: 17, responseId: 'response_fixture' });
+    expect(h.callbacks.onUserTranscript).toHaveBeenNthCalledWith(2, {});
+    expect(JSON.stringify(vi.mocked(h.callbacks.onUserTranscript).mock.calls)).not.toContain('private');
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+  });
+
+  it('does not recognize an empty or tentative transcript as a user turn', async () => {
+    const h = harness();
+    h.callbacks.onUserTranscript = vi.fn();
+    await h.connect();
+    for (const user_transcript of ['', ' \n\t ']) {
+      h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript } });
+    }
+    h.socket.message({ type: 'tentative_user_transcript', user_transcription_event: { user_transcript: 'private tentative speech' } });
+    expect(h.callbacks.onUserTranscript).not.toHaveBeenCalled();
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { type: 'user_transcript' },
+    { type: 'user_transcript', user_transcription_event: [] },
+    { type: 'user_transcript', user_transcription_event: { user_transcript: 1 } },
+    { type: 'user_transcript', user_transcription_event: { user_transcript: 'private speech', event_id: -1 } },
+  ])('rejects malformed final ASR envelopes without forwarding content', async event => {
+    const h = harness();
+    h.callbacks.onUserTranscript = vi.fn();
+    await h.connect();
+    h.socket.message(event);
+    expect(h.callbacks.onUserTranscript).not.toHaveBeenCalled();
+    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('invalid_agent_event');
+    expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+  });
+
+  it('preserves greeting, recognized user turn and answer wire order during async acceptance', async () => {
+    let accept: (() => void) | undefined;
+    const order: string[] = [];
+    const h = harness();
+    h.callbacks.onAudio = vi.fn(pcm => {
+      order.push(`audio_${pcm[0]}`);
+      if (pcm[0] === 1) return new Promise<void>(resolve => { accept = resolve; });
+    });
+    h.callbacks.onUserTranscript = vi.fn(() => { order.push('recognized'); });
+    h.callbacks.onTextResponse = vi.fn(identity => { order.push(`text_${identity?.eventId}`); });
+    await h.connect();
+    for (const byte of [1, 2]) {
+      h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.from([byte, 0]).toString('base64'), event_id: 5 } });
+    }
+    h.socket.message({ type: 'agent_response', agent_response_event: { agent_response: 'private greeting', event_id: 5 } });
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private speech', event_id: 6 } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.from([3, 0]).toString('base64'), event_id: 7 } });
+    h.socket.message({ type: 'agent_response', agent_response_event: { agent_response: 'private answer', event_id: 7 } });
+    h.socket.message({ type: 'agent_chat_response_part', text_response_part: { type: 'delta', text: 'private continued answer', event_id: 8 } });
+    expect(order).toEqual(['audio_1']);
+    accept?.();
+    await vi.waitFor(() => expect(order).toEqual(['audio_1', 'audio_2', 'text_5', 'recognized', 'audio_3', 'text_7', 'text_8']));
+  });
+
+  it('ignores late final ASR after revocation and sanitizes recognition callback failures', async () => {
+    const controller = new AbortController();
+    const h = harness({ signal: controller.signal });
+    h.callbacks.onUserTranscript = vi.fn();
+    await h.connect();
+    controller.abort();
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private speech' } });
+    expect(h.callbacks.onUserTranscript).not.toHaveBeenCalled();
+    const broken = harness();
+    broken.callbacks.onUserTranscript = vi.fn(() => { throw new Error('private callback speech'); });
+    await broken.connect();
+    broken.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private speech' } });
+    expect(broken.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_callback_error');
   });
 
   it.each([401, 402, 403])('does not retry HTTP %s and sanitizes the upstream body', async status => {
@@ -541,6 +667,60 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     await vi.waitFor(() => expect(h.callbacks.onAudio).toHaveBeenCalledTimes(2));
     expect(h.callbacks.onAudio).toHaveBeenLastCalledWith(Buffer.alloc(2), 6);
     expect(h.callbacks.onInterruption).toHaveBeenCalledOnce();
+  });
+
+  it('preserves final user recognition when an interruption discards queued greeting output', async () => {
+    let accept: (() => void) | undefined;
+    let borrowed: Buffer | undefined;
+    const order: string[] = [];
+    const h = harness();
+    h.callbacks.onAudio = vi.fn(pcm => {
+      order.push(`audio_${pcm[0]}`);
+      if (pcm[0] === 1) {
+        borrowed = pcm;
+        return new Promise<void>(resolve => { accept = resolve; });
+      }
+    });
+    h.callbacks.onUserTranscript = vi.fn(identity => { order.push(`recognized_${identity?.eventId}`); });
+    h.callbacks.onInterruption = vi.fn(() => { order.push('interruption'); });
+    h.callbacks.onTextResponse = vi.fn();
+    await h.connect();
+    for (const byte of [1, 2]) {
+      h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.from([byte, 0]).toString('base64'), event_id: 5 } });
+    }
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private speech', event_id: 6 } });
+    h.socket.message({ type: 'agent_response', agent_response_event: { agent_response: 'private greeting', event_id: 5 } });
+    h.socket.message({ type: 'agent_response_complete', agent_response_complete_event: { event_id: 5 } });
+    h.socket.message({ type: 'interruption', interruption_event: { event_id: 6 } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.from([3, 0]).toString('base64'), event_id: 7 } });
+    expect(order).toEqual(['audio_1', 'interruption']);
+    expect(borrowed).toEqual(Buffer.from([1, 0]));
+    accept?.();
+    await vi.waitFor(() => expect(order).toEqual(['audio_1', 'interruption', 'recognized_6', 'audio_3']));
+    expect(borrowed).toEqual(Buffer.alloc(2));
+    expect(h.callbacks.onTextResponse).not.toHaveBeenCalled();
+    expect(h.callbacks.onResponseComplete).not.toHaveBeenCalled();
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+  });
+
+  it('discards preserved ASR markers when the interruption callback revokes the session', async () => {
+    let accept: (() => void) | undefined;
+    const controller = new AbortController();
+    const h = harness({ signal: controller.signal });
+    h.callbacks.onAudio = vi.fn(() => new Promise<void>(resolve => { accept = resolve; }));
+    h.callbacks.onUserTranscript = vi.fn();
+    h.callbacks.onInterruption = vi.fn(() => { controller.abort(); });
+    await h.connect();
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AQA=', event_id: 5 } });
+    h.socket.message({ type: 'user_transcript', user_transcription_event: { user_transcript: 'private speech', event_id: 6 } });
+    h.socket.message({ type: 'interruption', interruption_event: { event_id: 6 } });
+    accept?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.callbacks.onInterruption).toHaveBeenCalledOnce();
+    expect(h.callbacks.onUserTranscript).not.toHaveBeenCalled();
+    expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
   });
 
   it('forwards content-free message identities and documented tool activity without sensitive payloads', async () => {

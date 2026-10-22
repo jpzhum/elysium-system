@@ -72,7 +72,10 @@ export class JarvisBot {
     if (this.closed) return;
     // Create/upsert only Jarvis; do not bulk replace other application commands.
     await guild.commands.create(jarvisCommand.toJSON());
-    this.logger.event(this.config.daveSmoke ? 'dave_probe_ready' : 'jarvis_ready', 'info', { diagnostics_version: 4 });
+    this.logger.event(this.config.daveSmoke ? 'dave_probe_ready' : 'jarvis_ready', 'info', {
+      diagnostics_version: 5,
+      ...(!this.config.daveSmoke ? { first_message_override_requested: this.config.JARVIS_SUPPRESS_FIRST_MESSAGE } : {}),
+    });
   }
 
   private async reply(interaction: ChatInputCommandInteraction, content: string, ephemeral = true): Promise<void> {
@@ -123,7 +126,9 @@ export class JarvisBot {
         }
         const snapshot = this.metrics.snapshot();
         // Streaming evidence remains visible even when legacy counters fill the reply.
-        const streaming = ['questions_received', 'questions_queued', 'questions_cancelled', 'turn_queue_depth',
+        const streaming = ['voice_turns_captured', 'voice_wake_activations', 'agent_input_audio_chunks',
+          'agent_user_turns_recognized', 'agent_responses_after_recognition', 'agent_initial_audio_discarded',
+          'agent_user_turn_missing', 'questions_received', 'questions_queued', 'questions_cancelled', 'turn_queue_depth',
           'agent_turns_superseded', 'agent_first_audio_ms_last', 'agent_first_playback_ms_last',
           'next_question_ready_ms_last', 'audio_stream_started', 'audio_chunks_received', 'audio_chunks_played',
           'audio_stream_buffer_bytes', 'playback_started', 'playback_completed', 'agent_response_received',
@@ -295,6 +300,7 @@ export class JarvisBot {
       room.sessions = new SessionManager({
         connect: (speaker, callbacks, signal) => connectAgent({
           apiKey: this.config.ELEVENLABS_API_KEY!, agentId: this.config.ELEVENLABS_AGENT_ID!,
+          suppressFirstMessage: this.config.JARVIS_SUPPRESS_FIRST_MESSAGE,
           dynamicVariables: promptVariables(speaker, channel.guild.name), callbacks, signal,
           tools: async (name, parameters) => {
             if (!this.allowed(room, speaker)) throw new AuthorizationError();
@@ -350,7 +356,7 @@ export class JarvisBot {
             await this.voiceInterruption(room, member, pcm, timing.playbackToken);
             return;
           }
-          try { await room.sessions.voiceTurn(this.context(room, member), pcm); }
+          try { await room.sessions.voiceTurn(this.context(room, member), pcm, timing); }
           catch {
             this.metrics.add('voice_turn_rejected');
             if (this.room === room && consent.get(id)?.audio) {

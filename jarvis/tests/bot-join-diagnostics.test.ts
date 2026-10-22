@@ -7,12 +7,18 @@ import type { VoiceConnectionManager } from '../src/discord/voice-connection.js'
 import { loadConfig } from '../src/config.js';
 import { DiagnosticError } from '../src/observability/diagnostics.js';
 import { Logger } from '../src/observability/metrics.js';
+import type { AgentCallbacks, ConnectAgentOptions } from '../src/agents/elevenlabs-client.js';
 
 const hooks = vi.hoisted(() => ({
   runtime: vi.fn(async () => undefined),
   playbackError: undefined as unknown,
   receiverError: undefined as unknown,
   playbackStop: vi.fn(), receiverStop: vi.fn(),
+  agentConnect: vi.fn(async (_options: ConnectAgentOptions) => ({ inputSampleRate: 16000, outputSampleRate: 24000,
+    sendText: vi.fn(), sendAudio: vi.fn(), sendContext: vi.fn(), close: vi.fn() })),
+}));
+vi.mock('../src/agents/elevenlabs-client.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/agents/elevenlabs-client.js')>(), connectAgent: hooks.agentConnect,
 }));
 vi.mock('../src/observability/voice-runtime.js', () => ({ inspectVoiceRuntime: hooks.runtime }));
 vi.mock('../src/audio/playback.js', () => ({ PlaybackQueue: class {
@@ -38,9 +44,9 @@ interface Access {
 const active: JarvisBot[] = [];
 const privateText = 'PRIVATE_TOKEN=https://private.invalid/signed?token=SECRET';
 
-function setup() {
+function setup(environment: Record<string, string> = {}) {
   const config = loadConfig({ JARVIS_DISCORD_TOKEN: 'fictional-discord-token-for-tests',
-    JARVIS_OWNER_USER_ID: '100000000000000001', JARVIS_GUILD_ID: '100000000000000002' }, true);
+    JARVIS_OWNER_USER_ID: '100000000000000001', JARVIS_GUILD_ID: '100000000000000002', ...environment }, true);
   const logs: Record<string, unknown>[] = [];
   const bot = new JarvisBot(config, new Logger('info', (line) => logs.push(JSON.parse(line))));
   active.push(bot);
@@ -96,6 +102,21 @@ beforeEach(() => {
   hooks.receiverError = undefined;
   hooks.playbackStop.mockClear();
   hooks.receiverStop.mockClear();
+  hooks.agentConnect.mockClear();
+});
+
+test.each([undefined, 'false'])('Discord sessions pass the configured first-message policy: %s', async (setting) => {
+  const h = setup(setting ? { JARVIS_SUPPRESS_FIRST_MESSAGE: setting } : {});
+  await h.run();
+  const room = h.access.room as { sessions: object };
+  const options = Reflect.get(room.sessions, 'options') as {
+    connect: (speaker: object, callbacks: AgentCallbacks, signal: AbortSignal) => Promise<unknown>;
+  };
+  const callbacks: AgentCallbacks = { onAudio: () => {}, onResponseComplete: () => {}, onInterruption: () => {},
+    onClose: () => {}, onError: () => {} };
+  await options.connect({ discordUserId: 'guest', displayName: 'guest', isOwner: false }, callbacks, new AbortController().signal);
+  expect(hooks.agentConnect).toHaveBeenCalledOnce();
+  expect(hooks.agentConnect.mock.calls[0]![0]).toMatchObject({ suppressFirstMessage: setting !== 'false', callbacks });
 });
 afterEach(async () => {
   for (const bot of active.splice(0)) await bot.stop();

@@ -21,16 +21,20 @@ podem mudar.
 
 ## 2. Primeira fala e formatos de áudio
 
-Deixe **First message vazio** no agente usado pelo Discord. Esse é o caminho
-usado pelo worker atual: ele não solicita override de primeira mensagem. Uma
-saudação é apropriada apenas no agente de teste do painel; retire-a antes de usar
-o mesmo agente no Discord.
+O worker Discord solicita `suppressFirstMessage: true` por padrão, controlado por
+`JARVIS_SUPPRESS_FIRST_MESSAGE=true`. Em **Security**, permita somente o override
+**First message** necessário para este ajuste. A abertura envia apenas
+`conversation_config_override.agent.first_message: ""`; System prompt, Tools e
+demais permissões não são ampliados. A configuração publicada do agente continua
+sendo responsável por personalidade, raciocínio e voz.
 
-O adapter oferece `suppressFirstMessage: true` como opção de implementação,
-desativada por padrão. Ela envia apenas
-`conversation_config_override.agent.first_message: ""` e exige que o override
-First message esteja habilitado em Security. Não habilite override de System
-prompt ou Tools para resolver uma saudação. Veja [Overrides](https://elevenlabs.io/docs/eleven-agents/customization/personalization/overrides).
+Se a política da conta não permitir esse override, publique **First message vazio**
+no agente e configure deliberadamente `JARVIS_SUPPRESS_FIRST_MESSAGE=false` no
+worker. Valide a versão publicada antes de usar esse caminho. Uma recusa de
+override não provoca uma nova tentativa automática com saudações habilitadas.
+Não desabilite o ajuste para contornar uma rejeição sem primeiro retirar a
+saudação da configuração publicada. Veja [Overrides](https://elevenlabs.io/docs/eleven-agents/customization/personalization/overrides)
+e o [roteiro específico de voz/saudação](VOICE_GREETING_VALIDATION.md).
 
 Configure PCM para entrada e saída do agente. Na configuração documentada, os
 campos são `conversation_config.asr.user_input_audio_format` e
@@ -54,6 +58,7 @@ Confira especialmente:
 [
   "audio",
   "agent_response",
+  "user_transcript",
   "interruption",
   "agent_response_complete",
   "client_tool_call",
@@ -67,6 +72,10 @@ sem afirmar que a geração terminou. `agent_response` delimita uma mensagem tex
 que pode ser uma entre várias no mesmo turno, e não encerra o áudio. Transcripts,
 correções e texto recebidos não são registrados. O adapter sinaliza somente que
 houve texto, sem guardar seu conteúdo, para detectar uma resposta sem áudio.
+`user_transcript` é o reconhecimento final da fala pelo ElevenAgents; sua presença
+é sinalizada sem repassar a transcrição. Ele precisa estar habilitado para
+comprovar que a pergunta por microfone foi reconhecida. O resultado do STT usado
+para wake não substitui esse reconhecimento dentro da sessão conversacional.
 Metadata de inicialização e ping são tratados pelo protocolo; não precisam ser
 inventados em overrides. Para diagnóstico e validação audível, siga
 [STREAMING_PRODUCTION_VALIDATION.md](STREAMING_PRODUCTION_VALIDATION.md).
