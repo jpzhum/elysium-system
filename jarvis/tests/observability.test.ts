@@ -97,7 +97,7 @@ describe('bounded structured operational logging', () => {
     state.logger.event('jarvis_ready', 'info', {
       duration_ms: NaN, stage_duration_ms: -1, timeout_ms: Infinity, network_status: -1, previous_network_status: 7,
       websocket_close_code: 5_000, disconnect_reason: 1.5, dave_protocol_version: 65_536,
-      diagnostics_version: 3,
+      diagnostics_version: 4, pending_tools: 129,
     });
     expect(Object.keys(state.records()[0]!)).toEqual(['time', 'level', 'event', 'incident']);
   });
@@ -241,4 +241,23 @@ test('metrics counters preserve existing names, bounds and snapshots', () => {
   metrics.add('invalid metric');
   metrics.add('invalid_value', Infinity);
   expect(metrics.snapshot()).toEqual({ voice_turns: 3 });
+});
+
+test('stream diagnostics keep completion, drain, recovery and tool state separate without content', () => {
+  const state = capture();
+  state.logger.event('jarvis_agent_turn_recovering', 'warn', {
+    operation: 'agent_turn', code: 'AGENT_COMPLETION_MISSING', completion_received: false,
+    ingress_ended: true, playback_drained: false, recovery: true, pending_tools: 2, diagnostics_version: 3,
+  });
+  expect(state.records()[0]).toMatchObject({ completion_received: false, ingress_ended: true,
+    playback_drained: false, recovery: true, pending_tools: 2, diagnostics_version: 3 });
+});
+
+test('stream gauges return to zero and fixed metric cardinality is bounded', () => {
+  const metrics = new Metrics();
+  metrics.add('audio_stream_buffer_bytes', 384);
+  metrics.add('audio_stream_buffer_bytes', -384);
+  for (let i = 0; i < 200; i++) metrics.add(`counter_${i}`);
+  expect(metrics.snapshot().audio_stream_buffer_bytes).toBe(0);
+  expect(Object.keys(metrics.snapshot())).toHaveLength(128);
 });

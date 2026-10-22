@@ -69,7 +69,7 @@ export class JarvisBot {
     if (this.closed) return;
     // Create/upsert only Jarvis; do not bulk replace other application commands.
     await guild.commands.create(jarvisCommand.toJSON());
-    this.logger.event(this.config.daveSmoke ? 'dave_probe_ready' : 'jarvis_ready', 'info', { diagnostics_version: 2 });
+    this.logger.event(this.config.daveSmoke ? 'dave_probe_ready' : 'jarvis_ready', 'info', { diagnostics_version: 3 });
   }
 
   private async reply(interaction: ChatInputCommandInteraction, content: string, ephemeral = true): Promise<void> {
@@ -117,7 +117,12 @@ export class JarvisBot {
           // Ephemeral ID-labelled counters are for verifying gateway attribution, never production logs.
           probe = '\nProva por falante consentido: ' + JSON.stringify(Object.fromEntries(room.probe));
         }
-        const counters = JSON.stringify(this.metrics.snapshot());
+        const snapshot = this.metrics.snapshot();
+        // Streaming evidence remains visible even when legacy counters fill the reply.
+        const streaming = ['audio_stream_started', 'audio_chunks_received', 'audio_chunks_played',
+          'audio_stream_buffer_bytes', 'playback_started', 'playback_completed', 'agent_response_received',
+          'agent_response_complete_received', 'turn_completion_missing', 'playback_failed'];
+        const counters = JSON.stringify({ ...Object.fromEntries(streaming.map((name) => [name, snapshot[name] ?? 0])), ...snapshot });
         await this.reply(interaction, `${room ? 'Conectado' : 'Desconectado'}; modo: ${this.config.daveSmoke
           ? 'diagnóstico DAVE local' : this.config.JARVIS_VOICE_INPUT}; sessões: ${room?.sessions.activeCount ?? 0}.`
           + `\nContadores (não estimam créditos): ${counters}${probe}`.slice(0, 1750)); return;
@@ -251,7 +256,8 @@ export class JarvisBot {
       connection = await this.voice.join(channel, diagnostic);
       if (this.closed || this.epoch !== epoch) { this.voice.leave(); throw new SessionError('closed'); }
       diagnostic?.stage('playback_setup');
-      const playback = new PlaybackQueue(connection, { maxQueue: 4, maxSeconds: 30, onMetric: this.metrics.add });
+      const playback = new PlaybackQueue(connection, { maxQueue: 4, maxSeconds: 120,
+        maxBufferBytes: 384 * 1024, onMetric: this.metrics.add });
       const consent = new ConsentStore();
       // Closure is assigned before any receiver subscriptions are started.
       const room = { channel, consent, playback, probe: new Map() } as Room;

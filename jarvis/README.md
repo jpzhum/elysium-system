@@ -121,12 +121,21 @@ transcrita Jarvis/Járvis/Djárvis ativa uma sessão ElevenAgents para o falante
 o turno original segue em PCM mono negociado, em chunks com pacing e silêncio
 final para VAD. Não há streaming permanente do canal inteiro.
 
-O follow-up dura 18 s por padrão após a resposta, só para aquele falante. Enquanto
+O follow-up dura 18 s por padrão após conclusão explícita e playback, só para aquele falante. Enquanto
 Jarvis reproduz áudio, a captura é suprimida para reduzir eco; barge-in de voz
 durante playback não está implementado. Interrupções do provedor cancelam o upload
-e o áudio daquele turno. A resposta completa é limitada e acumulada antes da
-reprodução para serializar falantes; isso acrescenta latência. Dono ganha prioridade
-na fila de respostas, sem interromper convidados no meio da fala.
+e o áudio daquele turno. PCM recebido segue progressivamente para Opus/Discord,
+com conversão contínua, buffers limitados e backpressure. Não é preciso esperar
+`agent_response_complete` para ouvir. Dono ganha prioridade na fila de respostas,
+sem interromper convidados no meio da fala.
+
+Conclusão da geração, fim do recebimento e fim da reprodução são estados distintos.
+Se a conclusão faltar, 45 s sem progresso e sem ferramenta pendente disparam uma
+recuperação: fecha o transporte, drena áudio válido e registra resultado não
+confirmado, sem follow-up. Silêncio não confirma geração completa. Revogação,
+desconexão e expiração cancelam imediatamente. Veja a
+[validação real no Render](docs/STREAMING_PRODUCTION_VALIDATION.md) e a
+[pesquisa do SDK oficial](docs/ELEVENLABS_STREAMING_RESEARCH.md).
 
 O reconhecimento fonético real em PT-BR, falsos wakes, qualidade VAD, perda de
 frames DAVE e latência ainda não foram medidos. Os testes de grafias usam texto
@@ -149,8 +158,10 @@ permanece risco até executar a matriz real; `/ask` não aprova voz de entrada.
 O limite de turnos é reservado antes de abrir uma sessão paga; falhas de conexão
 também consomem tentativa. O criador desconectar/reconectar recria a sessão da sala.
 Esses contadores não substituem um teto de crédito da ElevenLabs/Brave. A fila de
-playback admite quatro respostas, com até 30 s cada, e os streams têm limites de
-tempo/tamanho. Há timeout, backpressure e encerramento de sessões ociosas.
+playback admite quatro respostas, com até 120 s de PCM e 384 KiB pendentes por
+resposta; o prazo absoluto de 180 s inclui espera na fila e pausas. O adapter tem
+outros 384 KiB de PCM pendente por sessão. Limites absolutos cancelam o fluxo e
+não significam conclusão. Há backpressure e encerramento de sessões ociosas.
 
 Não há banco nem arquivos de voz/transcrições. Consentimentos e contexto são
 apenas em memória. `JARVIS_CONSENT_STORAGE_URL` é rejeitada enquanto não existir

@@ -11,6 +11,9 @@ class FakeSocket extends EventEmitter {
   bufferedAmount = 0;
   sent: Record<string, unknown>[] = [];
   terminated = false;
+  paused = false;
+  pause = vi.fn(() => { this.paused = true; });
+  resume = vi.fn(() => { this.paused = false; });
   constructor() { super(); sockets.push(this); }
   send(data: string, callback?: (error?: Error) => void): void {
     this.sent.push(JSON.parse(data) as Record<string, unknown>);
@@ -115,6 +118,8 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
 
   it('forwards PCM, interruption and true completion while ignoring text transcripts', async () => {
     const h = harness();
+    const received: Buffer[] = [];
+    h.callbacks.onAudio = vi.fn(pcm => { received.push(Buffer.from(pcm)); });
     await h.connect();
     const pcm = Buffer.from([1, 0, 2, 0]);
     h.socket.message({ type: 'audio', audio_event: { audio_base_64: pcm.toString('base64'), event_id: 2 } });
@@ -123,7 +128,8 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     expect(h.callbacks.onResponseComplete).not.toHaveBeenCalled();
     h.socket.message({ type: 'interruption', interruption_event: { reason: 'user' } });
     h.socket.message({ type: 'agent_response_complete', agent_response_complete_event: { event_id: 2 } });
-    expect(h.callbacks.onAudio).toHaveBeenCalledWith(pcm, 2);
+    expect(received).toEqual([pcm]);
+    expect(h.callbacks.onAudio).toHaveBeenCalledWith(Buffer.alloc(pcm.length), 2);
     expect(h.callbacks.onInterruption).toHaveBeenCalledOnce();
     expect(h.callbacks.onResponseComplete).toHaveBeenCalledOnce();
   });
@@ -352,5 +358,218 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
     expect(h.callbacks.onError).not.toHaveBeenCalled();
     expect(h.callbacks.onClose).toHaveBeenCalledOnce();
     expect(h.socket.sent).toHaveLength(1);
+  });
+
+  it('accepts every audio chunk with the same event ID before any completion event', async () => {
+    const h = harness();
+    const received: Buffer[] = [];
+    h.callbacks.onAudio = vi.fn(pcm => { received.push(Buffer.from(pcm)); });
+    await h.connect();
+    for (let index = 0; index < 30; index++) {
+      h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.from([index, 0]).toString('base64'), event_id: 5 } });
+    }
+    expect(h.callbacks.onAudio).toHaveBeenCalledTimes(30);
+    expect(received).toEqual(Array.from({ length: 30 }, (_, index) => Buffer.from([index, 0])));
+    expect(h.callbacks.onResponseComplete).not.toHaveBeenCalled();
+  });
+
+  it('serializes async audio acceptance, delays completion behind received audio and still answers ping', async () => {
+    let accept: (() => void) | undefined;
+    const order: string[] = [];
+    const h = harness();
+    h.callbacks.onAudio = vi.fn(pcm => {
+      order.push(`audio_${pcm[0]}`);
+      if (pcm[0] === 1) return new Promise<void>(resolve => { accept = resolve; });
+    });
+    h.callbacks.onResponseComplete = vi.fn(() => { order.push('complete'); });
+    await h.connect();
+    for (const byte of [1, 2]) {
+      h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.from([byte, 0]).toString('base64'), event_id: 5 } });
+    }
+    h.socket.message({ type: 'agent_response_complete', agent_response_complete_event: { event_id: 5 } });
+    h.socket.message({ type: 'ping', ping_event: { event_id: 99 } });
+    expect(order).toEqual(['audio_1']);
+    expect(h.socket.sent.at(-1)).toEqual({ type: 'pong', event_id: 99 });
+    accept?.();
+    await vi.waitFor(() => expect(order).toEqual(['audio_1', 'audio_2', 'complete']));
+  });
+
+  it('does not make completion callback promises block a later message', async () => {
+    const h = harness();
+    h.callbacks.onResponseComplete = vi.fn(() => new Promise<void>(() => { /* Turn bookkeeping can wait independently. */ }));
+    await h.connect();
+    h.socket.message({ type: 'agent_response_complete', agent_response_complete_event: { event_id: 5 } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AAA=', event_id: 6 } });
+    expect(h.callbacks.onAudio).toHaveBeenCalledExactlyOnceWith(Buffer.alloc(2), 6);
+  });
+
+  it('pauses ingress at its high water mark and resumes after bounded writes are accepted', async () => {
+    let accept: (() => void) | undefined;
+    const h = harness();
+    h.callbacks.onAudio = vi.fn().mockImplementationOnce(() => new Promise<void>(resolve => { accept = resolve; }));
+    await h.connect();
+    const encoded = Buffer.alloc(192_000).toString('base64');
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: encoded, event_id: 5 } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: encoded, event_id: 5 } });
+    expect(h.socket.pause).toHaveBeenCalledOnce();
+    expect(h.socket.paused).toBe(true);
+    expect(h.callbacks.onAudio).toHaveBeenCalledOnce();
+    accept?.();
+    await vi.waitFor(() => expect(h.socket.resume).toHaveBeenCalledOnce());
+    expect(h.callbacks.onAudio).toHaveBeenCalledTimes(2);
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a peer exceeds the hard ingress byte bound despite pausing', async () => {
+    const h = harness();
+    h.callbacks.onAudio = vi.fn(() => new Promise<void>(() => { /* Slow consumer. */ }));
+    await h.connect();
+    const encoded = Buffer.alloc(192_000).toString('base64');
+    for (let index = 0; index < 3; index++) h.socket.message({ type: 'audio', audio_event: { audio_base_64: encoded, event_id: 5 } });
+    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_audio_backpressure');
+    expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+    expect(h.callbacks.onAudio).toHaveBeenCalledOnce();
+  });
+
+  it('bounds queued event objects as well as PCM bytes', async () => {
+    const h = harness();
+    h.callbacks.onAudio = vi.fn(() => new Promise<void>(() => { /* Slow consumer. */ }));
+    await h.connect();
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AAA=', event_id: 5 } });
+    for (let index = 0; index < 1_025; index++) {
+      h.socket.message({ type: 'agent_response_complete', agent_response_complete_event: { event_id: 5 } });
+    }
+    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_audio_backpressure');
+    expect(h.callbacks.onResponseComplete).not.toHaveBeenCalled();
+  });
+
+  it('does not mistake locally paused ingress for a dead provider and restarts heartbeat after resume', async () => {
+    vi.useFakeTimers();
+    let accept: (() => void) | undefined;
+    const h = harness();
+    h.callbacks.onAudio = vi.fn().mockImplementationOnce(() => new Promise<void>(resolve => { accept = resolve; }));
+    await h.connect();
+    const encoded = Buffer.alloc(192_000).toString('base64');
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: encoded, event_id: 5 } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: encoded, event_id: 5 } });
+    expect(h.socket.paused).toBe(true);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+    expect(h.callbacks.onClose).not.toHaveBeenCalled();
+    accept?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.socket.paused).toBe(false);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_heartbeat_timeout');
+  });
+
+  it('drains previously received valid PCM on heartbeat failure without confirming generation', async () => {
+    vi.useFakeTimers();
+    let accept: (() => void) | undefined;
+    const received: Buffer[] = [];
+    const h = harness();
+    h.callbacks.onAudio = vi.fn(pcm => {
+      received.push(Buffer.from(pcm));
+      if (received.length === 1) return new Promise<void>(resolve => { accept = resolve; });
+    });
+    await h.connect();
+    for (const value of [1, 2]) {
+      h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.from([value, 0]).toString('base64'), event_id: 5 } });
+    }
+    await vi.advanceTimersByTimeAsync(100_000);
+    expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_heartbeat_timeout');
+    expect(h.callbacks.onClose).not.toHaveBeenCalled();
+    accept?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(received).toEqual([Buffer.from([1, 0]), Buffer.from([2, 0])]);
+    expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+    expect(h.callbacks.onResponseComplete).not.toHaveBeenCalled();
+  });
+
+  it.each(['remote_close', 'local_drain', 'transport_error'] as const)('drains valid received audio on %s without inventing completion', async kind => {
+    let accept: (() => void) | undefined;
+    const h = harness();
+    const received: Buffer[] = [];
+    h.callbacks.onAudio = vi.fn(pcm => {
+      received.push(Buffer.from(pcm));
+      if (received.length === 1) return new Promise<void>(resolve => { accept = resolve; });
+    });
+    const session = await h.connect();
+    for (const byte of [1, 2]) h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.from([byte, 0]).toString('base64'), event_id: 7 } });
+    if (kind === 'remote_close') h.socket.close();
+    else if (kind === 'local_drain') session.close({ drainAudio: true });
+    else h.socket.emit('error', new Error('credential-secret'));
+    expect(h.callbacks.onClose).not.toHaveBeenCalled();
+    expect(h.callbacks.onError).toHaveBeenCalledTimes(kind === 'transport_error' ? 1 : 0);
+    accept?.();
+    await vi.waitFor(() => expect(h.callbacks.onClose).toHaveBeenCalledOnce());
+    expect(received).toEqual([Buffer.from([1, 0]), Buffer.from([2, 0])]);
+    expect(h.callbacks.onResponseComplete).not.toHaveBeenCalled();
+  });
+
+  it('revocation cancels queued PCM and suppresses a secondary rejected write while transport is draining', async () => {
+    let rejectWrite: ((reason: unknown) => void) | undefined;
+    const controller = new AbortController();
+    const h = harness({ signal: controller.signal });
+    h.callbacks.onAudio = vi.fn(() => new Promise<void>((_resolve, reject) => { rejectWrite = reject; }));
+    const session = await h.connect();
+    for (let index = 0; index < 2; index++) h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AAA=', event_id: 7 } });
+    session.close({ drainAudio: true });
+    controller.abort();
+    rejectWrite?.(new Error('private cancelled write'));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.callbacks.onAudio).toHaveBeenCalledOnce();
+    expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+  });
+
+  it('cancels queued audio on interruption and filters stale event IDs using the SDK interruption boundary', async () => {
+    let accept: (() => void) | undefined;
+    const h = harness();
+    h.callbacks.onAudio = vi.fn().mockImplementationOnce(() => new Promise<void>(resolve => { accept = resolve; }));
+    await h.connect();
+    for (const byte of [1, 2]) h.socket.message({ type: 'audio', audio_event: { audio_base_64: Buffer.from([byte, 0]).toString('base64'), event_id: 5 } });
+    h.socket.message({ type: 'interruption', interruption_event: { event_id: 6 } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AAA=', event_id: 5 } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AAA=', event_id: 6 } });
+    accept?.();
+    await vi.waitFor(() => expect(h.callbacks.onAudio).toHaveBeenCalledTimes(2));
+    expect(h.callbacks.onAudio).toHaveBeenLastCalledWith(Buffer.alloc(2), 6);
+    expect(h.callbacks.onInterruption).toHaveBeenCalledOnce();
+  });
+
+  it('forwards content-free message identities and documented tool activity without sensitive payloads', async () => {
+    const h = harness();
+    h.callbacks.onTextResponse = vi.fn();
+    h.callbacks.onToolActivity = vi.fn();
+    await h.connect();
+    h.socket.message({ type: 'agent_response', agent_response_event: { agent_response: 'private text', event_id: 5, response_id: 'message_1' } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: 'AAA=', event_id: 5, response_id: 'message_1' } });
+    h.socket.message({ type: 'agent_tool_request', agent_tool_request: { tool_call_id: 'tool_1', parameters: { private: 'secret' } } });
+    h.socket.message({ type: 'mcp_tool_call', mcp_tool_call: { tool_call_id: 'tool_2', state: 'awaiting_approval' } });
+    h.socket.message({ type: 'agent_tool_response_full_payload', agent_tool_response_full_payload: { tool_call_id: 'tool_1', full_tool_result: 'private result' } });
+    h.socket.message({ type: 'mcp_tool_call', mcp_tool_call: { tool_call_id: 'tool_2', state: 'success', result: ['private result'] } });
+    expect(h.callbacks.onTextResponse).toHaveBeenCalledExactlyOnceWith({ eventId: 5, responseId: 'message_1' });
+    expect(h.callbacks.onAudio).toHaveBeenCalledExactlyOnceWith(Buffer.alloc(2), 5, { responseId: 'message_1' });
+    expect(vi.mocked(h.callbacks.onToolActivity).mock.calls).toEqual([[1], [2], [1], [0]]);
+    expect(JSON.stringify(vi.mocked(h.callbacks.onTextResponse).mock.calls)).not.toContain('private');
+  });
+
+  it('sanitizes asynchronous audio and completion callback rejections', async () => {
+    for (const kind of ['audio', 'complete']) {
+      const h = harness();
+      if (kind === 'audio') h.callbacks.onAudio = vi.fn(async () => { throw new Error('private audio secret'); });
+      else h.callbacks.onResponseComplete = vi.fn(async () => { throw new Error('private completion secret'); });
+      await h.connect();
+      h.socket.message(kind === 'audio'
+        ? { type: 'audio', audio_event: { audio_base_64: 'AAA=', event_id: 5 } }
+        : { type: 'agent_response_complete', agent_response_complete_event: { event_id: 5 } });
+      await vi.waitFor(() => expect(h.callbacks.onError).toHaveBeenCalledExactlyOnceWith('agent_callback_error'));
+    }
   });
 });

@@ -1,18 +1,47 @@
 # Estado da implementação — 21/10/2026
 
-## Revisão de diagnóstico de produção
+## Revisão de reprodução progressiva
+
+Evidência independente de produção confirmou áudio sem `agent_response_complete`:
+30 eventos em 55 s; no Jarvis, `BABA0C1C` recebeu 79.360 bytes e reteve o áudio.
+A revisão transmite PCM progressivamente para Opus/Discord com buffers limitados,
+backpressure e cancelamento por consentimento. Conclusão da geração, fim de entrada,
+drain local e término conversacional são estados separados. Recuperação sem evento
+de conclusão preserva áudio válido e registra resultado não confirmado.
+
+Pesquisa: [documentação e SDK oficial](docs/ELEVENLABS_STREAMING_RESEARCH.md).
+Deploy e confirmação humana: [validação de produção](docs/STREAMING_PRODUCTION_VALIDATION.md).
+**Nenhum deploy ou teste audível real foi executado nesta revisão.** A validação
+final exige ouvir o Jarvis na chamada real; checks locais não aprovam esse gate.
+
+Checks da revisão de streaming:
+
+| Verificação | Resultado |
+| --- | --- |
+| Build, typecheck e lint Node | Passaram |
+| `npm test` | 19 arquivos; 267 testes passaram e 1 gate real explicitamente skipped |
+| `python -m pytest -q` | 78 testes e 67 subtests passaram |
+| Compileall e imports do `AGENTS.md` | Passaram, sem conexão Discord |
+| Elysium Python e Render Blueprint | Sem alterações nesta revisão |
+| Deploy e audição real | Pendentes; nenhuma chamada real realizada nesta revisão |
+
+Os testes novos cobrem SDK/protocolo, ordenação, cancelamento, ferramentas,
+recuperação e limites. Um teste usa o player real do `@discordjs/voice` com Opus
+sintético e rede simulada; isso verifica consumo local, sem provar audição humana.
+
+## Histórico: revisão de diagnóstico de produção
 
 Instrumentados `/jarvis join`, negociação de voz/DAVE e fluxo ElevenAgents até
 playback. A revisão corrige a contagem de erro secundário no encerramento local,
-detecta texto sem áudio/conclusão ausente/fechamento prematuro e só libera áudio
-após conclusão explícita válida. Build, typecheck, lint e 230 testes Node passaram;
+detectou texto sem áudio/conclusão ausente/fechamento prematuro. Naquela revisão,
+o playback aguardava conclusão explícita; essa política foi substituída pelo
+streaming acima. Build, typecheck, lint e 230 testes Node passaram naquela entrega;
 um gate real segue skipped. Python: 78 testes e 67 subtests passaram. Elysium não
 foi alterado nesta revisão. Veja [o runbook Render](docs/RENDER_INCIDENTS.md).
 
 O proprietário relatou Discord conectado e HTTP/WS ElevenLabs iniciados em
-produção, mas nenhum áudio audível. Os contadores anteriores não determinam a
-causa. A nova instrumentação precisa de outra tentativa no Render; esta revisão
-não fez deploy nem comprovou a conexão de voz ou resposta audível real.
+produção, mas nenhum áudio audível. A evidência posterior e o bloqueio local estão
+registrados acima. A ausência de conclusão no provedor ainda precisa de investigação.
 
 ## Registro da entrega inicial
 
@@ -82,8 +111,9 @@ isso não comprova recepção de humanos. Veja a matriz [DAVE](docs/DAVE.md).
 
 O detector experimental envia até 4 s de fala consentida por checagem ao STT externo,
 inclusive antes da ativação; não é detector acústico local. Captura durante playback
-é suprimida, sem barge-in. Entrada depende de fim de fala; saída é acumulada até
-conclusão da resposta para arbitrar playback. A meta de 4 s não está comprovada.
+é suprimida, sem barge-in. Entrada depende de fim de fala; saída usa streaming
+progressivo, com prioridade do proprietário somente entre respostas enfileiradas.
+A meta de 4 s não está comprovada.
 Não há medições de WER, falsos wakes, p50/p95 ou custo/hora.
 
 Sem banco/memória durável; sair/reiniciar exige novo consentimento. Retenção do

@@ -61,13 +61,15 @@ Confira especialmente:
 ]
 ```
 
-`agent_response_complete` indica conclusão da resposta, incluindo tools.
-`agent_response` contém texto e não é tratado como término do áudio. Transcripts,
+`agent_response_complete` indica conclusão do turno, incluindo tools. O áudio é
+reproduzido progressivamente antes desse evento; sua ausência gera recuperação
+sem afirmar que a geração terminou. `agent_response` delimita uma mensagem textual,
+que pode ser uma entre várias no mesmo turno, e não encerra o áudio. Transcripts,
 correções e texto recebidos não são registrados. O adapter sinaliza somente que
 houve texto, sem guardar seu conteúdo, para detectar uma resposta sem áudio.
 Metadata de inicialização e ping são tratados pelo protocolo; não precisam ser
 inventados em overrides. Para diagnóstico e validação audível, siga
-[RENDER_INCIDENTS.md](RENDER_INCIDENTS.md).
+[STREAMING_PRODUCTION_VALIDATION.md](STREAMING_PRODUCTION_VALIDATION.md).
 Veja [Client events](https://elevenlabs.io/docs/eleven-agents/customization/events/client-events)
 e [WebSocket API](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket).
 
@@ -159,7 +161,9 @@ recebidos pelo provedor. Consentimentos do bot são por sessão após reinício.
 
 Os limites do adapter são: resposta de assinatura até 16 KiB; mensagem WS até
 384 KiB; backlog de saída até 512 KiB; chunk PCM até 192000 bytes; timeout HTTP
-de 10 s, metadata de 15 s e heartbeat de 90 s. Há até três tentativas de assinatura
+de 10 s, metadata de 15 s e heartbeat de 90 s, suspenso durante pausa local por
+backpressure. A fila de entrada de PCM tem 384 KiB e até 1.024 eventos; a conexão
+pausa em 256 KiB e retoma em 128 KiB. Há até três tentativas de assinatura
 somente em 429/5xx, com espera limitada e jitter. Erros de autenticação e crédito
 não são repetidos. Tools: duas concorrentes, até 64 execuções por sessão, timeout
 de 8 s e resultado até 16 KiB. A busca limita a resposta HTTP a 256 KiB e 6 s.

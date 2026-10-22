@@ -1,12 +1,14 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { AgentError, type AgentCallbacks, type AgentSession } from './elevenlabs-client.js';
 import { convertPcm } from '../audio/pcm-conversion.js';
+import type { PlaybackStream } from '../audio/playback.js';
 import type { SpeakerContext } from '../policy/identity.js';
 import { Logger, newIncident, type ErrorCode } from '../observability/metrics.js';
 
 export interface Playback {
   readonly isPlaying: boolean;
-  play(userId: string, pcm: Buffer, sampleRate: number, owner: boolean): Promise<void>;
+  startStream(userId: string, sampleRate: number, owner: boolean,
+    options?: { isAllowed?: () => boolean }): PlaybackStream;
   stopUser(userId: string): void;
   stop(): void;
 }
@@ -33,8 +35,14 @@ interface Entry {
   opening?: Promise<AgentSession>;
   waiting: boolean;
   playing: boolean;
-  chunks: Buffer[];
-  bytes: number;
+  stream?: PlaybackStream;
+  ingressEnded: boolean;
+  playbackDone: boolean;
+  recovering: boolean;
+  pendingTools: number;
+  acceptingAudio: boolean;
+  responseIds: Set<string>;
+  completedResponseIds: Set<string>;
   followupUntil: number;
   turnStarted: number;
   incident: string;
@@ -42,7 +50,7 @@ interface Entry {
   audioBytes: number;
   textReceived: boolean;
   completionReceived: boolean;
-  lastCompletionId?: number;
+  completionIds: Set<number>;
   providerClosed: boolean;
   failed: boolean;
   idle?: ReturnType<typeof setTimeout>;
@@ -136,32 +144,42 @@ export class SessionManager {
     }
     if (this.entries.size >= this.options.maxSessions) throw new SessionError('busy');
     entry = { speaker, abort: new AbortController(), waiting: false, playing: false,
-      chunks: [], bytes: 0, followupUntil: 0, turnStarted: performance.now(), incident: newIncident(),
+      ingressEnded: false, playbackDone: false, recovering: false, pendingTools: 0, acceptingAudio: false,
+      responseIds: new Set(), completedResponseIds: new Set(),
+      completionIds: new Set(),
+      followupUntil: 0, turnStarted: performance.now(), incident: newIncident(),
       audioChunks: 0, audioBytes: 0, textReceived: false, completionReceived: false,
       providerClosed: false, failed: false };
     this.entries.set(speaker.discordUserId, entry);
     const current = entry;
     const callbacks: AgentCallbacks = {
-      onAudio: (audio) => this.audio(current, audio),
+      onAudio: (audio, _eventId, info) => this.audio(current, audio, info?.responseId),
       onResponseComplete: (id) => this.complete(current, id),
-      onTextResponse: () => {
-        if (this.usable(current) && current.waiting) current.textReceived = true;
+      onTextResponse: (identity) => {
+        if (this.usable(current) && current.waiting && this.identifyResponse(current, identity?.responseId)) {
+          current.textReceived = true;
+          this.progress(current);
+        }
+      },
+      onToolActivity: (pending) => {
+        if (!this.usable(current)) return;
+        current.pendingTools = pending;
+        if (current.completionReceived && pending === 0) this.seal(current);
+        else this.progress(current);
       },
       onProtocolEvent: (event) => {
         if (!this.usable(current)) return;
         const names = { audio: 'agent_audio_events_received', agent_response: 'agent_text_events_received',
           agent_response_complete: 'agent_response_complete_events_received', client_error: 'agent_client_errors_received' } as const;
         this.options.metric?.(names[event]);
+        if (event === 'agent_response') this.options.metric?.('agent_response_received');
       },
       onInterruption: () => this.interrupt(current),
       onClose: () => this.providerClose(current),
       onError: (code) => this.providerError(current, code),
     };
     current.lifetime = setTimeout(() => {
-      if (current.playing && current.completionReceived) {
-        current.providerClosed = true;
-        current.session?.close();
-      } else if (current.waiting) this.fail(current, 'AGENT_SESSION_EXPIRED');
+      if (current.waiting || current.playing) this.fail(current, 'AGENT_SESSION_EXPIRED');
       else this.remove(current);
     }, this.options.maxSessionSeconds * 1000);
     current.lifetime.unref();
@@ -190,7 +208,13 @@ export class SessionManager {
     if (!this.usable(entry)) throw new SessionError('consent');
     if (entry.waiting || entry.playing) throw new SessionError('busy');
     entry.waiting = true;
-    this.discardAudio(entry);
+    for (const id of entry.responseIds) entry.completedResponseIds.add(id);
+    entry.responseIds.clear();
+    entry.stream = undefined;
+    entry.ingressEnded = false;
+    entry.playbackDone = false;
+    entry.recovering = false;
+    entry.acceptingAudio = false;
     entry.audioChunks = 0;
     entry.audioBytes = 0;
     entry.textReceived = false;
@@ -200,17 +224,7 @@ export class SessionManager {
     entry.turnStarted = performance.now();
     entry.followupUntil = 0;
     if (entry.idle) clearTimeout(entry.idle);
-    entry.deadline = setTimeout(() => {
-      if (!this.usable(entry) || !entry.waiting) return;
-      this.options.metric?.('agent_response_timeouts');
-      this.options.metric?.('agent_completion_missing');
-      if (entry.audioBytes > 0) this.fail(entry, 'AGENT_COMPLETION_MISSING');
-      else if (entry.textReceived) {
-        this.options.metric?.('agent_text_without_audio');
-        this.fail(entry, 'AGENT_TEXT_WITHOUT_AUDIO');
-      } else this.fail(entry, 'AGENT_RESPONSE_TIMEOUT');
-    }, 45_000);
-    entry.deadline.unref();
+    this.progress(entry);
     this.options.metric?.('agent_turns');
     this.report(entry, 'jarvis_agent_turn_started');
   }
@@ -220,70 +234,135 @@ export class SessionManager {
       && this.entries.get(entry.speaker.discordUserId) === entry && this.options.allowed(entry.speaker);
   }
 
-  private audio(entry: Entry, pcm: Buffer): void {
+  /** Correlate only identifiers actually supplied; audio IDs are not chunk sequence numbers. */
+  private identifyResponse(entry: Entry, responseId?: string): boolean {
+    if (responseId === undefined) return true;
+    if (entry.completedResponseIds.has(responseId)) {
+      this.options.metric?.('agent_stale_message_events'); return false;
+    }
+    if (entry.responseIds.size + entry.completedResponseIds.size >= 128 && !entry.responseIds.has(responseId)) {
+      this.fail(entry, 'AGENT_AUDIO_OVERFLOW'); return false;
+    }
+    entry.responseIds.add(responseId);
+    return true;
+  }
+
+  private async audio(entry: Entry, pcm: Buffer, responseId?: string): Promise<void> {
     if (!this.usable(entry)) return;
     this.options.metric?.('audio_chunks_received');
     this.options.metric?.('audio_bytes_received', pcm.length);
-    if (!entry.waiting || !entry.session) { this.options.metric?.('audio_chunks_discarded'); return; }
-    const max = entry.session.outputSampleRate * 2 * 30;
-    if (entry.bytes + pcm.length > max) {
+    if (!entry.waiting || entry.ingressEnded || !entry.session) {
+      this.options.metric?.('audio_chunks_discarded'); return;
+    }
+    if (!this.identifyResponse(entry, responseId)) return;
+    if (!pcm.length || pcm.length % 2) { this.fail(entry, 'AGENT_INVALID_EVENT'); return; }
+    const max = entry.session.outputSampleRate * 2 * 120;
+    if (entry.audioBytes + pcm.length > max) {
       this.options.metric?.('agent_audio_overflow'); this.fail(entry, 'AGENT_AUDIO_OVERFLOW'); return;
     }
-    entry.chunks.push(pcm);
-    entry.bytes += pcm.length;
     entry.audioChunks++;
     entry.audioBytes += pcm.length;
+    entry.acceptingAudio = true;
+    this.progress(entry);
+    try {
+      if (!entry.stream) {
+        entry.playing = true;
+        const stream = this.options.playback.startStream(entry.speaker.discordUserId,
+          entry.session.outputSampleRate, entry.speaker.isOwner, { isAllowed: () => this.usable(entry) });
+        entry.stream = stream;
+        void stream.done.then(() => {
+          if (!this.usable(entry) || entry.stream !== stream) return;
+          entry.playbackDone = true;
+          entry.playing = false;
+          this.report(entry, 'jarvis_agent_playback_completed');
+          this.finishTurn(entry);
+        }, () => { if (this.usable(entry) && entry.stream === stream) this.fail(entry, 'PLAYBACK_FAILED'); });
+      }
+      // Acceptance is bounded by the playback queue's capacity. The adapter
+      // serializes these writes and pauses provider input under backpressure.
+      await entry.stream.write(pcm);
+    } catch {
+      if (this.usable(entry)) this.fail(entry, 'PLAYBACK_FAILED');
+    } finally {
+      entry.acceptingAudio = false;
+      if (this.usable(entry)) {
+        if (entry.completionReceived && !entry.pendingTools) this.seal(entry);
+        else this.progress(entry);
+      }
+    }
   }
 
   private complete(entry: Entry, eventId?: number): void {
     if (!this.usable(entry) || !entry.waiting) return;
-    if (eventId !== undefined && eventId === entry.lastCompletionId) {
+    if (eventId !== undefined && entry.completionIds.has(eventId)) {
       this.options.metric?.('agent_duplicate_completions'); return;
     }
-    entry.lastCompletionId = eventId;
+    if (eventId !== undefined) {
+      if (entry.completionIds.size >= 128) { this.fail(entry, 'AGENT_INVALID_EVENT'); return; }
+      entry.completionIds.add(eventId);
+    }
     entry.completionReceived = true;
     entry.upload?.abort();
+    if (entry.deadline) clearTimeout(entry.deadline);
+    this.options.metric?.('agent_response_complete_received');
     this.options.metric?.('agent_responses_completed');
     this.report(entry, 'jarvis_agent_response_complete');
-    if (!entry.bytes) {
+    if (!entry.pendingTools) this.seal(entry);
+  }
+
+  /** Ingress closure is separate from generation confirmation and local drain. */
+  private seal(entry: Entry): void {
+    if (!this.usable(entry) || entry.ingressEnded || entry.acceptingAudio) return;
+    if (entry.completionReceived && !entry.audioBytes) {
       this.options.metric?.('agent_no_audio_responses');
       if (entry.textReceived) this.options.metric?.('agent_text_without_audio');
       this.fail(entry, entry.textReceived ? 'AGENT_TEXT_WITHOUT_AUDIO' : 'AGENT_EMPTY_RESPONSE');
       return;
     }
-    // Documented completion includes pending tools and all output. Silence, a
-    // text response, socket close, and elapsed time are never substitutes.
-    void this.flush(entry);
+    if (entry.deadline) clearTimeout(entry.deadline);
+    entry.waiting = false;
+    entry.ingressEnded = true;
+    entry.stream?.end();
+    this.finishTurn(entry);
   }
 
-  private async flush(entry: Entry): Promise<void> {
-    if (!this.usable(entry) || !entry.waiting || !entry.session) return;
+  private finishTurn(entry: Entry): void {
+    if (!this.usable(entry) || !entry.ingressEnded || (entry.stream && !entry.playbackDone)) return;
+    if (!entry.completionReceived || entry.recovering) { this.remove(entry); return; }
+    this.options.metric?.('agent_turns_completed');
+    if (entry.providerClosed) { this.remove(entry); return; }
+    entry.followupUntil = Date.now() + this.options.followupSeconds * 1000;
+    this.idle(entry);
+  }
+
+  /** Silence is only a resource-recovery trigger, never proof of completed generation. */
+  private progress(entry: Entry): void {
     if (entry.deadline) clearTimeout(entry.deadline);
-    if (!entry.completionReceived) return;
-    entry.waiting = false;
-    entry.playing = true;
-    const pcm = Buffer.concat(entry.chunks, entry.bytes);
-    this.discardAudio(entry);
-    try {
-      this.options.metric?.('playback_started');
-      await this.options.playback.play(entry.speaker.discordUserId, pcm,
-        entry.session.outputSampleRate, entry.speaker.isOwner);
-      if (this.usable(entry)) {
-        this.options.metric?.('playback_completed');
-        this.report(entry, 'jarvis_agent_playback_completed');
-        entry.followupUntil = Date.now() + this.options.followupSeconds * 1000;
-      }
-    } catch {
-      if (this.usable(entry)) this.fail(entry, 'PLAYBACK_FAILED');
-      else this.options.metric?.('playback_cancelled');
-    } finally {
-      pcm.fill(0);
-      entry.playing = false;
-      if (this.usable(entry)) {
-        if (entry.providerClosed) this.remove(entry);
-        else this.idle(entry);
-      }
-    }
+    // Local backpressure is not provider inactivity. Absolute playback/session
+    // deadlines still bound waiting participants while this write is suspended.
+    if (!entry.waiting || entry.recovering || entry.completionReceived || entry.pendingTools > 0 || entry.acceptingAudio) return;
+    entry.deadline = setTimeout(() => {
+      if (!this.usable(entry) || !entry.waiting) return;
+      this.options.metric?.('agent_response_timeouts');
+      this.missing(entry);
+      if (entry.audioBytes > 0) {
+        entry.recovering = true;
+        this.report(entry, 'jarvis_agent_turn_recovering', 'AGENT_COMPLETION_MISSING');
+        // Provider intake stops; validated writes queued before close are drained.
+        // The onClose callback seals the local stream after those writes finish.
+        entry.session?.close({ drainAudio: true });
+      } else if (entry.textReceived) {
+        this.options.metric?.('agent_text_without_audio');
+        this.fail(entry, 'AGENT_TEXT_WITHOUT_AUDIO');
+      } else this.fail(entry, 'AGENT_RESPONSE_TIMEOUT');
+    }, 45_000);
+    entry.deadline.unref();
+  }
+
+  private missing(entry: Entry): void {
+    if (entry.recovering || entry.completionReceived) return;
+    this.options.metric?.('turn_completion_missing');
+    this.options.metric?.('agent_completion_missing');
   }
 
   private report(entry: Entry, event: string, code?: ErrorCode): void {
@@ -295,14 +374,21 @@ export class SessionManager {
       duration_ms: Math.max(0, Math.round(performance.now() - entry.turnStarted)),
       audio_chunks: entry.audioChunks, audio_bytes: entry.audioBytes,
       text_received: entry.textReceived, completion_received: entry.completionReceived,
+      ingress_ended: entry.ingressEnded, playback_drained: entry.playbackDone,
+      recovery: entry.recovering, pending_tools: entry.pendingTools,
     });
   }
 
   private fail(entry: Entry, code: ErrorCode): void {
-    if (this.entries.get(entry.speaker.discordUserId) !== entry || entry.failed) return;
+    if (this.entries.get(entry.speaker.discordUserId) !== entry) return;
+    this.primaryError(entry, code);
+    this.remove(entry);
+  }
+
+  private primaryError(entry: Entry, code: ErrorCode): void {
+    if (entry.failed) return;
     entry.failed = true;
     this.report(entry, 'jarvis_agent_turn_failed', code);
-    this.remove(entry);
   }
 
   private providerError(entry: Entry, code: string): void {
@@ -314,6 +400,7 @@ export class SessionManager {
       if (!entry.playing) this.remove(entry);
       return;
     }
+    if (entry.failed || entry.recovering) return;
     this.options.metric?.('agent_errors');
     const codes: Readonly<Record<string, ErrorCode>> = {
       agent_transport_error: 'AGENT_TRANSPORT_ERROR', invalid_agent_event: 'AGENT_INVALID_EVENT',
@@ -321,24 +408,34 @@ export class SessionManager {
       agent_metadata_timeout: 'AGENT_METADATA_TIMEOUT', agent_credit_limit: 'AGENT_CREDIT_LIMIT',
       agent_rate_limited: 'AGENT_RATE_LIMITED', agent_authentication_failed: 'AGENT_AUTHENTICATION_FAILED',
       agent_callback_error: 'AGENT_CALLBACK_ERROR', agent_backpressure: 'AGENT_BACKPRESSURE',
+      agent_audio_backpressure: 'AGENT_BACKPRESSURE',
+      agent_heartbeat_timeout: 'AGENT_HEARTBEAT_TIMEOUT',
     };
-    this.fail(entry, Object.hasOwn(codes, code) ? codes[code]! : 'AGENT_PROVIDER_ERROR');
+    const safeCode = Object.hasOwn(codes, code) ? codes[code]! : 'AGENT_PROVIDER_ERROR';
+    if ((code === 'agent_transport_error' || code === 'agent_heartbeat_timeout') && entry.waiting) {
+      this.primaryError(entry, safeCode);
+      this.missing(entry);
+      entry.recovering = true;
+      if (entry.deadline) clearTimeout(entry.deadline);
+      // Adapter will finish delivering already validated audio, then onClose.
+    } else this.fail(entry, safeCode);
   }
 
   private providerClose(entry: Entry): void {
     if (this.entries.get(entry.speaker.discordUserId) !== entry) return;
-    if (entry.completionReceived && entry.playing) { entry.providerClosed = true; return; }
+    entry.providerClosed = true;
+    if (entry.completionReceived && entry.playing) { this.seal(entry); return; }
     if (entry.waiting || entry.opening) {
-      this.options.metric?.('agent_premature_closes');
-      this.options.metric?.('agent_errors');
-      this.fail(entry, 'AGENT_PREMATURE_CLOSE');
+      if (!entry.recovering) {
+        this.options.metric?.('agent_premature_closes');
+        this.options.metric?.('agent_errors');
+        this.primaryError(entry, 'AGENT_PREMATURE_CLOSE');
+        this.missing(entry);
+        entry.recovering = true;
+      }
+      if (!entry.audioBytes) this.remove(entry);
+      else this.seal(entry);
     } else this.remove(entry);
-  }
-
-  private discardAudio(entry: Entry): void {
-    for (const chunk of entry.chunks) chunk.fill(0);
-    entry.chunks = [];
-    entry.bytes = 0;
   }
 
   private interrupt(entry: Entry): void {
@@ -359,7 +456,7 @@ export class SessionManager {
     entry.upload?.abort();
     entry.abort.abort();
     for (const timer of [entry.idle, entry.lifetime, entry.deadline]) if (timer) clearTimeout(timer);
-    this.discardAudio(entry);
+    entry.stream?.cancel();
     this.options.playback.stopUser(entry.speaker.discordUserId);
     entry.session?.close();
   }

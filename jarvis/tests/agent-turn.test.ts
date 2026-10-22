@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import { afterEach, expect, test, vi } from 'vitest';
 import { createAgentConnector, type AgentDependencies } from '../src/agents/elevenlabs-client.js';
 import { SessionManager, type Playback } from '../src/agents/session-manager.js';
+import type { PlaybackStream } from '../src/audio/playback.js';
 import { Logger, Metrics } from '../src/observability/metrics.js';
 import { ConsentStore } from '../src/policy/consent.js';
 import { speakerContext } from '../src/policy/identity.js';
@@ -10,6 +11,8 @@ const secret = 'PRIVATE-text-and-credentials-that-must-not-appear';
 class Socket extends EventEmitter {
   readyState = 0;
   bufferedAmount = 0;
+  pause = vi.fn();
+  resume = vi.fn();
   send(_data: string, callback?: (error?: Error) => void): void { callback?.(); }
   open(): void { this.readyState = 1; this.emit('open'); }
   event(value: unknown): void { this.emit('message', Buffer.from(JSON.stringify(value)), false); }
@@ -17,6 +20,8 @@ class Socket extends EventEmitter {
   terminate(): void { this.close(); }
 }
 const active: SessionManager[] = [];
+async function settle(): Promise<void> { for (let step = 0; step < 30; step++) await Promise.resolve(); }
+
 function setup(pendingPlayback = false) {
   const socket = new Socket();
   const metrics = new Metrics();
@@ -36,27 +41,72 @@ function setup(pendingPlayback = false) {
     }, random: () => 0.5, sleep: async () => undefined,
   });
   const consent = new ConsentStore();
-  const grant = consent.grant('guest', false);
+  const grant = consent.grant('guest', true);
   const speaker = speakerContext({ discordUserId: 'guest', displayName: secret, guildId: 'guild', channelId: 'room',
     consented: true, consentVersion: grant.version }, 'owner');
-  let finishPlayback = () => {};
-  const playbackGate = new Promise<void>((resolve) => { finishPlayback = resolve; });
+  interface LocalStream extends PlaybackStream { userId: string; ended: boolean; settled: boolean; finish(): void; }
+  const streams: LocalStream[] = [];
   const copies: Buffer[] = [];
-  const playback: Playback = { isPlaying: false, stopUser: vi.fn(), stop: vi.fn(),
-    play: vi.fn(async (_id, pcm) => { copies.push(Buffer.from(pcm)); if (pendingPlayback) await playbackGate; }),
+  let allowFinish = !pendingPlayback;
+  const playback: Playback = {
+    get isPlaying() { return streams.some(stream => !stream.settled); },
+    startStream: vi.fn((userId, _rate, _owner, options) => {
+      let resolve!: () => void;
+      let reject!: (error: Error) => void;
+      const done = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+      void done.catch(() => undefined);
+      let started = false;
+      const stream: LocalStream = {
+        userId, done, ended: false, settled: false,
+        write: vi.fn(async (pcm) => {
+          if (stream.settled || stream.ended || options?.isAllowed?.() === false) throw new Error('cancelled');
+          // Synthetic consumer accepts bounded chunks and records copies before
+          // adapter ownership ends; no actual Discord audibility is asserted.
+          if (pcm.length > 65_536) throw new Error('bounded playback ingress');
+          copies.push(Buffer.from(pcm));
+          if (!started) {
+            started = true;
+            metrics.add('audio_stream_started'); metrics.add('playback_started');
+          }
+          metrics.add('audio_chunks_played');
+        }),
+        end: vi.fn(() => { stream.ended = true; stream.finish(); }),
+        finish: () => {
+          if (!allowFinish || !stream.ended || stream.settled) return;
+          stream.settled = true;
+          metrics.add('playback_completed'); resolve();
+        },
+        cancel: vi.fn(() => {
+          if (stream.settled) return;
+          stream.settled = true;
+          metrics.add('playback_cancelled'); reject(new Error('cancelled'));
+        }),
+      };
+      streams.push(stream);
+      return stream;
+    }),
+    stopUser: vi.fn(userId => { for (const stream of streams) if (stream.userId === userId) stream.cancel(); }),
+    stop: vi.fn(() => { for (const stream of streams) stream.cancel(); }),
   };
+  const detectWake = vi.fn(async () => false);
   const manager = new SessionManager({
     connect: (_speaker, callbacks, signal) => connector({ apiKey: secret, agentId: 'agent_test',
       dynamicVariables: {}, callbacks, signal }),
     allowed: (context, audio) => consent.isCurrent(context.discordUserId, context.consentVersion, audio),
-    detectWake: async () => false, playback, maxSessions: 2, maxTurnSeconds: 12,
+    detectWake, playback, maxSessions: 2, maxTurnSeconds: 12,
     maxSessionSeconds: 300, idleSeconds: 45, followupSeconds: 18, maxTurnsPerHour: 100,
     metric: metrics.add, logger: new Logger('info', (line) => logs.push(JSON.parse(line))),
   });
   active.push(manager);
-  const audio = () => socket.event({ type: 'audio', audio_event: { audio_base_64: 'AQACAA==', event_id: 1 } });
+  const audio = (id = 1, value = 1) => socket.event({ type: 'audio', audio_event: {
+    audio_base_64: Buffer.from([value, 0, value + 1, 0]).toString('base64'), event_id: id,
+  } });
   const text = () => socket.event({ type: 'agent_response', agent_response_event: { agent_response: secret, event_id: 2 } });
   const complete = (id = 3) => socket.event({ type: 'agent_response_complete', agent_response_complete_event: { event_id: id } });
+  const ping = () => socket.event({ type: 'ping', ping_event: { event_id: 50 } });
+  const tool = (pending: boolean) => socket.event(pending
+    ? { type: 'agent_tool_request', agent_tool_request: { tool_call_id: 'tool_private' } }
+    : { type: 'agent_tool_response', agent_tool_response: { tool_call_id: 'tool_private' } });
   const failed = (code: string) => {
     const failures = logs.filter((line) => line.event === 'jarvis_agent_turn_failed');
     expect(failures).toHaveLength(1);
@@ -66,7 +116,9 @@ function setup(pendingPlayback = false) {
     expect(JSON.stringify(logs)).not.toContain('fixture-private-id');
     return failures[0]!;
   };
-  return { manager, speaker, socket, metrics, logs, audio, text, complete, playback, copies, consent, finishPlayback, failed };
+  const finishPlayback = () => { allowFinish = true; for (const stream of streams) stream.finish(); };
+  return { manager, speaker, socket, metrics, logs, audio, text, complete, ping, tool,
+    playback, copies, streams, consent, finishPlayback, failed, detectWake };
 }
 
 afterEach(() => {
@@ -74,126 +126,252 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-test('full documented audio + completion traverses the real adapter and finishes local playback', async () => {
+test('documented audio starts before completion and repeated event IDs preserve all PCM in arrival order', async () => {
   const h = setup();
   await h.manager.ask(h.speaker, secret);
-  h.text(); h.audio(); h.complete();
-  await Promise.resolve();
-  expect(h.copies).toEqual([Buffer.from([1, 0, 2, 0])]);
+  h.text(); h.audio(1, 1); h.audio(1, 3);
+  await settle();
+  expect(h.copies).toEqual([Buffer.from([1, 0, 2, 0]), Buffer.from([3, 0, 4, 0])]);
+  expect(h.playback.startStream).toHaveBeenCalledOnce();
+  expect(h.metrics.snapshot()).toMatchObject({ playback_started: 1, audio_chunks_received: 2, audio_bytes_received: 8 });
+  expect(h.metrics.snapshot().playback_completed ?? 0).toBe(0);
+  h.complete(); await settle();
   expect(h.metrics.snapshot()).toMatchObject({ agent_sessions_started: 1, agent_turns: 1,
-    audio_chunks_received: 1, audio_bytes_received: 4, agent_responses_completed: 1, playback_completed: 1,
+    agent_responses_completed: 1, playback_completed: 1, agent_turns_completed: 1,
+    agent_response_complete_received: 1, agent_response_received: 1,
     agent_response_complete_events_received: 1, agent_text_events_received: 1 });
-  expect(h.logs.filter((line) => line.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
   expect(JSON.stringify(h.logs)).not.toContain(secret);
 });
-test('buffered audio without completion is discarded at deadline; cleanup is not a provider error', async () => {
+
+test('missing completion recovers after inactivity, drains valid audio and never claims a successful conversation turn', async () => {
   vi.useFakeTimers();
   const h = setup();
   await h.manager.ask(h.speaker, secret);
-  h.audio();
+  h.audio(); await settle();
+  expect(h.copies).toHaveLength(1);
   await vi.advanceTimersByTimeAsync(44_000);
-  expect(h.playback.play).not.toHaveBeenCalled();
-  await vi.advanceTimersByTimeAsync(1_001);
-  expect(h.playback.play).not.toHaveBeenCalled();
+  expect(h.streams[0]!.ended).toBe(false);
+  await vi.advanceTimersByTimeAsync(1_001); await settle();
   expect(h.metrics.snapshot()).toMatchObject({ audio_chunks_received: 1, audio_bytes_received: 4,
-    agent_response_timeouts: 1, agent_completion_missing: 1 });
+    agent_response_timeouts: 1, agent_completion_missing: 1, turn_completion_missing: 1,
+    playback_started: 1, playback_completed: 1 });
+  expect(h.metrics.snapshot().agent_turns_completed ?? 0).toBe(0);
   expect(h.metrics.snapshot().agent_errors ?? 0).toBe(0);
-  expect(h.failed('AGENT_COMPLETION_MISSING')).toMatchObject({ audio_bytes: 4, completion_received: false });
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
+  expect(h.logs.find(line => line.event === 'jarvis_agent_turn_recovering')).toMatchObject({
+    code: 'AGENT_COMPLETION_MISSING', audio_bytes: 4, completion_received: false,
+  });
   expect(h.manager.activeCount).toBe(0);
+  await h.manager.voiceTurn(h.speaker, Buffer.alloc(192));
+  expect(h.detectWake).toHaveBeenCalledOnce();
+  expect(h.playback.startStream).toHaveBeenCalledOnce();
 });
-test('silence without any provider output identifies a response timeout without a fabricated second error', async () => {
+
+test('generation completion and local playback drain are independent, and new asks stay busy until both', async () => {
+  const h = setup(true);
+  await h.manager.ask(h.speaker, secret);
+  h.audio(); h.complete(); await settle();
+  expect(h.streams[0]!.ended).toBe(true);
+  expect(h.metrics.snapshot().agent_responses_completed).toBe(1);
+  expect(h.metrics.snapshot().agent_turns_completed ?? 0).toBe(0);
+  await expect(h.manager.ask(h.speaker, secret)).rejects.toMatchObject({ code: 'busy' });
+  h.finishPlayback(); await settle();
+  expect(h.metrics.snapshot()).toMatchObject({ playback_completed: 1, agent_turns_completed: 1 });
+});
+
+test('no provider output identifies the primary timeout without cleanup creating a second provider error', async () => {
   vi.useFakeTimers();
   const h = setup();
   await h.manager.ask(h.speaker, secret);
-  await vi.advanceTimersByTimeAsync(45_001);
+  await vi.advanceTimersByTimeAsync(45_001); await settle();
   expect(h.failed('AGENT_RESPONSE_TIMEOUT')).toMatchObject({ text_received: false, audio_chunks: 0 });
   expect(h.metrics.snapshot().agent_errors ?? 0).toBe(0);
-  expect(h.playback.play).not.toHaveBeenCalled();
+  expect(h.playback.startStream).not.toHaveBeenCalled();
 });
-test.each([true, false])('detects text without audio, with completion=%s', async (completed) => {
+
+test.each([true, false])('detects text without audio, with completion=%s', async completed => {
   vi.useFakeTimers();
   const h = setup();
   await h.manager.ask(h.speaker, secret);
   h.text();
   if (completed) h.complete();
   else await vi.advanceTimersByTimeAsync(45_001);
+  await settle();
   expect(h.failed('AGENT_TEXT_WITHOUT_AUDIO')).toMatchObject({ text_received: true, audio_bytes: 0, completion_received: completed });
   expect(h.metrics.snapshot().agent_text_without_audio).toBe(1);
-  expect(h.playback.play).not.toHaveBeenCalled();
+  expect(h.playback.startStream).not.toHaveBeenCalled();
 });
+
 test('explicit completion with no text and no audio is an empty response', async () => {
   const h = setup();
   await h.manager.ask(h.speaker, secret);
-  h.complete();
+  h.complete(); await settle();
   expect(h.failed('AGENT_EMPTY_RESPONSE')).toMatchObject({ completion_received: true });
   expect(h.metrics.snapshot().agent_responses_completed).toBe(1);
-  expect(h.playback.play).not.toHaveBeenCalled();
+  expect(h.playback.startStream).not.toHaveBeenCalled();
 });
-test('malformed completion is counted as received but never accepted as safe for playback', async () => {
+
+test('malformed completion cancels progressive output without accepting a fabricated generation end', async () => {
   const h = setup();
   await h.manager.ask(h.speaker, secret);
-  h.audio();
+  h.audio(); await settle();
   h.socket.event({ type: 'agent_response_complete', agent_response_complete_event: { event_id: secret } });
+  await settle();
   expect(h.metrics.snapshot()).toMatchObject({ agent_response_complete_events_received: 1, agent_errors: 1 });
   expect(h.metrics.snapshot().agent_responses_completed ?? 0).toBe(0);
   h.failed('AGENT_INVALID_EVENT');
-  expect(h.playback.play).not.toHaveBeenCalled();
+  expect(h.streams[0]!.cancel).toHaveBeenCalled();
+  expect(h.metrics.snapshot().playback_completed ?? 0).toBe(0);
 });
-test('premature socket close never flushes partial audio and cancels the pending timeout', async () => {
+
+test.each(['close', 'error'])('premature WebSocket %s drains validated queued audio and records one primary error', async kind => {
   vi.useFakeTimers();
   const h = setup();
   await h.manager.ask(h.speaker, secret);
-  h.audio(); h.socket.close();
+  h.audio(1, 1); h.audio(1, 3);
+  if (kind === 'close') h.socket.close();
+  else h.socket.emit('error', new Error(secret));
+  await settle();
   await vi.advanceTimersByTimeAsync(46_000);
-  h.failed('AGENT_PREMATURE_CLOSE');
-  expect(h.metrics.snapshot()).toMatchObject({ agent_premature_closes: 1, agent_errors: 1 });
+  h.failed(kind === 'close' ? 'AGENT_PREMATURE_CLOSE' : 'AGENT_TRANSPORT_ERROR');
+  expect(h.copies).toEqual([Buffer.from([1, 0, 2, 0]), Buffer.from([3, 0, 4, 0])]);
+  expect(h.metrics.snapshot()).toMatchObject({ agent_errors: 1, playback_completed: 1, turn_completion_missing: 1 });
   expect(h.metrics.snapshot().agent_response_timeouts ?? 0).toBe(0);
-  expect(h.playback.play).not.toHaveBeenCalled();
+  expect(h.metrics.snapshot().agent_turns_completed ?? 0).toBe(0);
+  expect(h.manager.activeCount).toBe(0);
 });
+
 test('a primary provider error stays singular even when teardown emits close', async () => {
   vi.useFakeTimers();
   const h = setup();
   await h.manager.ask(h.speaker, secret);
   h.socket.event({ type: 'client_error', error_event: { code: 401, message: secret } });
-  await vi.advanceTimersByTimeAsync(46_000);
+  await vi.advanceTimersByTimeAsync(46_000); await settle();
   h.failed('AGENT_AUTHENTICATION_FAILED');
   expect(h.metrics.snapshot().agent_errors).toBe(1);
   expect(h.metrics.snapshot().agent_response_timeouts ?? 0).toBe(0);
 });
-test('socket closure after explicit completion preserves an already validated full response', async () => {
+
+test('socket closure after explicit completion preserves queued full output', async () => {
   const h = setup(true);
   await h.manager.ask(h.speaker, secret);
-  h.audio(); h.complete(); h.socket.close();
+  h.audio(); h.complete(); await settle();
+  h.socket.close(); await settle();
   expect(h.metrics.snapshot().playback_completed ?? 0).toBe(0);
-  h.finishPlayback();
-  await Promise.resolve(); await Promise.resolve();
+  h.finishPlayback(); await settle();
   expect(h.metrics.snapshot().playback_completed).toBe(1);
   expect(h.metrics.snapshot().agent_errors ?? 0).toBe(0);
   expect(h.manager.activeCount).toBe(0);
 });
-test('revocation still cancels completed, queued playback and suppresses late events', async () => {
+
+test('revocation cancels progressive and queued output immediately and fences late provider events', async () => {
   const h = setup(true);
   await h.manager.ask(h.speaker, secret);
-  h.audio(); h.complete();
+  h.audio(); await settle();
   h.consent.revoke(h.speaker.discordUserId);
   h.manager.revoke(h.speaker.discordUserId);
-  h.finishPlayback();
-  h.audio(); h.complete();
-  await Promise.resolve(); await Promise.resolve();
+  h.finishPlayback(); h.audio(); h.complete(); await settle();
   expect(h.playback.stopUser).toHaveBeenCalledWith(h.speaker.discordUserId);
+  expect(h.streams[0]!.cancel).toHaveBeenCalled();
+  expect(h.copies).toHaveLength(1);
   expect(h.metrics.snapshot().playback_completed ?? 0).toBe(0);
   expect(h.manager.activeCount).toBe(0);
 });
-test('an old duplicate completion cannot prematurely flush the next question', async () => {
+
+test('an old duplicate completion cannot seal the next question but does not block progressive audio', async () => {
   const h = setup();
   await h.manager.ask(h.speaker, secret);
-  h.audio(); h.complete(3);
-  await Promise.resolve();
+  h.audio(); h.complete(3); await settle();
   await h.manager.ask(h.speaker, secret);
-  h.audio(); h.complete(3);
-  expect(h.playback.play).toHaveBeenCalledTimes(1);
-  h.complete(4);
-  await Promise.resolve();
-  expect(h.playback.play).toHaveBeenCalledTimes(2);
+  h.audio(); h.complete(3); await settle();
+  expect(h.playback.startStream).toHaveBeenCalledTimes(2);
+  expect(h.streams[1]!.ended).toBe(false);
+  h.complete(4); await settle();
+  expect(h.metrics.snapshot().playback_completed).toBe(2);
   expect(h.metrics.snapshot().agent_duplicate_completions).toBe(1);
+});
+
+test('pending tools suspend response inactivity recovery and multiple messages remain on one ordered stream', async () => {
+  vi.useFakeTimers();
+  const h = setup();
+  await h.manager.ask(h.speaker, secret);
+  h.text(); h.audio(); h.tool(true); await settle();
+  for (let interval = 0; interval < 3; interval++) { await vi.advanceTimersByTimeAsync(35_000); h.ping(); }
+  expect(h.manager.activeCount).toBe(1);
+  expect(h.metrics.snapshot().turn_completion_missing ?? 0).toBe(0);
+  h.text(); h.audio(1, 3); h.tool(false); await settle();
+  expect(h.playback.startStream).toHaveBeenCalledOnce();
+  expect(h.copies).toHaveLength(2);
+  h.complete(); await settle();
+  expect(h.metrics.snapshot()).toMatchObject({ agent_response_received: 2, agent_turns_completed: 1 });
+});
+
+test('completion received while a tool is pending waits for its response before ending ingress', async () => {
+  const h = setup();
+  await h.manager.ask(h.speaker, secret);
+  h.audio(); h.tool(true); h.complete(); await settle();
+  expect(h.streams[0]!.ended).toBe(false);
+  expect(h.metrics.snapshot().agent_responses_completed).toBe(1);
+  h.tool(false); await settle();
+  expect(h.streams[0]!.ended).toBe(true);
+  expect(h.metrics.snapshot().agent_turns_completed).toBe(1);
+});
+
+test('hard session TTL bounds pending tools and cancels output even when pings keep the provider alive', async () => {
+  vi.useFakeTimers();
+  const h = setup(true);
+  await h.manager.ask(h.speaker, secret);
+  h.audio(); h.tool(true); await settle();
+  for (let interval = 0; interval < 8; interval++) { await vi.advanceTimersByTimeAsync(35_000); h.ping(); }
+  await vi.advanceTimersByTimeAsync(20_001); await settle();
+  h.failed('AGENT_SESSION_EXPIRED');
+  expect(h.streams[0]!.cancel).toHaveBeenCalled();
+  expect(h.metrics.snapshot().playback_completed ?? 0).toBe(0);
+  expect(h.manager.activeCount).toBe(0);
+});
+
+test('audio progress supports long generation while transport pings alone do not reset response inactivity', async () => {
+  vi.useFakeTimers();
+  const h = setup();
+  await h.manager.ask(h.speaker, secret);
+  h.audio(); await settle();
+  await vi.advanceTimersByTimeAsync(30_000); h.audio(1, 3); await settle();
+  await vi.advanceTimersByTimeAsync(30_000); h.audio(1, 5); h.complete(); await settle();
+  expect(h.copies).toHaveLength(3);
+  expect(h.metrics.snapshot()).toMatchObject({ playback_completed: 1, agent_turns_completed: 1 });
+  expect(h.metrics.snapshot().agent_response_timeouts ?? 0).toBe(0);
+  await h.manager.ask(h.speaker, secret);
+  await vi.advanceTimersByTimeAsync(40_000); h.ping();
+  await vi.advanceTimersByTimeAsync(5_001); await settle();
+  h.failed('AGENT_RESPONSE_TIMEOUT');
+});
+
+test('local playback backpressure is not mistaken for provider inactivity', async () => {
+  vi.useFakeTimers();
+  const h = setup(); await h.manager.ask(h.speaker, secret);
+  h.audio(); await settle();
+  let release!: () => void;
+  const capacity = new Promise<void>((resolve) => { release = resolve; });
+  const write = h.streams[0]!.write;
+  vi.spyOn(h.streams[0]!, 'write').mockImplementationOnce(async (pcm) => { await capacity; await write(pcm); });
+  h.audio(1, 3); await settle();
+  for (let i = 0; i < 3; i++) { await vi.advanceTimersByTimeAsync(35_000); h.ping(); }
+  expect(h.manager.activeCount).toBe(1);
+  expect(h.metrics.snapshot().agent_response_timeouts ?? 0).toBe(0);
+  h.complete(); release(); await settle();
+  expect(h.copies).toHaveLength(2);
+  expect(h.metrics.snapshot()).toMatchObject({ playback_completed: 1, agent_turns_completed: 1 });
+});
+
+test('provider heartbeat failure drains valid audio and keeps one specific primary diagnostic', async () => {
+  vi.useFakeTimers();
+  const h = setup(); await h.manager.ask(h.speaker, secret);
+  h.audio(); h.tool(true); await settle();
+  await vi.advanceTimersByTimeAsync(100_001); await settle();
+  h.failed('AGENT_HEARTBEAT_TIMEOUT');
+  expect(h.copies).toHaveLength(1);
+  expect(h.metrics.snapshot()).toMatchObject({ agent_errors: 1, playback_completed: 1, turn_completion_missing: 1 });
+  expect(h.metrics.snapshot().agent_turns_completed ?? 0).toBe(0);
+  expect(h.manager.activeCount).toBe(0);
 });

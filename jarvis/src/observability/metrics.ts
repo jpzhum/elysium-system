@@ -4,7 +4,7 @@ export class Metrics {
   private readonly counters = new Map<string, number>();
   add = (name: string, value = 1): void => {
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(name) || !Number.isFinite(value)) return;
-    if (!this.counters.has(name) && this.counters.size >= 64) return;
+    if (!this.counters.has(name) && this.counters.size >= 128) return;
     this.counters.set(name, (this.counters.get(name) ?? 0) + value);
   };
   snapshot(): Record<string, number> { return Object.fromEntries(this.counters); }
@@ -44,7 +44,7 @@ export const errorCodes = [
   'WS_CLOSE_4021', 'WS_CLOSE_4022',
   'AGENT_RESPONSE_TIMEOUT', 'AGENT_COMPLETION_MISSING', 'AGENT_TEXT_WITHOUT_AUDIO',
   'AGENT_EMPTY_RESPONSE', 'AGENT_PREMATURE_CLOSE', 'AGENT_PROVIDER_ERROR',
-  'AGENT_AUDIO_OVERFLOW', 'AGENT_SESSION_EXPIRED', 'AGENT_TRANSPORT_ERROR',
+  'AGENT_AUDIO_OVERFLOW', 'AGENT_SESSION_EXPIRED', 'AGENT_TRANSPORT_ERROR', 'AGENT_HEARTBEAT_TIMEOUT',
   'AGENT_INVALID_EVENT', 'AGENT_AUDIO_FORMAT_UNSUPPORTED', 'AGENT_METADATA_TIMEOUT',
   'AGENT_CREDIT_LIMIT', 'AGENT_RATE_LIMITED', 'AGENT_AUTHENTICATION_FAILED',
   'AGENT_CALLBACK_ERROR', 'AGENT_BACKPRESSURE', 'PLAYBACK_FAILED',
@@ -91,6 +91,10 @@ export interface DiagnosticFields {
   audio_bytes?: number;
   text_received?: boolean;
   completion_received?: boolean;
+  ingress_ended?: boolean;
+  playback_drained?: boolean;
+  recovery?: boolean;
+  pending_tools?: number;
 }
 
 const events = new Set([
@@ -104,7 +108,7 @@ const events = new Set([
   'voice_recovery_ready', 'voice_recovery_timeout', 'voice_recovery_cancelled', 'voice_recovery_failed',
   'voice_websocket_close', 'voice_connection_disconnected', 'voice_dave_state', 'voice_join_failed',
   'jarvis_agent_turn_started', 'jarvis_agent_turn_failed', 'jarvis_agent_response_complete',
-  'jarvis_agent_playback_completed',
+  'jarvis_agent_playback_completed', 'jarvis_agent_turn_recovering',
 ]);
 
 export function newIncident(): string { return randomBytes(4).toString('hex').toUpperCase(); }
@@ -139,7 +143,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
   for (const key of [
     'dave_enabled', 'dave_available', 'dave_ready', 'transport_aes_gcm',
     'permission_view', 'permission_connect', 'permission_speak', 'permission_full',
-    'text_received', 'completion_received',
+    'text_received', 'completion_received', 'ingress_ended', 'playback_drained', 'recovery',
   ]) {
     const value = diagnosticValue(fields, key);
     if (typeof value === 'boolean') result[key] = value;
@@ -148,7 +152,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['duration_ms', 0, 86_400_000], ['stage_duration_ms', 0, 86_400_000], ['timeout_ms', 0, 300_000],
     ['network_status', 0, 6], ['previous_network_status', 0, 6],
     ['websocket_close_code', 1_000, 4_999], ['disconnect_reason', 0, 4],
-    ['dave_protocol_version', 0, 65_535], ['diagnostics_version', 1, 2],
+    ['dave_protocol_version', 0, 65_535], ['diagnostics_version', 1, 3], ['pending_tools', 0, 128],
     ['audio_chunks', 0, 1_000_000], ['audio_bytes', 0, 128_000_000],
   ] as const) {
     const value = diagnosticValue(fields, key);

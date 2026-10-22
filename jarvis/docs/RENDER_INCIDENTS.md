@@ -6,10 +6,13 @@ O incidente `07090582` registrou apenas `jarvis_command_failed` em `/jarvis join
 Esse registro antigo não contém a etapa ou a exceção; não é possível recuperar a
 causa apenas pelo ID. A revisão acrescenta diagnóstico para a próxima tentativa.
 
-Posteriormente foi informado em produção: Discord conectado, HTTP 200 ElevenLabs,
-WebSocket iniciado, uma sessão, um turno, um timeout e um erro, sem resposta audível.
-Isso confirma abertura/envio, mas não informa se chegaram áudio ou conclusão.
-Não comprova que `agent_response_complete` está desabilitado ou que o TTS falhou.
+Posteriormente, um teste independente no Render recebeu HTTP 200, metadata,
+uma mensagem textual, 30 eventos `audio` e 32 `ping`, mas nenhuma conclusão em
+55 segundos. A conclusão estava habilitada na versão publicada
+`agtvrsn_0201m5ge5vdfe148necsryg6a6wc`. O incidente `BABA0C1C` recebeu 79.360
+bytes, mas o Jarvis os reteve até falhar em 45 segundos. Há áudio disponível;
+o bloqueio local estava na dependência exclusiva do evento de conclusão.
+A causa de o provedor não emitir esse evento continua sem comprovação.
 
 Defeito comprovado no código anterior: timeout removia a sessão, abortava o WS e
 o callback desse cancelamento incrementava `agent_errors` incondicionalmente.
@@ -32,12 +35,16 @@ eventos necessários às tools configuradas. Inicialização e ping têm tratame
 próprio; não copie um dump de eventos para overrides. Veja também a
 [referência WebSocket](https://elevenlabs.io/docs/eleven-agents/api-reference/eleven-agents/websocket).
 
-O buffer só segue para playback após conclusão explícita válida. Silêncio, texto,
-timeout e fechamento do socket nunca autorizam reproduzir um trecho incompleto.
-A espera heurística de 200 ms foi removida: a conclusão documentada é a fronteira.
-Conclusão sem áudio gera diagnóstico; áudio sem conclusão é descartado ao expirar
-o prazo. Uma resposta integral já concluída pode terminar seu playback local
-quando o WS fecha; revogação continua cancelando reprodução e dados pendentes.
+Áudio válido segue progressivamente para Opus/Discord, com buffers limitados e
+backpressure. O SDK oficial também inicia playback sem esperar conclusão.
+`agent_response_complete` confirma a geração do turno; o fim do recebimento e o
+esvaziamento local da reprodução são estados separados. Nenhum silêncio ou
+timeout confirma geração completa. Após 45 s sem progresso e sem ferramenta
+pendente, a recuperação fecha o transporte, drena os blocos válidos recebidos e
+encerra o resultado como **não confirmado**, sem follow-up. Ferramentas pendentes
+esperam os limites absolutos; expiração, revogação e desconexão cancelam a reprodução.
+Veja a [pesquisa oficial e do SDK](ELEVENLABS_STREAMING_RESEARCH.md) e o
+[roteiro completo de validação](STREAMING_PRODUCTION_VALIDATION.md).
 
 ## Preparar e implantar a revisão
 
@@ -54,7 +61,7 @@ quando o WS fecha; revogação continua cancelando reprodução e dados pendente
    instância. Não execute outra cópia local com o mesmo token/guild.
 5. Use `JARVIS_LOG_LEVEL=info` para acompanhar as etapas. Falhas também são
    registradas em nível `error`, com o snapshot relevante mesmo se info for filtrado.
-6. Confirme `jarvis_ready` com `diagnostics_version: 2` nos logs do processo novo.
+6. Confirme `jarvis_ready` com `diagnostics_version: 3` nos logs do processo novo.
    Esse marcador confirma a instrumentação, não conexão de voz ou resposta audível.
 
 Não há variável nova obrigatória. Credenciais continuam exclusivamente no
@@ -100,9 +107,11 @@ em [VOICE_NEGOTIATION_NOTES.md](VOICE_NEGOTIATION_NOTES.md).
    fallback não requer consentimento para captar voz nem valida wake word.
 4. Aguarde a resposta e consulte `/jarvis status` novamente. Use as **diferenças**
    entre os contadores, não seus totais históricos.
-5. A diferença esperada para uma resposta de voz é: `audio_chunks_received > 0`,
-   `audio_bytes_received > 0`, `agent_responses_completed = 1` e
-   `playback_completed = 1`. `playback_started` antecede o último contador.
+5. Antes da conclusão explícita, `audio_chunks_received`, `audio_bytes_received`,
+   `audio_chunks_played`, `audio_stream_started` e `playback_started` devem subir.
+   Ao drenar a fila, `playback_completed` sobe e `audio_stream_buffer_bytes` volta
+   a zero. `agent_response_complete_received` só sobe se a conclusão chegar;
+   sua ausência pode terminar em `turn_completion_missing`, sem impedir áudio.
 6. Confirme também ouvir a frase inteira. `playback_completed` significa que a
    reprodução local terminou sem rejeição; não mede o que uma pessoa ouviu.
 7. Teste revogação durante espera/playback: não pode haver novo upload/reprodução
@@ -110,12 +119,12 @@ em [VOICE_NEGOTIATION_NOTES.md](VOICE_NEGOTIATION_NOTES.md).
 
 | Observação nova | Interpretação verificável / próxima checagem |
 | --- | --- |
-| Áudio positivo, `agent_response_complete_events_received=0`, timeout | Áudio chegou, evento de conclusão não foi observado; revisar client_events do agente publicado e entrega do evento |
-| Completion recebido, `agent_responses_completed=0`, `AGENT_INVALID_EVENT` | Envelope chegou, mas não passou validação; nenhuma reprodução autorizada |
+| Áudio positivo e conclusão zero | Áudio deve começar; recuperação termina como não confirmada. Investigar entrega do evento, ferramentas e diferenças entre entrada por texto e voz |
+| Completion recebido, `agent_responses_completed=0`, `AGENT_INVALID_EVENT` | Envelope chegou, mas não passou validação; o fluxo é cancelado sem confirmar geração |
 | `text_received=true`, áudio zero, `AGENT_TEXT_WITHOUT_AUDIO` | Texto observado sem áudio; conferir modo `text_only=false`, voz/TTS e erros do agente no painel |
 | Nenhum áudio/texto/conclusão, `AGENT_RESPONSE_TIMEOUT` | Nenhum output observado em 45 s; verificar geração/tools e configuração de eventos, sem presumir TTS |
-| `AGENT_PREMATURE_CLOSE` | WS encerrou antes da conclusão; trecho pendente descartado, sem flush por fechamento |
-| Conclusão e áudio positivos, `PLAYBACK_FAILED` | Falha no caminho de reprodução Discord após validar a resposta |
+| `AGENT_PREMATURE_CLOSE` ou `AGENT_TRANSPORT_ERROR` | Drena áudio válido já recebido; mantém resultado não confirmado e uma falha primária |
+| `PLAYBACK_FAILED` / `playback_failed` | Falha na fila, codificação, recurso ou limite de reprodução Discord |
 | `AGENT_AUTHENTICATION_FAILED`, `AGENT_CREDIT_LIMIT`, `AGENT_RATE_LIMITED` | Erro primário classificado do provedor; fechamento subsequente não duplica a contagem |
 
 `agent_responses_completed` conta conclusões válidas do turno; o contador
@@ -124,8 +133,9 @@ validação. `agent_text_events_received` e `text_received` registram presença 
 texto sem guardá-lo. Chunks válidos recebidos fora de um turno são descartados e
 contabilizados em `audio_chunks_discarded`.
 
-Timeout local incrementa `agent_response_timeouts` uma vez e gera uma falha
-primária com snapshot, sem incrementar `agent_errors` pelo abort local.
+Timeout local incrementa `agent_response_timeouts` uma vez. Se houver áudio,
+gera `jarvis_agent_turn_recovering`; sem áudio gera falha com snapshot.
+O abort local não incrementa `agent_errors`.
 `agent_errors` é reservado às falhas primárias de provider/protocolo ou fechamento
 prematuro. O encerramento esperado depois de uma conclusão tem contagem separada.
 Use `jarvis_agent_turn_failed` e seu `incident` para correlacionar a falha do turno.
@@ -136,8 +146,8 @@ de exceção. Não habilite debug bruto nem registre o objeto de configuração.
 
 ## Evidência desta revisão
 
-Build, typecheck, lint e 230 testes Node passaram; um gate de voz real continua
-explicitamente skipped. Python: 78 testes e 67 subtests passaram. Os testes novos
-incluem adapter + manager integrados com PCM sintético e falhas simuladas.
+O registro de checks desta revisão está em
+[IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md). Os testes incluem
+adapter + manager integrados e codificação Opus real com PCM sintético.
 Nenhum desses resultados comprova som audível no Render. A aceitação operacional
 exige a execução humana acima e o registro somente dos contadores/códigos.

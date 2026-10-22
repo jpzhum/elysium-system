@@ -7,14 +7,22 @@ export interface AgentSession {
   /** Signed 16-bit little-endian, mono PCM at inputSampleRate. */
   sendAudio(pcm: Buffer): void;
   sendContext(text: string): void;
-  close(): void;
+  /** Stop transport; optional drain only accepts PCM already received, never confirms a turn. */
+  close(options?: { drainAudio?: boolean }): void;
+}
+
+export interface AgentResponseIdentity {
+  eventId?: number;
+  responseId?: string;
 }
 
 export interface AgentCallbacks {
-  onAudio(pcm: Buffer, eventId: number): void;
-  onResponseComplete(eventId?: number): void;
+  /** Copy borrowed PCM before returning/resolving; it is erased after bounded acceptance. */
+  onAudio(pcm: Buffer, eventId: number, info?: { responseId?: string }): void | Promise<void>;
+  onResponseComplete(eventId?: number): void | Promise<void>;
   /** Content-free signals only. Never forward the provider's text to diagnostics. */
-  onTextResponse?(): void;
+  onTextResponse?(identity?: AgentResponseIdentity): void;
+  onToolActivity?(pending: number): void;
   onProtocolEvent?(event: 'audio' | 'agent_response' | 'agent_response_complete' | 'client_error'): void;
   onInterruption(): void;
   onClose(): void;
@@ -41,7 +49,8 @@ export class AgentError extends Error {
 }
 
 type AgentSocket = Pick<WebSocket,
-  'on' | 'send' | 'close' | 'terminate' | 'readyState' | 'bufferedAmount'>;
+  'on' | 'send' | 'close' | 'terminate' | 'readyState' | 'bufferedAmount'>
+  & Partial<Pick<WebSocket, 'pause' | 'resume'>>;
 
 /** Injection is for protocol tests; production always uses the fixed HTTPS origin. */
 export interface AgentDependencies {
@@ -54,6 +63,10 @@ export interface AgentDependencies {
 const MAX_MESSAGE_BYTES = 384 * 1024;
 const MAX_PCM_BYTES = 192_000;
 const MAX_BUFFERED_BYTES = 512 * 1024;
+const MAX_INGRESS_PCM_BYTES = 384 * 1024;
+const PAUSE_INGRESS_PCM_BYTES = 256 * 1024;
+const RESUME_INGRESS_PCM_BYTES = 128 * 1024;
+const MAX_INGRESS_EVENTS = 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 const METADATA_TIMEOUT_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 90_000;
@@ -71,6 +84,13 @@ function integer(value: unknown): number {
     throw new AgentError('invalid_agent_event');
   }
   return value;
+}
+
+function responseIdentity(value: Record<string, unknown>): AgentResponseIdentity {
+  return {
+    ...(value.event_id === undefined ? {} : { eventId: integer(value.event_id) }),
+    ...(value.response_id === undefined ? {} : { responseId: boundedString(value.response_id, 200) }),
+  };
 }
 
 function boundedString(value: unknown, bytes: number): string {
@@ -246,6 +266,14 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
     return new Promise<AgentSession>((resolve, reject) => {
       let negotiated = false;
       let closed = false;
+      let finalized = false;
+      let draining = false;
+      let pumping = false;
+      let ingressBytes = 0;
+      let paused = false;
+      let inFlightPcm: Buffer | undefined;
+      let deliveryEpoch = 0;
+      let lastInterruptId = 0;
       let inputSampleRate = 0;
       let outputSampleRate = 0;
       let toolsActive = 0;
@@ -253,23 +281,57 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       let lastMessageAt = Date.now();
       let closeTimer: ReturnType<typeof setTimeout> | undefined;
       const toolIds = new Set<string>();
+      const pendingToolIds = new Set<string>();
       const cancelTools = new Set<() => void>();
+      type Delivery = { kind: 'audio'; pcm: Buffer; eventId: number; info?: { responseId?: string } }
+        | { kind: 'complete'; eventId: number };
+      const deliveries: Delivery[] = [];
       const notify = (callback: () => void): void => { try { callback(); } catch { /* Do not expose callback data. */ } };
-      const cleanup = (): void => {
+      const cleanup = (removeAbort: boolean): void => {
         clearTimeout(metadataTimer);
         clearInterval(heartbeatTimer);
-        options.signal?.removeEventListener('abort', onAbort);
+        if (removeAbort) options.signal?.removeEventListener('abort', onAbort);
         for (const cancel of cancelTools) cancel();
         cancelTools.clear();
         toolIds.clear();
+        pendingToolIds.clear();
       };
-      const end = (code?: string): void => {
-        if (closed) return;
+      const resumeIngress = (): void => {
+        if (!paused || ingressBytes > RESUME_INGRESS_PCM_BYTES) return;
+        paused = false;
+        // A local TCP pause hides provider pings. Restart their liveness window
+        // when we can receive again; independent session/playback limits bound it.
+        lastMessageAt = Date.now();
+        try { ws.resume?.(); } catch { /* Transport closure is handled separately. */ }
+      };
+      const finishClose = (): void => {
+        if (finalized) return;
+        finalized = true;
+        cleanup(true);
+        notify(() => options.callbacks.onClose());
+      };
+      const discardDeliveries = (): void => {
+        deliveryEpoch++;
+        for (const item of deliveries) if (item.kind === 'audio') item.pcm.fill(0);
+        // In-flight PCM remains borrowed until the callback settles; cancellation
+        // also revokes playback, whose pending write then rejects promptly.
+        deliveries.length = 0;
+        ingressBytes = 0;
+        resumeIngress();
+      };
+      const end = (code?: string, drainAudio = false): void => {
+        if (finalized) return;
+        if (closed) {
+          // Revocation can cancel a graceful transport drain that is still pending.
+          if (!drainAudio) { draining = false; discardDeliveries(); finishClose(); }
+          return;
+        }
         closed = true;
-        cleanup();
+        draining = drainAudio && negotiated;
+        cleanup(!draining);
         if (code) notify(() => options.callbacks.onError(code));
         if (!negotiated) reject(new AgentError(code ?? 'agent_closed'));
-        notify(() => options.callbacks.onClose());
+        if (!draining) discardDeliveries();
         // terminate bounds shutdown even when the remote peer never acknowledges CLOSE.
         if (ws.readyState === WebSocket.OPEN) {
           ws.close(1000);
@@ -278,6 +340,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
             closeTimer.unref();
           }
         } else if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
+        if (!draining || (!pumping && deliveries.length === 0)) finishClose();
       };
       // A local close/revocation after negotiation is not a provider failure.
       const onAbort = (): void => end(negotiated ? undefined : 'agent_aborted');
@@ -285,9 +348,83 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         try { callback(); }
         catch { end('agent_callback_error'); }
       };
+      const updateToolActivity = (id: string, pending: boolean): void => {
+        if (pending) {
+          if (pendingToolIds.size >= 128 && !pendingToolIds.has(id)) throw new AgentError('agent_tool_limit');
+          pendingToolIds.add(id);
+        } else pendingToolIds.delete(id);
+        dispatch(() => options.callbacks.onToolActivity?.(pendingToolIds.size));
+      };
+      const pump = (): void => {
+        if (pumping || finalized || (closed && !draining)) return;
+        pumping = true;
+        const epoch = deliveryEpoch;
+        while (deliveries.length > 0 && epoch === deliveryEpoch && !finalized) {
+          const item = deliveries.shift()!;
+          try {
+            if (item.kind === 'complete') {
+              // A completion waits for prior writes to be accepted, not for playback
+              // to finish. Its own callback cannot block later protocol progress.
+              const result = options.callbacks.onResponseComplete(item.eventId);
+              if (result) void Promise.resolve(result).catch(() => {
+                if (epoch === deliveryEpoch && !finalized) end('agent_callback_error');
+              });
+              continue;
+            }
+            inFlightPcm = item.pcm;
+            const result = item.info
+              ? options.callbacks.onAudio(item.pcm, item.eventId, item.info)
+              : options.callbacks.onAudio(item.pcm, item.eventId);
+            if (result) {
+              void Promise.resolve(result).then(() => {
+                item.pcm.fill(0);
+                inFlightPcm = undefined;
+                if (epoch === deliveryEpoch) ingressBytes -= item.pcm.length;
+                resumeIngress();
+                pumping = false;
+                pump();
+              }, () => {
+                item.pcm.fill(0);
+                inFlightPcm = undefined;
+                pumping = false;
+                if (epoch === deliveryEpoch && !finalized) end('agent_callback_error');
+                else pump();
+              });
+              return;
+            }
+            item.pcm.fill(0);
+            inFlightPcm = undefined;
+            if (epoch === deliveryEpoch) ingressBytes -= item.pcm.length;
+            resumeIngress();
+          } catch {
+            inFlightPcm?.fill(0);
+            inFlightPcm = undefined;
+            pumping = false;
+            end('agent_callback_error');
+            return;
+          }
+        }
+        pumping = false;
+        if (closed && draining && deliveries.length === 0) finishClose();
+        else if (deliveries.length > 0 && !finalized) queueMicrotask(pump);
+      };
+      const enqueue = (item: Delivery): void => {
+        const bytes = item.kind === 'audio' ? item.pcm.length : 0;
+        if (deliveries.length >= MAX_INGRESS_EVENTS || ingressBytes + bytes > MAX_INGRESS_PCM_BYTES) {
+          if (item.kind === 'audio') item.pcm.fill(0);
+          throw new AgentError('agent_audio_backpressure');
+        }
+        deliveries.push(item);
+        ingressBytes += bytes;
+        if (!paused && ingressBytes >= PAUSE_INGRESS_PCM_BYTES && ws.pause) {
+          paused = true;
+          ws.pause();
+        }
+        pump();
+      };
       const metadataTimer = setTimeout(() => end('agent_metadata_timeout'), METADATA_TIMEOUT_MS);
       const heartbeatTimer = setInterval(() => {
-        if (Date.now() - lastMessageAt > HEARTBEAT_TIMEOUT_MS) end('agent_heartbeat_timeout');
+        if (!paused && Date.now() - lastMessageAt > HEARTBEAT_TIMEOUT_MS) end('agent_heartbeat_timeout', true);
       }, 10_000);
       heartbeatTimer.unref();
       const send = (payload: unknown): void => {
@@ -298,8 +435,8 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
           throw new AgentError('agent_backpressure');
         }
         try {
-          ws.send(data, error => { if (error) end('agent_transport_error'); });
-        } catch { end('agent_transport_error'); throw new AgentError('agent_transport_error'); }
+          ws.send(data, error => { if (error) end('agent_transport_error', true); });
+        } catch { end('agent_transport_error', true); throw new AgentError('agent_transport_error'); }
       };
       const session: AgentSession = {
         get inputSampleRate() { return inputSampleRate; },
@@ -312,13 +449,15 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
           }
           send({ user_audio_chunk: pcm.toString('base64') });
         },
-        close: () => end(),
+        close: closeOptions => end(undefined, closeOptions?.drainAudio),
       };
       const runTool = async (call: Record<string, unknown>): Promise<void> => {
         const name = boundedString(call.tool_name, 100);
         const id = boundedString(call.tool_call_id, 200);
         if (toolIds.has(id)) return;
         toolIds.add(id);
+        updateToolActivity(id, true);
+        if (closed) return;
         let result = 'Ferramenta indisponível nesta sessão.';
         let isError = true;
         if (toolsActive < 2 && toolsUsed < 64 && options.tools && negotiated) {
@@ -355,6 +494,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         if (!closed && call.expects_response !== false) {
           send({ type: 'client_tool_result', tool_call_id: id, result, is_error: isError });
         }
+        if (!closed) updateToolActivity(id, false);
       };
       ws.on('open', () => {
         if (closed) return;
@@ -391,7 +531,12 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               const pcm = Buffer.from(encoded, 'base64');
               if (pcm.length === 0 || pcm.length % 2 || pcm.length > MAX_PCM_BYTES) throw new AgentError('invalid_output_audio');
               const eventId = integer(audio.event_id);
-              dispatch(() => options.callbacks.onAudio(pcm, eventId));
+              // The SDK uses event_id as an interruption boundary. Multiple PCM
+              // chunks may share it; it is not a unique packet sequence number.
+              if (eventId < lastInterruptId) break;
+              const identity = responseIdentity(audio);
+              enqueue({ kind: 'audio', pcm, eventId,
+                ...(identity.responseId ? { info: { responseId: identity.responseId } } : {}) });
               break;
             }
             case 'ping':
@@ -399,6 +544,11 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               break;
             case 'interruption':
               if (!negotiated) throw new AgentError('invalid_agent_event');
+              if (event.interruption_event !== undefined) {
+                const interruption = record(event.interruption_event);
+                if (interruption.event_id !== undefined) lastInterruptId = Math.max(lastInterruptId, integer(interruption.event_id));
+              }
+              discardDeliveries();
               dispatch(() => options.callbacks.onInterruption());
               break;
             case 'agent_response_complete': {
@@ -406,12 +556,33 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               if (closed) return;
               if (!negotiated) throw new AgentError('invalid_agent_event');
               const eventId = integer(record(event.agent_response_complete_event).event_id);
-              dispatch(() => options.callbacks.onResponseComplete(eventId));
+              enqueue({ kind: 'complete', eventId });
               break;
             }
             case 'client_tool_call':
+              if (!negotiated) throw new AgentError('invalid_agent_event');
               void runTool(record(event.client_tool_call)).catch(() => end('agent_tool_error'));
               break;
+            case 'agent_tool_request': {
+              if (!negotiated) throw new AgentError('invalid_agent_event');
+              updateToolActivity(boundedString(record(event.agent_tool_request).tool_call_id, 200), true);
+              break;
+            }
+            case 'agent_tool_response':
+            case 'agent_tool_response_full_payload': {
+              if (!negotiated) throw new AgentError('invalid_agent_event');
+              const result = record(event[event.type]);
+              updateToolActivity(boundedString(result.tool_call_id, 200), false);
+              break;
+            }
+            case 'mcp_tool_call': {
+              if (!negotiated) throw new AgentError('invalid_agent_event');
+              const call = record(event.mcp_tool_call);
+              const pending = call.state === 'loading' || call.state === 'awaiting_approval';
+              if (!pending && call.state !== 'success' && call.state !== 'failure') throw new AgentError('invalid_agent_event');
+              updateToolActivity(boundedString(call.tool_call_id, 200), pending);
+              break;
+            }
             case 'client_error': {
               dispatch(() => options.callbacks.onProtocolEvent?.('client_error'));
               if (closed) return;
@@ -427,13 +598,13 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               if (closed) return;
               const response = record(event.agent_response_event);
               if (typeof response.agent_response !== 'string') throw new AgentError('invalid_agent_event');
-              if (response.agent_response.trim()) dispatch(() => options.callbacks.onTextResponse?.());
+              if (response.agent_response.trim()) dispatch(() => options.callbacks.onTextResponse?.(responseIdentity(response)));
               break;
             }
             case 'agent_chat_response_part': {
               const part = record(event.text_response_part);
               if (part.type === 'delta' && typeof part.text === 'string' && part.text.trim()) {
-                dispatch(() => options.callbacks.onTextResponse?.());
+                dispatch(() => options.callbacks.onTextResponse?.(responseIdentity(part)));
               }
               break;
             }
@@ -451,14 +622,14 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
           end(error instanceof AgentError ? error.code : 'invalid_agent_event');
         }
       });
-      ws.on('error', () => end('agent_transport_error'));
+      ws.on('error', () => end('agent_transport_error', true));
       ws.on('unexpected-response', (_request, response) => {
         response.resume();
         end(statusCode(response.statusCode ?? 0));
       });
       ws.on('close', () => {
         clearTimeout(closeTimer);
-        end(negotiated ? undefined : 'agent_closed_before_metadata');
+        if (!closed) end(negotiated ? undefined : 'agent_closed_before_metadata', true);
       });
       options.signal?.addEventListener('abort', onAbort, { once: true });
       if (options.signal?.aborted) onAbort();
