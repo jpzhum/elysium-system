@@ -2,6 +2,9 @@
 export interface CaptureTiming {
   readonly captureMs: number;
   readonly endDetectionMs: number;
+  /** Monotonic delays from the local Discord speaking.start callback, when observed. */
+  readonly firstPcmMs?: number;
+  readonly voiceStartMs?: number;
   readonly captureId?: string;
   readonly captureStartedAtMs?: number;
   readonly captureEndedAtMs?: number;

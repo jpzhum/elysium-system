@@ -56,6 +56,13 @@ export interface ConnectAgentOptions {
   tools?: (name: string, parameters: unknown, signal: AbortSignal) => Promise<unknown>;
   /** Fixed tool/stage classifications only: parameters, IDs and results never enter diagnostics. */
   onToolEvent?(event: AgentToolDiagnostic): void;
+  /** Monotonic connection stages only; never expose credentials, URLs or provider IDs. */
+  onConnectionStage?(event: AgentConnectionStage): void;
+}
+
+export interface AgentConnectionStage {
+  stage: 'signed_url' | 'websocket_handshake' | 'audio_negotiation';
+  durationMs: number;
 }
 
 export interface AgentToolDiagnostic {
@@ -296,8 +303,16 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       ...(options.suppressFirstMessage ? { conversation_config_override: { agent: { first_message: '' } } } : {}),
     });
     if (Buffer.byteLength(initiation) > 16 * 1024) throw new AgentError('invalid_agent_configuration');
+    const connectionStage = (stage: AgentConnectionStage['stage'], started: number): void => {
+      try { options.onConnectionStage?.({ stage, durationMs: Math.max(0, performance.now() - started) }); }
+      catch { /* Diagnostics must never alter provider connectivity. */ }
+    };
+    const signedUrlStarted = performance.now();
     const signedUrl = await getSignedUrl(options, deps);
+    connectionStage('signed_url', signedUrlStarted);
     if (options.signal?.aborted) throw new AgentError('agent_aborted');
+    const socketStarted = performance.now();
+    let socketOpenedAt: number | undefined;
     let ws: AgentSocket;
     try { ws = deps.createSocket(signedUrl); }
     catch { throw new AgentError('agent_unavailable'); }
@@ -535,7 +550,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       const queueTool = (call: Record<string, unknown>): void => {
         const name = boundedString(call.tool_name, 100);
         const id = boundedString(call.tool_call_id, 200);
-        const started = Date.now();
+        const started = performance.now();
         if (call.expects_response !== undefined && typeof call.expects_response !== 'boolean') {
           throw new AgentError('invalid_agent_event');
         }
@@ -549,7 +564,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         const waitForResponse = call.expects_response !== false;
         const diagnostic = (stage: AgentToolDiagnostic['stage'], code?: AgentToolDiagnostic['code']): void => {
           notify(() => options.onToolEvent?.({ stage, tool, waitForResponse,
-            ...(stage === 'completed' || stage === 'failed' ? { durationMs: Math.max(0, Date.now() - started) } : {}),
+            ...(stage === 'completed' || stage === 'failed' ? { durationMs: Math.max(0, performance.now() - started) } : {}),
             ...(code ? { code } : {}) }));
         };
         diagnostic('received');
@@ -585,7 +600,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         cancelTools.add(cancel);
         enqueue({ kind: 'tool', cancel, start: () => {
           if (settled || closed) return;
-          if (Date.now() - started >= 8000) { finish(failureResult, 'TOOL_TIMEOUT'); return; }
+          if (performance.now() - started >= 8000) { finish(failureResult, 'TOOL_TIMEOUT'); return; }
           if (toolsActive >= 2 || toolsUsed >= 64 || !options.tools || !negotiated) {
             finish('Ferramenta indisponível nesta sessão.', 'TOOL_UNAVAILABLE'); return;
           }
@@ -611,6 +626,8 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
       };
       ws.on('open', () => {
         if (closed) return;
+        socketOpenedAt = performance.now();
+        connectionStage('websocket_handshake', socketStarted);
         try { send(JSON.parse(initiation) as unknown); } catch { end('agent_transport_error'); }
       });
       ws.on('message', (raw: RawData, binary: boolean) => {
@@ -629,6 +646,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               outputSampleRate = pcmRate(metadata.agent_output_audio_format);
               negotiated = true;
               clearTimeout(metadataTimer);
+              if (socketOpenedAt !== undefined) connectionStage('audio_negotiation', socketOpenedAt);
               resolve(session);
               break;
             }

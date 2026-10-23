@@ -12,7 +12,11 @@ export interface GameSearchResult {
   sources: GameSearchSource[];
   checked_at: string;
   uncertainty: string;
+  /** Fixed operational origin only; never provider headers, bodies or queries. */
+  rate_limit_source?: GameSearchRateLimitSource;
 }
+
+export type GameSearchRateLimitSource = 'worker_busy' | 'worker_interval' | 'provider_quota' | 'provider_429';
 
 export type GameSearchStatus = 'success' | 'missing_key' | 'invalid_input' | 'cancelled'
   | 'rate_limited' | 'unavailable' | 'timeout' | 'invalid_reply' | 'no_sources';
@@ -21,6 +25,7 @@ export interface GameSearchDiagnostic {
   status: GameSearchStatus;
   durationMs: number;
   sourceCount: number;
+  rateLimitSource?: GameSearchRateLimitSource;
 }
 
 export interface GameSearchOptions {
@@ -40,11 +45,13 @@ export function createGameSearch(options: GameSearchOptions): (
 ) => Promise<GameSearchResult> {
   let active = false;
   let nextRequestAt = 0;
+  let nextRequestSource: GameSearchRateLimitSource = 'worker_interval';
   return async (game, query, signal) => {
     const started = Date.now();
     const report = (result: GameSearchResult): GameSearchResult => {
       try { options.onDiagnostic?.({ status: result.status,
-        durationMs: Math.max(0, Date.now() - started), sourceCount: result.sources.length }); }
+        durationMs: Math.max(0, Date.now() - started), sourceCount: result.sources.length,
+        ...(result.rate_limit_source ? { rateLimitSource: result.rate_limit_source } : {}) }); }
       catch { /* Diagnostics must never change a tool result or expose callback errors. */ }
       return result;
     };
@@ -54,10 +61,12 @@ export function createGameSearch(options: GameSearchOptions): (
     }
     if (active || Date.now() < nextRequestAt) {
       return report({ ...emptyResult(game, query), status: 'rate_limited', answer: UNAVAILABLE,
+        rate_limit_source: active ? 'worker_busy' : nextRequestSource,
         uncertainty: 'O limite de consultas deste worker foi atingido. Aguarde antes de tentar novamente.' });
     }
     active = true;
     nextRequestAt = Date.now() + 1000;
+    nextRequestSource = 'worker_interval';
     try {
       return report(await performSearch(game, query, options.apiKey, signal, response => {
         // Honor all quota windows reported by Brave without retaining headers or
@@ -72,8 +81,10 @@ export function createGameSearch(options: GameSearchOptions): (
           const retry = Number(response.headers.get('retry-after'));
           waits.push(Number.isFinite(retry) && retry > 0 ? retry : 5);
         }
-        if (waits.length) nextRequestAt = Math.max(nextRequestAt,
-          Date.now() + Math.min(120, Math.max(...waits)) * 1000);
+        if (waits.length) {
+          nextRequestAt = Math.max(nextRequestAt, Date.now() + Math.min(120, Math.max(...waits)) * 1000);
+          nextRequestSource = response.status === 429 ? 'provider_429' : 'provider_quota';
+        }
       }, options.timeoutMs));
     } finally { active = false; }
   };
@@ -158,6 +169,7 @@ async function performSearch(
   const result = emptyResult(game, query);
   const unavailable = (status: GameSearchStatus, reason: string): GameSearchResult => ({
     ...result, status, answer: UNAVAILABLE, uncertainty: reason,
+    ...(status === 'rate_limited' ? { rate_limit_source: 'provider_429' as const } : {}),
   });
   if (!validInput(game, query)) {
     return unavailable('invalid_input', 'Informe o jogo e uma pergunta dentro dos limites da ferramenta.');

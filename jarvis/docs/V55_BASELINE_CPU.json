@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "kind": "synthetic_audio_local_cpu",
+  "description": "Measured wall-clock CPU fixture execution, including allocation. No real voice, network, recognition, or audibility measurements.",
+  "runtime": {
+    "node": "v24.19.0",
+    "platform": "win32",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 7 7800X3D 8-Core Processor           "
+  },
+  "clock": "performance.now monotonic milliseconds",
+  "samples_per_case": 25,
+  "warmups_per_case": 5,
+  "cpu": {
+    "capture_48k_stereo_to_16k_mono_1s": {
+      "n": 25,
+      "p50_ms": 31.43999999999994,
+      "p90_ms": 34.36660000000006,
+      "p95_ms": 35.58370000000002,
+      "max_ms": 36.40120000000002
+    },
+    "capture_48k_stereo_to_16k_mono_3s": {
+      "n": 25,
+      "p50_ms": 90.77790000000005,
+      "p90_ms": 93.4249000000002,
+      "p95_ms": 94.60389999999961,
+      "max_ms": 96.49459999999999
+    },
+    "playback_16k_mono_to_48k_stereo_20ms": {
+      "n": 25,
+      "p50_ms": 1.1721999999999753,
+      "p90_ms": 1.1761000000001332,
+      "p95_ms": 1.1811999999999898,
+      "max_ms": 1.1820000000002437
+    },
+    "playback_24k_mono_to_48k_stereo_20ms": {
+      "n": 25,
+      "p50_ms": 1.0936000000001513,
+      "p90_ms": 1.154399999999896,
+      "p95_ms": 1.1924999999996544,
+      "max_ms": 1.2826999999997497
+    },
+    "streaming_24k_first_20ms": {
+      "n": 25,
+      "p50_ms": 0.5226999999999862,
+      "p90_ms": 0.5419000000001688,
+      "p95_ms": 0.5526999999997315,
+      "max_ms": 0.5898999999999432
+    },
+    "streaming_24k_full_1s": {
+      "n": 25,
+      "p50_ms": 25.400399999999536,
+      "p90_ms": 26.564700000000357,
+      "p95_ms": 26.615099999999984,
+      "max_ms": 28.590500000000247
+    }
+  }
+}

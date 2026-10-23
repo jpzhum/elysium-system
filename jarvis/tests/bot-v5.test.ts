@@ -46,7 +46,8 @@ vi.mock('../src/discord/voice-receiver.js', () => ({ VoiceReceiver: class {
   constructor(_connection: unknown, options: VoiceReceiverOptions) { hooks.receiver = options; }
   start = vi.fn(); stop = vi.fn(); stopUser = vi.fn();
 } }));
-vi.mock('../src/audio/playback.js', () => ({ PlaybackQueue: class {
+vi.mock('../src/audio/playback.js', async (original) => ({
+  ...await original<typeof import('../src/audio/playback.js')>(), PlaybackQueue: class {
   isPlaying = false; isAudible = false; currentStreamToken = undefined;
   play = vi.fn(async () => undefined);
   stop = vi.fn(); stopUser = vi.fn();
@@ -419,6 +420,27 @@ describe('V5 Discord integration with the real per-speaker session manager', () 
     expect(logs[1]).toMatchObject({ input_kind: 'text', session_reused: true, identity_injected: true });
     expect(logs[1]!.incident).not.toBe(logs[0]!.incident);
     expect(h.access.metrics.snapshot()).toMatchObject({ identity_text_turns: 2, agent_session_reused: 1 });
+  });
+
+  test('late connection stage keeps its opening incident after cancellation and replacement', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER).run();
+    let release!: () => void;
+    const opening = new Promise<void>(resolve => { release = resolve; });
+    hooks.beforeConnect = async options => {
+      if (hooks.providers.length !== 1) return;
+      await opening;
+      options.onConnectionStage?.({ stage: 'signed_url', durationMs: 12 });
+    };
+    await h.ask();
+    const original = h.logs.find(line => line.event === 'jarvis_turn_queue_changed')!.incident;
+    await h.interaction('cancel').run();
+    await h.ask();
+    release(); await settle();
+    expect(h.logs.find(line => line.event === 'jarvis_agent_connection_stage')).toMatchObject({
+      incident: original, connection_stage: 'signed_url', duration_ms: 12,
+    });
+    expect(hooks.providers).toHaveLength(2);
   });
 
   test('new owner socket restores actual delivered context while the guest socket receives none of it', async () => {

@@ -76,7 +76,7 @@ test('progressive PCM plays real Opus before ingress ends, without a completion 
 });
 
 test('continuous resampling matches one complete conversion across arbitrary 22050/44100 Hz chunks', async () => {
-  for (const rate of [8_000, 16_000, 22_050, 44_100, 48_000, 96_000]) {
+  for (const rate of [8_000, 16_000, 22_050, 24_000, 44_100, 48_000, 96_000, 192_000]) {
     const pcm = tone(4_001, rate);
     const source = new StreamingPcm(rate, { maxBufferBytes: 64_000, maxSeconds: 120 });
     for (let offset = 0; offset < pcm.length; offset += 34) await source.write(pcm.subarray(offset, offset + 34), () => true);

@@ -60,6 +60,59 @@ afterEach(() => {
 });
 
 describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
+  it('separates signed URL, WebSocket and audio negotiation with monotonic content-free durations', async () => {
+    let now = 1_000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const onConnectionStage = vi.fn();
+    const h = harness({ onConnectionStage }, false);
+    h.request.mockImplementation(async () => {
+      now = 1_200;
+      return Response.json({ signed_url: signedUrl });
+    });
+    const pending = h.connect();
+    await vi.waitFor(() => expect(h.createSocket).toHaveBeenCalledOnce());
+    now = 1_500;
+    h.socket.open();
+    now = 1_800;
+    h.socket.message(metadata);
+    await pending;
+    expect(onConnectionStage.mock.calls.map(([event]) => event)).toEqual([
+      { stage: 'signed_url', durationMs: 200 },
+      { stage: 'websocket_handshake', durationMs: 300 },
+      { stage: 'audio_negotiation', durationMs: 300 },
+    ]);
+    expect(JSON.stringify(onConnectionStage.mock.calls)).not.toContain('private-secret');
+    expect(JSON.stringify(onConnectionStage.mock.calls)).not.toContain('conv_fixture');
+    expect(JSON.stringify(onConnectionStage.mock.calls)).not.toContain('api-secret');
+  });
+
+  it('does not lose connectivity when a connection diagnostic consumer fails', async () => {
+    const h = harness({ onConnectionStage: () => { throw new Error('private diagnostic failure'); } });
+    const session = await h.connect();
+    session.sendText('Pergunta de teste');
+    expect(h.socket.sent.at(-1)).toEqual({ type: 'user_message', text: 'Pergunta de teste' });
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+  });
+
+  it('keeps tool elapsed time correct when the system wall clock changes', async () => {
+    let now = 1_000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const wall = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    const onToolEvent = vi.fn();
+    const h = harness({ onToolEvent, tools: async () => {
+      now = 1_450;
+      wall.mockReturnValue(9_000_000_000);
+      return 'Resultado sintético';
+    } });
+    await h.connect();
+    h.socket.message({ type: 'client_tool_call', client_tool_call: {
+      tool_name: 'search_game_info', tool_call_id: 'synthetic', parameters: {},
+    } });
+    await Promise.resolve();
+    expect(onToolEvent).toHaveBeenLastCalledWith({ stage: 'completed', tool: 'search_game_info',
+      waitForResponse: true, durationMs: 450 });
+  });
+
   it('uses a fresh signed URL per session and sends trusted variables without API-key WS headers', async () => {
     const h = harness();
     const session = await h.connect();

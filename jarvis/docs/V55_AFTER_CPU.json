@@ -1,0 +1,1242 @@
+{
+  "schema": 1,
+  "kind": "synthetic_audio_local_cpu",
+  "description": "Measured wall-clock CPU fixture execution, including allocation. No real voice, network, recognition, or audibility measurements.",
+  "runtime": {
+    "node": "v24.19.0",
+    "platform": "win32",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 7 7800X3D 8-Core Processor           "
+  },
+  "clock": "performance.now monotonic milliseconds",
+  "samples_per_case": 25,
+  "warmups_per_case": 5,
+  "cpu": {
+    "capture_48k_stereo_to_16k_mono_1s": {
+      "n": 25,
+      "p50_ms": 12.056300000000022,
+      "p90_ms": 12.605399999999975,
+      "p95_ms": 15.998899999999992,
+      "max_ms": 17.091499999999996
+    },
+    "capture_48k_stereo_to_16k_mono_3s": {
+      "n": 25,
+      "p50_ms": 35.20749999999998,
+      "p90_ms": 37.0062999999999,
+      "p95_ms": 37.02139999999997,
+      "max_ms": 37.147500000000036
+    },
+    "playback_16k_mono_to_48k_stereo_20ms": {
+      "n": 25,
+      "p50_ms": 0.43100000000004,
+      "p90_ms": 0.4911000000001877,
+      "p95_ms": 0.5131000000001222,
+      "max_ms": 0.5628999999998996
+    },
+    "playback_24k_mono_to_48k_stereo_20ms": {
+      "n": 25,
+      "p50_ms": 0.42200000000002547,
+      "p90_ms": 0.47929999999996653,
+      "p95_ms": 0.4936000000000149,
+      "max_ms": 0.4962000000000444
+    },
+    "streaming_24k_first_20ms": {
+      "n": 25,
+      "p50_ms": 0.18079999999986285,
+      "p90_ms": 0.20229999999992287,
+      "p95_ms": 0.2335000000000491,
+      "max_ms": 0.24260000000003856
+    },
+    "streaming_24k_full_1s": {
+      "n": 25,
+      "p50_ms": 7.742899999999963,
+      "p90_ms": 8.08420000000001,
+      "p95_ms": 8.213399999999865,
+      "max_ms": 8.490599999999858
+    }
+  },
+  "pipeline": {
+    "kind": "synthetic_virtual_pipeline",
+    "repetitions": 5,
+    "description": "Production SessionManager with virtual monotonic timers, generated audio, mocked consent/provider/player; no live STT, network, Brave, recognition quality, or Discord audibility assertions.",
+    "assumptions_ms": {
+      "vad_silence": 600,
+      "wake_stt": 560,
+      "connection": 486,
+      "upload_chunk_pacing": 20,
+      "recognition_after_last_input": 200,
+      "agent_after_recognition": 1020,
+      "first_playback": 20,
+      "search_success": 150,
+      "search_timeout": 5000
+    },
+    "scenarios": {
+      "short_voice": {
+        "interactions": 5,
+        "success": 5,
+        "rejected": 0,
+        "stt_calls": 5,
+        "sessions_started": 5,
+        "sessions_reused": 0,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 1,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 1,
+        "stages": {
+          "wake_detection_ms": {
+            "n": 5,
+            "p50_ms": 560,
+            "p90_ms": 560,
+            "p95_ms": 560,
+            "max_ms": 560
+          },
+          "question_queue_wait_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_session_open_ms": {
+            "n": 5,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_audio_prepare_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_audio_upload_ms": {
+            "n": 5,
+            "p50_ms": 1820,
+            "p90_ms": 1820,
+            "p95_ms": 1820,
+            "max_ms": 1820
+          },
+          "agent_input_silence_saved_ms": {
+            "n": 5,
+            "p50_ms": 580,
+            "p90_ms": 580,
+            "p95_ms": 580,
+            "max_ms": 580
+          },
+          "agent_user_recognition_ms": {
+            "n": 5,
+            "p50_ms": 2000,
+            "p90_ms": 2000,
+            "p95_ms": 2000,
+            "max_ms": 2000
+          },
+          "agent_post_upload_recognition_ms": {
+            "n": 5,
+            "p50_ms": 180,
+            "p90_ms": 180,
+            "p95_ms": 180,
+            "max_ms": 180
+          },
+          "agent_recognition_to_response_ms": {
+            "n": 5,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 3506,
+            "p90_ms": 3506,
+            "p95_ms": 3506,
+            "max_ms": 3506
+          },
+          "agent_recognition_to_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_remote_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 1200,
+            "p90_ms": 1200,
+            "p95_ms": 1200,
+            "max_ms": 1200
+          },
+          "agent_first_playback_ms": {
+            "n": 5,
+            "p50_ms": 3526,
+            "p90_ms": 3526,
+            "p95_ms": 3526,
+            "max_ms": 3526
+          },
+          "agent_audio_buffering_ms": {
+            "n": 5,
+            "p50_ms": 20,
+            "p90_ms": 20,
+            "p95_ms": 20,
+            "max_ms": 20
+          },
+          "agent_end_to_end_first_playback_ms": {
+            "n": 5,
+            "p50_ms": 5686,
+            "p90_ms": 5686,
+            "p95_ms": 5686,
+            "max_ms": 5686
+          },
+          "agent_playback_drained_ms": {
+            "n": 5,
+            "p50_ms": 4026,
+            "p90_ms": 4026,
+            "p95_ms": 4026,
+            "max_ms": 4026
+          },
+          "agent_playback_ms": {
+            "n": 5,
+            "p50_ms": 500,
+            "p90_ms": 500,
+            "p95_ms": 500,
+            "max_ms": 500
+          },
+          "agent_turn_logical_end_ms": {
+            "n": 5,
+            "p50_ms": 4026,
+            "p90_ms": 4026,
+            "p95_ms": 4026,
+            "max_ms": 4026
+          },
+          "next_question_ready_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_last_audio_ms": {
+            "n": 5,
+            "p50_ms": 3906,
+            "p90_ms": 3906,
+            "p95_ms": 3906,
+            "max_ms": 3906
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 5,
+            "p50_ms": 5686,
+            "p90_ms": 5686,
+            "p95_ms": 5686,
+            "max_ms": 5686
+          }
+        }
+      },
+      "long_voice": {
+        "interactions": 5,
+        "success": 5,
+        "rejected": 0,
+        "stt_calls": 5,
+        "sessions_started": 5,
+        "sessions_reused": 0,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 1,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 1,
+        "stages": {
+          "wake_detection_ms": {
+            "n": 5,
+            "p50_ms": 560,
+            "p90_ms": 560,
+            "p95_ms": 560,
+            "max_ms": 560
+          },
+          "question_queue_wait_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_session_open_ms": {
+            "n": 5,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_audio_prepare_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_audio_upload_ms": {
+            "n": 5,
+            "p50_ms": 4820,
+            "p90_ms": 4820,
+            "p95_ms": 4820,
+            "max_ms": 4820
+          },
+          "agent_input_silence_saved_ms": {
+            "n": 5,
+            "p50_ms": 580,
+            "p90_ms": 580,
+            "p95_ms": 580,
+            "max_ms": 580
+          },
+          "agent_user_recognition_ms": {
+            "n": 5,
+            "p50_ms": 5000,
+            "p90_ms": 5000,
+            "p95_ms": 5000,
+            "max_ms": 5000
+          },
+          "agent_post_upload_recognition_ms": {
+            "n": 5,
+            "p50_ms": 180,
+            "p90_ms": 180,
+            "p95_ms": 180,
+            "max_ms": 180
+          },
+          "agent_recognition_to_response_ms": {
+            "n": 5,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 6506,
+            "p90_ms": 6506,
+            "p95_ms": 6506,
+            "max_ms": 6506
+          },
+          "agent_recognition_to_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_remote_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 1200,
+            "p90_ms": 1200,
+            "p95_ms": 1200,
+            "max_ms": 1200
+          },
+          "agent_first_playback_ms": {
+            "n": 5,
+            "p50_ms": 6526,
+            "p90_ms": 6526,
+            "p95_ms": 6526,
+            "max_ms": 6526
+          },
+          "agent_audio_buffering_ms": {
+            "n": 5,
+            "p50_ms": 20,
+            "p90_ms": 20,
+            "p95_ms": 20,
+            "max_ms": 20
+          },
+          "agent_end_to_end_first_playback_ms": {
+            "n": 5,
+            "p50_ms": 11686,
+            "p90_ms": 11686,
+            "p95_ms": 11686,
+            "max_ms": 11686
+          },
+          "agent_playback_drained_ms": {
+            "n": 5,
+            "p50_ms": 7026,
+            "p90_ms": 7026,
+            "p95_ms": 7026,
+            "max_ms": 7026
+          },
+          "agent_playback_ms": {
+            "n": 5,
+            "p50_ms": 500,
+            "p90_ms": 500,
+            "p95_ms": 500,
+            "max_ms": 500
+          },
+          "agent_turn_logical_end_ms": {
+            "n": 5,
+            "p50_ms": 7026,
+            "p90_ms": 7026,
+            "p95_ms": 7026,
+            "max_ms": 7026
+          },
+          "next_question_ready_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_last_audio_ms": {
+            "n": 5,
+            "p50_ms": 6906,
+            "p90_ms": 6906,
+            "p95_ms": 6906,
+            "max_ms": 6906
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 5,
+            "p50_ms": 11686,
+            "p90_ms": 11686,
+            "p95_ms": 11686,
+            "max_ms": 11686
+          }
+        }
+      },
+      "text": {
+        "interactions": 5,
+        "success": 5,
+        "rejected": 0,
+        "stt_calls": 0,
+        "sessions_started": 5,
+        "sessions_reused": 0,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 1,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 0,
+        "stages": {
+          "question_queue_wait_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_session_open_ms": {
+            "n": 5,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 1506,
+            "p90_ms": 1506,
+            "p95_ms": 1506,
+            "max_ms": 1506
+          },
+          "agent_remote_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_first_playback_ms": {
+            "n": 5,
+            "p50_ms": 1526,
+            "p90_ms": 1526,
+            "p95_ms": 1526,
+            "max_ms": 1526
+          },
+          "agent_audio_buffering_ms": {
+            "n": 5,
+            "p50_ms": 20,
+            "p90_ms": 20,
+            "p95_ms": 20,
+            "max_ms": 20
+          },
+          "agent_playback_drained_ms": {
+            "n": 5,
+            "p50_ms": 2026,
+            "p90_ms": 2026,
+            "p95_ms": 2026,
+            "max_ms": 2026
+          },
+          "agent_playback_ms": {
+            "n": 5,
+            "p50_ms": 500,
+            "p90_ms": 500,
+            "p95_ms": 500,
+            "max_ms": 500
+          },
+          "agent_turn_logical_end_ms": {
+            "n": 5,
+            "p50_ms": 2026,
+            "p90_ms": 2026,
+            "p95_ms": 2026,
+            "max_ms": 2026
+          },
+          "next_question_ready_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_last_audio_ms": {
+            "n": 5,
+            "p50_ms": 1906,
+            "p90_ms": 1906,
+            "p95_ms": 1906,
+            "max_ms": 1906
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 5,
+            "p50_ms": 1526,
+            "p90_ms": 1526,
+            "p95_ms": 1526,
+            "max_ms": 1526
+          }
+        }
+      },
+      "consecutive": {
+        "interactions": 10,
+        "success": 10,
+        "rejected": 0,
+        "stt_calls": 0,
+        "sessions_started": 5,
+        "sessions_reused": 5,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 1,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 0,
+        "stages": {
+          "question_queue_wait_ms": {
+            "n": 10,
+            "p50_ms": 913,
+            "p90_ms": 1826,
+            "p95_ms": 1826,
+            "max_ms": 1826
+          },
+          "agent_session_open_ms": {
+            "n": 5,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_first_audio_ms": {
+            "n": 10,
+            "p50_ms": 2176,
+            "p90_ms": 2846,
+            "p95_ms": 2846,
+            "max_ms": 2846
+          },
+          "agent_remote_first_audio_ms": {
+            "n": 10,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_first_playback_ms": {
+            "n": 10,
+            "p50_ms": 2196,
+            "p90_ms": 2866,
+            "p95_ms": 2866,
+            "max_ms": 2866
+          },
+          "agent_audio_buffering_ms": {
+            "n": 10,
+            "p50_ms": 20,
+            "p90_ms": 20,
+            "p95_ms": 20,
+            "max_ms": 20
+          },
+          "agent_playback_drained_ms": {
+            "n": 10,
+            "p50_ms": 2696,
+            "p90_ms": 3366,
+            "p95_ms": 3366,
+            "max_ms": 3366
+          },
+          "agent_playback_ms": {
+            "n": 10,
+            "p50_ms": 500,
+            "p90_ms": 500,
+            "p95_ms": 500,
+            "max_ms": 500
+          },
+          "agent_turn_logical_end_ms": {
+            "n": 10,
+            "p50_ms": 2696,
+            "p90_ms": 3366,
+            "p95_ms": 3366,
+            "max_ms": 3366
+          },
+          "next_question_ready_ms": {
+            "n": 10,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_last_audio_ms": {
+            "n": 10,
+            "p50_ms": 2576,
+            "p90_ms": 3246,
+            "p95_ms": 3246,
+            "max_ms": 3246
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 10,
+            "p50_ms": 2196,
+            "p90_ms": 2866,
+            "p95_ms": 2866,
+            "max_ms": 2866
+          }
+        }
+      },
+      "followup": {
+        "interactions": 10,
+        "success": 10,
+        "rejected": 0,
+        "stt_calls": 5,
+        "sessions_started": 5,
+        "sessions_reused": 5,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 1,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 0.5,
+        "stages": {
+          "wake_detection_ms": {
+            "n": 5,
+            "p50_ms": 560,
+            "p90_ms": 560,
+            "p95_ms": 560,
+            "max_ms": 560
+          },
+          "question_queue_wait_ms": {
+            "n": 10,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_session_open_ms": {
+            "n": 5,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_audio_prepare_ms": {
+            "n": 10,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_audio_upload_ms": {
+            "n": 10,
+            "p50_ms": 1820,
+            "p90_ms": 1820,
+            "p95_ms": 1820,
+            "max_ms": 1820
+          },
+          "agent_input_silence_saved_ms": {
+            "n": 10,
+            "p50_ms": 580,
+            "p90_ms": 580,
+            "p95_ms": 580,
+            "max_ms": 580
+          },
+          "agent_user_recognition_ms": {
+            "n": 10,
+            "p50_ms": 2000,
+            "p90_ms": 2000,
+            "p95_ms": 2000,
+            "max_ms": 2000
+          },
+          "agent_post_upload_recognition_ms": {
+            "n": 10,
+            "p50_ms": 180,
+            "p90_ms": 180,
+            "p95_ms": 180,
+            "max_ms": 180
+          },
+          "agent_recognition_to_response_ms": {
+            "n": 10,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_first_audio_ms": {
+            "n": 10,
+            "p50_ms": 3263,
+            "p90_ms": 3506,
+            "p95_ms": 3506,
+            "max_ms": 3506
+          },
+          "agent_recognition_to_first_audio_ms": {
+            "n": 10,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_remote_first_audio_ms": {
+            "n": 10,
+            "p50_ms": 1200,
+            "p90_ms": 1200,
+            "p95_ms": 1200,
+            "max_ms": 1200
+          },
+          "agent_first_playback_ms": {
+            "n": 10,
+            "p50_ms": 3283,
+            "p90_ms": 3526,
+            "p95_ms": 3526,
+            "max_ms": 3526
+          },
+          "agent_audio_buffering_ms": {
+            "n": 10,
+            "p50_ms": 20,
+            "p90_ms": 20,
+            "p95_ms": 20,
+            "max_ms": 20
+          },
+          "agent_end_to_end_first_playback_ms": {
+            "n": 10,
+            "p50_ms": 5163,
+            "p90_ms": 5686,
+            "p95_ms": 5686,
+            "max_ms": 5686
+          },
+          "agent_playback_drained_ms": {
+            "n": 10,
+            "p50_ms": 3783,
+            "p90_ms": 4026,
+            "p95_ms": 4026,
+            "max_ms": 4026
+          },
+          "agent_playback_ms": {
+            "n": 10,
+            "p50_ms": 500,
+            "p90_ms": 500,
+            "p95_ms": 500,
+            "max_ms": 500
+          },
+          "agent_turn_logical_end_ms": {
+            "n": 10,
+            "p50_ms": 3783,
+            "p90_ms": 4026,
+            "p95_ms": 4026,
+            "max_ms": 4026
+          },
+          "next_question_ready_ms": {
+            "n": 10,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_last_audio_ms": {
+            "n": 10,
+            "p50_ms": 3663,
+            "p90_ms": 3906,
+            "p95_ms": 3906,
+            "max_ms": 3906
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 10,
+            "p50_ms": 5163,
+            "p90_ms": 5686,
+            "p95_ms": 5686,
+            "max_ms": 5686
+          }
+        }
+      },
+      "two_speakers": {
+        "interactions": 10,
+        "success": 10,
+        "rejected": 0,
+        "stt_calls": 0,
+        "sessions_started": 10,
+        "sessions_reused": 0,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 1,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 0,
+        "stages": {
+          "question_queue_wait_ms": {
+            "n": 10,
+            "p50_ms": 913,
+            "p90_ms": 1826,
+            "p95_ms": 1826,
+            "max_ms": 1826
+          },
+          "agent_session_open_ms": {
+            "n": 10,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_first_audio_ms": {
+            "n": 10,
+            "p50_ms": 2419,
+            "p90_ms": 3332,
+            "p95_ms": 3332,
+            "max_ms": 3332
+          },
+          "agent_remote_first_audio_ms": {
+            "n": 10,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_first_playback_ms": {
+            "n": 10,
+            "p50_ms": 2439,
+            "p90_ms": 3352,
+            "p95_ms": 3352,
+            "max_ms": 3352
+          },
+          "agent_audio_buffering_ms": {
+            "n": 10,
+            "p50_ms": 20,
+            "p90_ms": 20,
+            "p95_ms": 20,
+            "max_ms": 20
+          },
+          "agent_playback_drained_ms": {
+            "n": 10,
+            "p50_ms": 2939,
+            "p90_ms": 3852,
+            "p95_ms": 3852,
+            "max_ms": 3852
+          },
+          "agent_playback_ms": {
+            "n": 10,
+            "p50_ms": 500,
+            "p90_ms": 500,
+            "p95_ms": 500,
+            "max_ms": 500
+          },
+          "agent_turn_logical_end_ms": {
+            "n": 10,
+            "p50_ms": 2939,
+            "p90_ms": 3852,
+            "p95_ms": 3852,
+            "max_ms": 3852
+          },
+          "next_question_ready_ms": {
+            "n": 10,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_last_audio_ms": {
+            "n": 10,
+            "p50_ms": 2819,
+            "p90_ms": 3732,
+            "p95_ms": 3732,
+            "max_ms": 3732
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 10,
+            "p50_ms": 2439,
+            "p90_ms": 3352,
+            "p95_ms": 3352,
+            "max_ms": 3352
+          }
+        }
+      },
+      "missing_completion": {
+        "interactions": 10,
+        "success": 10,
+        "rejected": 0,
+        "stt_calls": 0,
+        "sessions_started": 10,
+        "sessions_reused": 0,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 1,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 0,
+        "stages": {
+          "question_queue_wait_ms": {
+            "n": 10,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_session_open_ms": {
+            "n": 10,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_first_audio_ms": {
+            "n": 10,
+            "p50_ms": 1506,
+            "p90_ms": 1506,
+            "p95_ms": 1506,
+            "max_ms": 1506
+          },
+          "agent_remote_first_audio_ms": {
+            "n": 10,
+            "p50_ms": 1020,
+            "p90_ms": 1020,
+            "p95_ms": 1020,
+            "max_ms": 1020
+          },
+          "agent_first_playback_ms": {
+            "n": 10,
+            "p50_ms": 1526,
+            "p90_ms": 1526,
+            "p95_ms": 1526,
+            "max_ms": 1526
+          },
+          "agent_audio_buffering_ms": {
+            "n": 10,
+            "p50_ms": 20,
+            "p90_ms": 20,
+            "p95_ms": 20,
+            "max_ms": 20
+          },
+          "agent_playback_drained_ms": {
+            "n": 10,
+            "p50_ms": 2026,
+            "p90_ms": 2026,
+            "p95_ms": 2026,
+            "max_ms": 2026
+          },
+          "agent_playback_ms": {
+            "n": 10,
+            "p50_ms": 500,
+            "p90_ms": 500,
+            "p95_ms": 500,
+            "max_ms": 500
+          },
+          "agent_turn_logical_end_ms": {
+            "n": 10,
+            "p50_ms": 4013,
+            "p90_ms": 6000,
+            "p95_ms": 6000,
+            "max_ms": 6000
+          },
+          "next_question_ready_ms": {
+            "n": 10,
+            "p50_ms": 1987,
+            "p90_ms": 3974,
+            "p95_ms": 3974,
+            "max_ms": 3974
+          },
+          "agent_last_audio_ms": {
+            "n": 10,
+            "p50_ms": 1906,
+            "p90_ms": 1906,
+            "p95_ms": 1906,
+            "max_ms": 1906
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 10,
+            "p50_ms": 1526,
+            "p90_ms": 1526,
+            "p95_ms": 1526,
+            "max_ms": 1526
+          }
+        }
+      },
+      "recognition_timeout": {
+        "interactions": 5,
+        "success": 0,
+        "rejected": 0,
+        "stt_calls": 5,
+        "sessions_started": 5,
+        "sessions_reused": 0,
+        "timeouts": 5,
+        "lost_questions": 0,
+        "success_rate": 0,
+        "timeout_rate": 1,
+        "stt_calls_per_interaction": 1,
+        "stages": {
+          "wake_detection_ms": {
+            "n": 5,
+            "p50_ms": 560,
+            "p90_ms": 560,
+            "p95_ms": 560,
+            "max_ms": 560
+          },
+          "question_queue_wait_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_session_open_ms": {
+            "n": 5,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_audio_prepare_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_audio_upload_ms": {
+            "n": 5,
+            "p50_ms": 1820,
+            "p90_ms": 1820,
+            "p95_ms": 1820,
+            "max_ms": 1820
+          },
+          "agent_input_silence_saved_ms": {
+            "n": 5,
+            "p50_ms": 580,
+            "p90_ms": 580,
+            "p95_ms": 580,
+            "max_ms": 580
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 0,
+            "p50_ms": null,
+            "p90_ms": null,
+            "p95_ms": null,
+            "max_ms": null
+          }
+        }
+      },
+      "stt_failure": {
+        "interactions": 5,
+        "success": 0,
+        "rejected": 5,
+        "stt_calls": 5,
+        "sessions_started": 0,
+        "sessions_reused": 0,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 0,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 1,
+        "stages": {
+          "capture_to_first_local_packet_ms": {
+            "n": 0,
+            "p50_ms": null,
+            "p90_ms": null,
+            "p95_ms": null,
+            "max_ms": null
+          }
+        }
+      },
+      "search_success": {
+        "interactions": 5,
+        "success": 5,
+        "rejected": 0,
+        "stt_calls": 0,
+        "sessions_started": 5,
+        "sessions_reused": 0,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 1,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 0,
+        "stages": {
+          "question_queue_wait_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_session_open_ms": {
+            "n": 5,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 1656,
+            "p90_ms": 1656,
+            "p95_ms": 1656,
+            "max_ms": 1656
+          },
+          "agent_remote_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 1170,
+            "p90_ms": 1170,
+            "p95_ms": 1170,
+            "max_ms": 1170
+          },
+          "agent_first_playback_ms": {
+            "n": 5,
+            "p50_ms": 1676,
+            "p90_ms": 1676,
+            "p95_ms": 1676,
+            "max_ms": 1676
+          },
+          "agent_audio_buffering_ms": {
+            "n": 5,
+            "p50_ms": 20,
+            "p90_ms": 20,
+            "p95_ms": 20,
+            "max_ms": 20
+          },
+          "agent_playback_drained_ms": {
+            "n": 5,
+            "p50_ms": 2176,
+            "p90_ms": 2176,
+            "p95_ms": 2176,
+            "max_ms": 2176
+          },
+          "agent_playback_ms": {
+            "n": 5,
+            "p50_ms": 500,
+            "p90_ms": 500,
+            "p95_ms": 500,
+            "max_ms": 500
+          },
+          "agent_turn_logical_end_ms": {
+            "n": 5,
+            "p50_ms": 2176,
+            "p90_ms": 2176,
+            "p95_ms": 2176,
+            "max_ms": 2176
+          },
+          "next_question_ready_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_last_audio_ms": {
+            "n": 5,
+            "p50_ms": 2056,
+            "p90_ms": 2056,
+            "p95_ms": 2056,
+            "max_ms": 2056
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 5,
+            "p50_ms": 1676,
+            "p90_ms": 1676,
+            "p95_ms": 1676,
+            "max_ms": 1676
+          }
+        }
+      },
+      "search_timeout": {
+        "interactions": 5,
+        "success": 5,
+        "rejected": 0,
+        "stt_calls": 0,
+        "sessions_started": 5,
+        "sessions_reused": 0,
+        "timeouts": 0,
+        "lost_questions": 0,
+        "success_rate": 1,
+        "timeout_rate": 0,
+        "stt_calls_per_interaction": 0,
+        "stages": {
+          "question_queue_wait_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_session_open_ms": {
+            "n": 5,
+            "p50_ms": 486,
+            "p90_ms": 486,
+            "p95_ms": 486,
+            "max_ms": 486
+          },
+          "agent_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 6506,
+            "p90_ms": 6506,
+            "p95_ms": 6506,
+            "max_ms": 6506
+          },
+          "agent_remote_first_audio_ms": {
+            "n": 5,
+            "p50_ms": 6020,
+            "p90_ms": 6020,
+            "p95_ms": 6020,
+            "max_ms": 6020
+          },
+          "agent_first_playback_ms": {
+            "n": 5,
+            "p50_ms": 6526,
+            "p90_ms": 6526,
+            "p95_ms": 6526,
+            "max_ms": 6526
+          },
+          "agent_audio_buffering_ms": {
+            "n": 5,
+            "p50_ms": 20,
+            "p90_ms": 20,
+            "p95_ms": 20,
+            "max_ms": 20
+          },
+          "agent_playback_drained_ms": {
+            "n": 5,
+            "p50_ms": 7026,
+            "p90_ms": 7026,
+            "p95_ms": 7026,
+            "max_ms": 7026
+          },
+          "agent_playback_ms": {
+            "n": 5,
+            "p50_ms": 500,
+            "p90_ms": 500,
+            "p95_ms": 500,
+            "max_ms": 500
+          },
+          "agent_turn_logical_end_ms": {
+            "n": 5,
+            "p50_ms": 7026,
+            "p90_ms": 7026,
+            "p95_ms": 7026,
+            "max_ms": 7026
+          },
+          "next_question_ready_ms": {
+            "n": 5,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0
+          },
+          "agent_last_audio_ms": {
+            "n": 5,
+            "p50_ms": 6906,
+            "p90_ms": 6906,
+            "p95_ms": 6906,
+            "max_ms": 6906
+          },
+          "capture_to_first_local_packet_ms": {
+            "n": 5,
+            "p50_ms": 6526,
+            "p90_ms": 6526,
+            "p95_ms": 6526,
+            "max_ms": 6526
+          }
+        }
+      }
+    }
+  }
+}

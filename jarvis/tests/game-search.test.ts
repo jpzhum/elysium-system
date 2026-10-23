@@ -128,7 +128,9 @@ describe('game search', () => {
     const diagnostics = vi.fn();
     const search = createGameSearch({ apiKey: 'key-secret', onDiagnostic: diagnostics });
     const first = search('Game', 'private-query');
-    expect((await search('Other game', 'other private query')).status).toBe('rate_limited');
+    expect(await search('Other game', 'other private query')).toMatchObject({
+      status: 'rate_limited', rate_limit_source: 'worker_busy',
+    });
     await vi.advanceTimersByTimeAsync(1100);
     expect((await search('Other game', 'still busy')).status).toBe('rate_limited');
     resolve?.(new Response(JSON.stringify({ web: { results: [
@@ -137,7 +139,9 @@ describe('game search', () => {
     expect((await first).status).toBe('success');
     request.mockResolvedValue(new Response('{}'));
     expect((await search('Game', 'next')).status).toBe('no_sources');
-    expect((await search('Game', 'too soon')).status).toBe('rate_limited');
+    expect(await search('Game', 'too soon')).toMatchObject({
+      status: 'rate_limited', rate_limit_source: 'worker_interval',
+    });
     expect(request).toHaveBeenCalledTimes(2);
     expect(diagnostics.mock.calls[2]?.[0]).toEqual({ status: 'success', durationMs: 1100, sourceCount: 1 });
     expect(JSON.stringify(diagnostics.mock.calls)).not.toMatch(/key-secret|private-query|example.com|Evidence/);
@@ -150,13 +154,36 @@ describe('game search', () => {
     }));
     vi.stubGlobal('fetch', request);
     const search = createGameSearch({ apiKey: 'secret' });
-    expect((await search('Game', 'quest')).status).toBe('rate_limited');
+    expect(await search('Game', 'quest')).toMatchObject({ status: 'rate_limited', rate_limit_source: 'provider_429' });
     await vi.advanceTimersByTimeAsync(119_999);
-    expect((await search('Game', 'quest')).status).toBe('rate_limited');
+    expect(await search('Game', 'quest')).toMatchObject({ status: 'rate_limited', rate_limit_source: 'provider_429' });
     expect(request).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1);
     request.mockResolvedValue(new Response('{}'));
     expect((await search('Game', 'quest')).status).toBe('no_sources');
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('distinguishes a successful provider quota cooldown from HTTP 429 without spending extra requests', async () => {
+    vi.useFakeTimers();
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}', {
+      headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '5' },
+    }));
+    vi.stubGlobal('fetch', request);
+    const diagnostics = vi.fn();
+    const search = createGameSearch({ apiKey: 'secret', onDiagnostic: diagnostics });
+    expect((await search('Game', 'quest')).status).toBe('no_sources');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await search('Game', 'private quest')).toMatchObject({
+      status: 'rate_limited', rate_limit_source: 'provider_quota',
+    });
+    expect(diagnostics).toHaveBeenLastCalledWith({ status: 'rate_limited', durationMs: 0,
+      sourceCount: 0, rateLimitSource: 'provider_quota' });
+    expect(request).toHaveBeenCalledOnce();
+    expect(JSON.stringify(diagnostics.mock.calls)).not.toMatch(/secret|private quest|ratelimit/);
+    await vi.advanceTimersByTimeAsync(4000);
+    request.mockResolvedValue(new Response('{}'));
+    expect((await search('Game', 'next')).status).toBe('no_sources');
     expect(request).toHaveBeenCalledTimes(2);
   });
 

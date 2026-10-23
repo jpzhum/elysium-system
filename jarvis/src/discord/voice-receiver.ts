@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { OpusDecoder } from "../audio/opus-decoder.js";
 import { rms } from "../audio/voice-activity.js";
 import type { CaptureTiming } from '../audio/capture-window.js';
+import { sanitizeError } from '../observability/diagnostics.js';
+import { diagnosticValue, newIncident, type DiagnosticFields } from '../observability/metrics.js';
 
 export type VoiceReceiverState = 'ready' | 'suspended' | 'stopped';
 
@@ -18,6 +20,8 @@ export interface VoiceReceiverOptions {
   onTurn: (userId: string, pcm48kStereo: Buffer, timing: VoiceTurnTiming) => void | Promise<void>;
   onMetric?: (name: string, value: number) => void;
   onState?: (state: VoiceReceiverState) => void;
+  /** Content-free source and capture state; never forwards the original exception. */
+  onDiagnostic?: (fields: DiagnosticFields) => void;
 }
 
 export interface VoiceTurnTiming extends CaptureTiming {
@@ -38,6 +42,9 @@ interface IncomingTurn {
   duringPlayback: boolean;
   startedAt: number;
   lastVoicedAt: number;
+  speakingStartedAt: number;
+  firstPcmMs?: number;
+  voiceStartMs?: number;
   maxBytes: number;
   playbackToken?: number;
   captureId: string;
@@ -48,6 +55,23 @@ const SILENCE_MS = 600;
 const MIN_VOICE_RMS = 0.008;
 const BARGE_IN_SECONDS = 4;
 const BARGE_IN_COOLDOWN_MS = 2_000;
+type ReceiveStage = 'subscribe' | 'decoder_setup' | 'stream' | 'decode';
+
+function receiveFailure(error: unknown, stage: ReceiveStage): Pick<DiagnosticFields, 'category' | 'code'> {
+  const classified = sanitizeError(error);
+  if (classified.code !== 'UNKNOWN') return classified;
+  const message = diagnosticValue(error, 'message');
+  if (typeof message === 'string') {
+    // Known native/library errors are matched locally; their text never leaves this function.
+    if (/\bDecryptionFailed\b/.test(message)) return { category: 'dave', code: 'DAVE_DECRYPTION_FAILED' };
+    if (message === 'Unsupported state or unable to authenticate data') {
+      return { category: 'voice', code: 'VOICE_DECRYPTION_FAILED' };
+    }
+    if (message === 'Failed to parse packet') return { category: 'voice', code: 'VOICE_PACKET_PARSE_FAILED' };
+  }
+  return { category: stage === 'decoder_setup' || stage === 'decode' ? 'dependency' : 'voice',
+    code: stage === 'decoder_setup' ? 'OPUS_DECODER_FAILED' : stage === 'decode' ? 'OPUS_DECODE_FAILED' : 'VOICE_RECEIVE_FAILED' };
+}
 
 /** Receives individual Discord IDs only after the caller's consent/identity gate. */
 export class VoiceReceiver {
@@ -58,7 +82,7 @@ export class VoiceReceiver {
   private captureSequence = 0;
   private reportedState?: VoiceReceiverState;
   private readonly maxBytes: number;
-  private readonly onStart = (userId: string): void => this.subscribe(userId);
+  private readonly onStart = (userId: string): void => this.subscribe(userId, performance.now());
   private readonly onConnectionState = (_before: unknown, next: { status: string }): void => {
     if (next.status === VoiceConnectionStatus.Destroyed) this.stop();
     else if (next.status !== VoiceConnectionStatus.Ready) {
@@ -117,7 +141,26 @@ export class VoiceReceiver {
     this.options.onMetric?.(name, value);
   }
 
-  private subscribe(userId: string): void {
+  private receiveError(error: unknown, stage: ReceiveStage, state?: IncomingTurn): void {
+    const active = state !== undefined && [...this.turns.values()].includes(state);
+    const failure = receiveFailure(error, stage);
+    this.metric(stage === 'decode' ? 'voice_decode_errors' : 'voice_receive_errors');
+    this.metric(`voice_receive_${stage}_errors`);
+    this.metric(failure.category === 'dave' ? 'voice_receive_dave_errors'
+      : failure.category === 'network' || failure.category === 'timeout' ? 'voice_receive_network_errors'
+      : failure.code === 'VOICE_DECRYPTION_FAILED' ? 'voice_receive_transport_decrypt_errors'
+      : failure.code === 'VOICE_PACKET_PARSE_FAILED' ? 'voice_receive_packet_parse_errors'
+      : stage === 'decode' || stage === 'decoder_setup' ? 'voice_receive_opus_errors' : 'voice_receive_other_errors');
+    if (stage === 'stream' && !active) this.metric('voice_receive_after_cleanup_errors');
+    try {
+      this.options.onDiagnostic?.({ ...failure, incident: newIncident(), stage: 'voice_capture',
+        receive_stage: stage, receiver_state: this.state, voice_status: this.connection.state.status,
+        capture_active: active, capture_has_pcm: (state?.bytes ?? 0) > 0, capture_has_voice: state?.voiced ?? false,
+      });
+    } catch { /* Diagnostics cannot interrupt capture cleanup. */ }
+  }
+
+  private subscribe(userId: string, speakingStartedAt: number): void {
     if (!this.allowed(userId)) return;
     // Discord speaking-start is an activity notification, not a new question.
     // Repeated starts and microphone microgaps stay in the same 600 ms VAD window.
@@ -131,6 +174,7 @@ export class VoiceReceiver {
     let stream: AudioReceiveStream | undefined;
     let decoder: OpusDecoder | undefined;
     let state: IncomingTurn | undefined;
+    let stage: ReceiveStage = 'subscribe';
     try {
       // Gate is checked before subscribing and before constructing any decoder.
       stream = this.connection.receiver.subscribe(userId, {
@@ -138,11 +182,12 @@ export class VoiceReceiver {
       });
       // Subscribe may synchronously start a stream that later fails DAVE decryption.
       // Always retain an error listener, including after cleanup/destroy.
-      stream.on("error", () => {
-        this.metric("voice_receive_errors");
+      stream.on("error", (error: unknown) => {
+        this.receiveError(error, 'stream', state);
         if (state && this.turns.get(userId) === state) this.finish(userId, false);
       });
       if (!this.allowed(userId)) { stream.destroy(); return; }
+      stage = 'decoder_setup';
       decoder = new OpusDecoder();
       const maxSeconds = duringPlayback ? Math.min(BARGE_IN_SECONDS, this.options.maxTurnSeconds)
         : this.options.maxTurnSeconds;
@@ -151,6 +196,7 @@ export class VoiceReceiver {
       const now = performance.now();
       state = { stream, decoder, chunks: [], bytes: 0, voiced: false, silentBytes: 0, timeout,
         duringPlayback, playbackToken, startedAt: now, lastVoicedAt: now,
+        speakingStartedAt,
         captureId: `${this.captureEpoch}:${++this.captureSequence}`,
         maxBytes: Math.min(this.maxBytes, maxSeconds * BYTES_PER_SECOND) };
       if (duringPlayback) this.metric('voice_barge_in_captures');
@@ -159,10 +205,10 @@ export class VoiceReceiver {
       stream.on("data", (packet: Buffer) => this.receive(userId, incoming, packet));
       stream.once("end", () => { if (this.turns.get(userId) === incoming) this.finish(userId, true); });
       stream.once("close", () => { if (this.turns.get(userId) === incoming) this.finish(userId, false); });
-    } catch {
+    } catch (error) {
       stream?.destroy();
       decoder?.delete();
-      this.metric("voice_receive_errors");
+      this.receiveError(error, stage, state);
     }
   }
 
@@ -177,10 +223,18 @@ export class VoiceReceiver {
     }
     try {
       const pcm = state.decoder.decode(packet);
+      if (state.firstPcmMs === undefined) {
+        state.firstPcmMs = Math.max(0, Math.round(performance.now() - state.speakingStartedAt));
+        this.metric('voice_first_pcm_ms', state.firstPcmMs);
+      }
       const level = rms(pcm);
       this.metric("voice_decoded_frames");
       this.metric("voice_rms", level);
       if (level >= MIN_VOICE_RMS) {
+        if (!state.voiced) {
+          state.voiceStartMs = Math.max(0, Math.round(performance.now() - state.speakingStartedAt));
+          this.metric('voice_activity_start_ms', state.voiceStartMs);
+        }
         state.voiced = true;
         state.silentBytes = 0;
         state.lastVoicedAt = performance.now();
@@ -197,8 +251,8 @@ export class VoiceReceiver {
         this.metric("voice_turn_limits", state.bytes >= state.maxBytes ? 1 : 0);
         this.finish(userId, true);
       }
-    } catch {
-      this.metric("voice_decode_errors");
+    } catch (error) {
+      this.receiveError(error, 'decode', state);
       this.finish(userId, false);
     }
   }
@@ -223,6 +277,7 @@ export class VoiceReceiver {
       const timing: VoiceTurnTiming = { duringPlayback: state.duringPlayback,
         captureMs: Math.max(0, Math.round(now - state.startedAt)),
         endDetectionMs: Math.max(0, Math.round(now - state.lastVoicedAt)),
+        firstPcmMs: state.firstPcmMs, voiceStartMs: state.voiceStartMs,
         captureId: state.captureId, captureStartedAtMs: state.startedAt, captureEndedAtMs: now,
         ...(state.playbackToken !== undefined ? { playbackToken: state.playbackToken } : {}) };
       this.metric("voice_turn_seconds", result.length / BYTES_PER_SECOND);

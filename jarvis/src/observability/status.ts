@@ -25,15 +25,22 @@ const counters = [
 ] as const;
 
 const durations = [
+  ['voice_first_pcm_ms', 'Speaking.start → primeiro PCM'], ['voice_activity_start_ms', 'Speaking.start → atividade vocal'],
   ['voice_capture_ms', 'Captura Discord + VAD'], ['voice_capture_active_ms', 'Captura antes do VAD final'],
   ['voice_end_detection_ms', 'Fim da fala (VAD)'],
   ['wake_queue_wait_ms', 'Fila do STT'], ['wake_recognition_ms', 'STT remoto'],
   ['wake_detection_ms', 'Wake total'], ['question_queue_wait_ms', 'Fila de perguntas'],
   ['agent_session_open_ms', 'Abertura ElevenAgents'], ['agent_audio_upload_ms', 'Upload PCM + silêncio'],
+  ['agent_signed_url_ms', 'URL temporária ElevenAgents'], ['agent_websocket_handshake_ms', 'Handshake WebSocket'],
+  ['agent_audio_negotiation_ms', 'Negociação de áudio'], ['agent_audio_prepare_ms', 'Preparação PCM conversacional'],
+  ['wake_audio_prepare_ms', 'Preparação PCM do STT'], ['wake_stt_request_ms', 'Requisição do STT'],
   ['agent_input_silence_saved_ms', 'Silêncio digital adicional evitado'],
   ['agent_user_recognition_ms', 'Início do envio → reconhecimento ElevenAgents'],
   ['agent_post_upload_recognition_ms', 'Fim do envio → reconhecimento ElevenAgents'],
   ['agent_remote_first_audio_ms', 'Fim do envio → primeiro áudio'],
+  ['agent_recognition_to_response_ms', 'Reconhecimento → sinal de resposta'],
+  ['agent_recognition_to_first_audio_ms', 'Reconhecimento → primeiro áudio'],
+  ['agent_audio_buffering_ms', 'Primeiro áudio → primeiro pacote local'],
   ['agent_end_to_end_first_playback_ms', 'Início da captura → primeiro pacote local'],
   ['agent_first_audio_ms', 'Pergunta → primeiro áudio'], ['pcm_conversion_ms', 'Conversão PCM por lote'],
   ['opus_encode_ms', 'Opus por frame'], ['agent_first_playback_ms', 'Pergunta → primeiro pacote local'],
@@ -49,7 +56,7 @@ function milliseconds(value: number): string { return value < 1 ? value.toFixed(
 export function operationalStatus(snapshot: Record<string, number>): string[] {
   const sections = [
     ['Contadores operacionais (não estimam créditos):', counters.map(name => `${name}=${finite(snapshot[name]) ? snapshot[name] : 0}`)],
-    ['Tempos locais em ms: última / média / mín / máx; n=total desde o início. Mediana e p95: até 256 amostras recentes por etapa (janela n). Sem amostras não significa latência zero.',
+    ['Tempos locais em ms: última / média / mín / máx; n=total desde o início. Mediana, p90 e p95: até 256 amostras recentes por etapa (janela n). Sem amostras não significa latência zero.',
       durations.map(([name, label]) => {
         const count = snapshot[`${name}_samples`];
         const values = [snapshot[`${name}_last`], snapshot[name], snapshot[`${name}_min`], snapshot[`${name}_max`]];
@@ -58,12 +65,13 @@ export function operationalStatus(snapshot: Record<string, number>): string[] {
           + `${milliseconds(values[2]!)} / ${milliseconds(values[3]!)}; n=${count}`;
         const windowCount = snapshot[`${name}_window_samples`];
         const median = snapshot[`${name}_median`];
+        const p90 = snapshot[`${name}_p90`];
         const p95 = snapshot[`${name}_p95`];
         if (!finite(windowCount) || !Number.isSafeInteger(windowCount) || windowCount < 1 || windowCount > 256
-          || windowCount > count || !finite(median) || !finite(p95)) {
-          return `${aggregate}; mediana/p95: sem amostras`;
+          || windowCount > count || !finite(median) || !finite(p90) || !finite(p95)) {
+          return `${aggregate}; mediana/p90/p95: sem amostras`;
         }
-        return `${aggregate}; mediana=${milliseconds(median)}; p95=${milliseconds(p95)}; janela n=${windowCount}`;
+        return `${aggregate}; mediana=${milliseconds(median)}; p90=${milliseconds(p90)}; p95=${milliseconds(p95)}; janela n=${windowCount}`;
       })],
   ] as const;
   const pages: string[] = [];

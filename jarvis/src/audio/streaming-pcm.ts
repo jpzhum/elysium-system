@@ -1,3 +1,5 @@
+import { WindowedSinc } from './windowed-sinc.js';
+
 interface Chunk { pcm: Buffer; start: number; end: number; final: boolean; }
 interface Options {
   maxBufferBytes: number;
@@ -21,10 +23,10 @@ export class StreamingPcm {
   private wake: (() => void) | undefined;
   private capacity: (() => void) | undefined;
   private readonly radius: number;
-  private readonly cutoff: number;
+  private readonly filter: WindowedSinc;
   constructor(private readonly sampleRate: number, private readonly options: Options) {
-    this.cutoff = Math.min(1, 48_000 / sampleRate);
-    this.radius = Math.ceil(12 / this.cutoff);
+    this.filter = new WindowedSinc(sampleRate, 48_000);
+    this.radius = this.filter.radius;
   }
   get hasInput(): boolean { return this.samples > 0 || this.ended; }
   get bufferedBytes(): number { return this.bytes; }
@@ -119,17 +121,12 @@ export class StreamingPcm {
 
   private interpolate(position: number): number {
     const center = Math.floor(position);
+    const kernel = this.filter.at(position);
     let value = 0;
-    let sum = 0;
-    for (let index = center - this.radius + 1; index <= center + this.radius; index++) {
-      const distance = position - index;
-      const scaled = Math.PI * distance * this.cutoff;
-      const sinc = Math.abs(scaled) < 1e-10 ? 1 : Math.sin(scaled) / scaled;
-      const weight = sinc * (0.5 + 0.5 * Math.cos(Math.PI * distance / this.radius)) * this.cutoff;
-      value += this.sample(index) * weight;
-      sum += weight;
+    for (let index = 0; index < kernel.weights.length; index++) {
+      value += this.sample(center - this.radius + 1 + index) * kernel.weights[index]!;
     }
-    return Math.max(-32_768, Math.min(32_767, Math.round(value / sum)));
+    return Math.max(-32_768, Math.min(32_767, Math.round(value / kernel.sum)));
   }
 
   private sample(index: number): number {

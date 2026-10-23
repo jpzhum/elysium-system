@@ -1,0 +1,49 @@
+{
+  "mode": "synthetic-local-cpu",
+  "node": "v24.19.0",
+  "sourceSha256": "b0d80e91c3f2ad1818275e49665a60ab320c4fd405bf9f2a0950bf0ad28c4aee",
+  "scenarios": [
+    {
+      "pcmBytes": 4800,
+      "packetBytes": 6464,
+      "samples": 100,
+      "packetsPerSample": 50,
+      "unit": "ms_per_packet",
+      "p50": 0.021400000000000148,
+      "p90": 0.024877999999999928,
+      "p95": 0.028473999999999933,
+      "max": 0.029779999999999803,
+      "deliveredBytes": 24000000,
+      "expectedBytes": 24000000,
+      "errors": 0
+    },
+    {
+      "pcmBytes": 48000,
+      "packetBytes": 64064,
+      "samples": 100,
+      "packetsPerSample": 50,
+      "unit": "ms_per_packet",
+      "p50": 0.19992799999999988,
+      "p90": 0.21127199999999902,
+      "p95": 0.21648799999999938,
+      "max": 0.23760800000000018,
+      "deliveredBytes": 240000000,
+      "expectedBytes": 240000000,
+      "errors": 0
+    },
+    {
+      "pcmBytes": 192000,
+      "packetBytes": 256064,
+      "samples": 100,
+      "packetsPerSample": 50,
+      "unit": "ms_per_packet",
+      "p50": 0.7801139999999941,
+      "p90": 0.8321600000000035,
+      "p95": 0.8446739999999955,
+      "max": 0.9037139999999999,
+      "deliveredBytes": 960000000,
+      "expectedBytes": 960000000,
+      "errors": 0
+    }
+  ]
+}

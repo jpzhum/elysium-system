@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
-const MAX_METRICS = 256;
-const MAX_DURATION_SERIES = 32;
+const MAX_METRICS = 512;
+const MAX_DURATION_SERIES = 48;
 const DURATION_WINDOW_SAMPLES = 256;
 
 interface DurationWindow {
@@ -24,7 +24,8 @@ export class Metrics {
       const middle = Math.floor(sorted.length / 2);
       result[`${name}_median`] = sorted.length % 2 === 0
         ? (sorted[middle - 1]! + sorted[middle]!) / 2 : sorted[middle]!;
-      // Nearest-rank p95 is an observed value; the median averages the two middle values.
+      // Nearest-rank percentiles are observed values; the median averages the middle pair.
+      result[`${name}_p90`] = sorted[Math.ceil(sorted.length * 0.9) - 1]!;
       result[`${name}_p95`] = sorted[Math.ceil(sorted.length * 0.95) - 1]!;
       result[`${name}_window_samples`] = sorted.length;
     }
@@ -67,6 +68,7 @@ export const diagnosticStages = [
   'agent_connect', 'agent_response_wait', 'agent_audio_wait', 'playback',
   'voice_capture', 'wake_detection', 'agent_audio_upload', 'agent_user_recognition',
   'identity_injection', 'tool_dispatch', 'voice_participants', 'search_request',
+  'command_reply', 'command_execute', 'turn_enqueue',
 ] as const;
 export type DiagnosticStage = typeof diagnosticStages[number];
 
@@ -100,20 +102,44 @@ export const errorCodes = [
   'AGENT_CALLBACK_ERROR', 'AGENT_BACKPRESSURE', 'PLAYBACK_FAILED', 'AGENT_USER_TURN_MISSING', 'AGENT_INITIATION_REJECTED',
   'AGENT_INPUT_INCOMPLETE', 'AGENT_INPUT_INVALID',
   'TOOL_UNAVAILABLE', 'TOOL_FAILED', 'TOOL_TIMEOUT', 'TOOL_CANCELLED',
+  'PLAYBACK_ENCODER_FAILED', 'PLAYBACK_RESOURCE_ENDED', 'PLAYBACK_RESOURCE_IN_USE',
+  'PLAYBACK_PLAYER_ERROR', 'PLAYBACK_STREAM_FAILED', 'PLAYBACK_PREMATURE_IDLE',
+  'PLAYBACK_DEADLINE', 'PLAYBACK_INPUT_FAILED',
+  'PLAYBACK_QUEUE_CLOSED', 'PLAYBACK_QUEUE_FULL', 'PLAYBACK_PCM_INVALID', 'PLAYBACK_DURATION_LIMIT',
+  'VOICE_RECEIVE_FAILED', 'VOICE_PACKET_PARSE_FAILED', 'VOICE_DECRYPTION_FAILED',
+  'DAVE_DECRYPTION_FAILED', 'OPUS_DECODER_FAILED', 'OPUS_DECODE_FAILED',
+  'CONSENT_REQUIRED', 'SESSION_BUSY', 'SESSION_CLOSED', 'USAGE_LIMIT', 'SAME_CHANNEL_REQUIRED',
 ] as const;
 export type ErrorCode = typeof errorCodes[number];
 
 const voiceStatuses = ['signalling', 'connecting', 'ready', 'disconnected', 'destroyed'] as const;
+export const diagnosticCommands = ['join', 'leave', 'status', 'tone', 'privacy', 'consent', 'revoke', 'cancel', 'ask', 'clear', 'unknown'] as const;
+const playerStatuses = ['idle', 'buffering', 'playing', 'paused', 'autopaused'] as const;
+const playbackStages = ['subscribe', 'resource_create', 'player_start', 'pcm_input', 'opus_init', 'opus_encode', 'stream', 'player', 'connection', 'deadline'] as const;
 type VoiceStatus = typeof voiceStatuses[number];
 
 /** Only scalar, bounded operational metadata is accepted, including at runtime. */
 export interface DiagnosticFields {
   incident?: string;
-  command?: 'join';
+  command?: typeof diagnosticCommands[number];
+  command_group?: 'context';
   operation?: 'agent_turn' | 'identity' | 'tool' | 'search';
   stage?: DiagnosticStage;
   category?: ErrorCategory;
   code?: ErrorCode;
+  cause_code?: ErrorCode;
+  cause_name?: 'Error' | 'TypeError' | 'RangeError' | 'AudioPlayerError' | 'DiagnosticError';
+  opus_error_code?: number;
+  playback_stage?: typeof playbackStages[number];
+  player_status?: typeof playerStatuses[number];
+  previous_player_status?: typeof playerStatuses[number];
+  resource_ended?: boolean;
+  subscribed?: boolean;
+  receive_stage?: 'subscribe' | 'decoder_setup' | 'stream' | 'decode';
+  capture_active?: boolean;
+  capture_has_pcm?: boolean;
+  capture_has_voice?: boolean;
+  rate_limit_source?: 'worker_busy' | 'worker_interval' | 'provider_quota' | 'provider_429';
   duration_ms?: number;
   stage_duration_ms?: number;
   timeout_ms?: number;
@@ -163,6 +189,9 @@ export interface DiagnosticFields {
   capture_ms?: number;
   capture_wait_ms?: number;
   end_detection_ms?: number;
+  first_pcm_ms?: number;
+  voice_start_ms?: number;
+  connection_stage?: 'signed_url' | 'websocket_handshake' | 'audio_negotiation';
   wake_detected?: boolean;
   followup?: boolean;
   user_turn_recognized?: boolean;
@@ -222,9 +251,12 @@ const events = new Set([
   'jarvis_wake_failed',
   'jarvis_agent_user_turn_recognized', 'jarvis_agent_initial_output_discarded', 'jarvis_agent_response_observed',
   'jarvis_agent_session_ready',
+  'jarvis_agent_connection_stage',
   'jarvis_identity_injected', 'jarvis_tool_event', 'jarvis_search_result', 'jarvis_voice_participants_result',
   'jarvis_short_context', 'jarvis_agent_turn_recovered',
   'jarvis_voice_receiver_state', 'jarvis_voice_turn_rejected', 'jarvis_voice_capture_rejected',
+  'jarvis_voice_receive_error', 'jarvis_playback_failed', 'jarvis_playback_state',
+  'jarvis_agent_input_prepared', 'jarvis_agent_first_audio',
 ]);
 
 export function newIncident(): string { return randomBytes(4).toString('hex').toUpperCase(); }
@@ -249,10 +281,15 @@ function integer(value: unknown, minimum: number, maximum: number): value is num
 export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
   const result: Record<string, string | number | boolean> = {};
   for (const [key, options] of [
-    ['command', ['join']], ['operation', ['agent_turn', 'identity', 'tool', 'search']], ['stage', diagnosticStages], ['category', errorCategories],
+    ['command', diagnosticCommands], ['command_group', ['context']], ['operation', ['agent_turn', 'identity', 'tool', 'search']], ['stage', diagnosticStages], ['category', errorCategories],
     ['code', errorCodes], ['voice_status', voiceStatuses], ['previous_voice_status', voiceStatuses],
+    ['cause_code', errorCodes], ['cause_name', ['Error', 'TypeError', 'RangeError', 'AudioPlayerError', 'DiagnosticError']],
+    ['playback_stage', playbackStages], ['player_status', playerStatuses], ['previous_player_status', playerStatuses],
+    ['receive_stage', ['subscribe', 'decoder_setup', 'stream', 'decode']],
+    ['rate_limit_source', ['worker_busy', 'worker_interval', 'provider_quota', 'provider_429']],
     ['turn_outcome', ['completed', 'superseded', 'unconfirmed', 'cancelled', 'failed']],
     ['input_kind', ['voice', 'text']],
+    ['connection_stage', ['signed_url', 'websocket_handshake', 'audio_negotiation']],
     ['identity_source', ['discord']],
     ['search_status', ['success', 'missing_key', 'invalid_input', 'cancelled', 'rate_limited', 'unavailable', 'timeout', 'invalid_reply', 'no_sources']],
     ['tool_name', ['search_game_info', 'get_voice_participants', 'unknown']],
@@ -278,12 +315,14 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     'identity_injected', 'identity_is_creator', 'active_game_known', 'room_context_injected',
     'search_key_configured', 'wait_for_response', 'participants_available', 'participants_complete',
     'context_injected',
+    'resource_ended', 'subscribed', 'capture_active', 'capture_has_pcm', 'capture_has_voice',
   ]) {
     const value = diagnosticValue(fields, key);
     if (typeof value === 'boolean') result[key] = value;
   }
   for (const [key, minimum, maximum] of [
     ['duration_ms', 0, 86_400_000], ['stage_duration_ms', 0, 86_400_000], ['timeout_ms', 0, 300_000],
+    ['opus_error_code', -7, -1],
     ['network_status', 0, 6], ['previous_network_status', 0, 6],
     ['websocket_close_code', 1_000, 4_999], ['disconnect_reason', 0, 4],
     ['dave_protocol_version', 0, 65_535], ['diagnostics_version', 1, 7], ['pending_tools', 0, 128],
@@ -293,6 +332,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['first_playback_ms', 0, 3_600_000], ['drain_ms', 0, 3_600_000], ['next_question_ready_ms', 0, 3_600_000],
     ['capture_bytes', 0, 5_760_000], ['capture_ms', 0, 30_000], ['capture_wait_ms', 0, 120_000],
     ['end_detection_ms', 0, 120_000], ['input_audio_chunks', 0, 10_000], ['input_audio_bytes', 0, 4_000_000],
+    ['first_pcm_ms', 0, 30_000], ['voice_start_ms', 0, 30_000],
     ['silence_tail_ms', 0, 2_000], ['input_sample_rate', 8_000, 48_000], ['output_sample_rate', 8_000, 48_000],
     ['input_source_chunks', 0, 10_000], ['input_silence_chunks', 0, 10_000], ['upload_ms', 0, 120_000],
     ['source_count', 0, 5],

@@ -21,7 +21,8 @@ vi.mock('../src/agents/elevenlabs-client.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../src/agents/elevenlabs-client.js')>(), connectAgent: hooks.agentConnect,
 }));
 vi.mock('../src/observability/voice-runtime.js', () => ({ inspectVoiceRuntime: hooks.runtime }));
-vi.mock('../src/audio/playback.js', () => ({ PlaybackQueue: class {
+vi.mock('../src/audio/playback.js', async (original) => ({
+  ...await original<typeof import('../src/audio/playback.js')>(), PlaybackQueue: class {
   isPlaying = false;
   constructor() { if (hooks.playbackError) throw hooks.playbackError; }
   play = vi.fn(async () => undefined);

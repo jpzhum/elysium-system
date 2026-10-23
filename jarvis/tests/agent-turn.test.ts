@@ -4,6 +4,7 @@ import { createAgentConnector, type AgentDependencies } from '../src/agents/elev
 import { SessionManager, type Playback, type SessionOptions } from '../src/agents/session-manager.js';
 import { WakeError } from '../src/agents/wake-detector.js';
 import type { PlaybackStream } from '../src/audio/playback.js';
+import { DiagnosticError } from '../src/observability/diagnostics.js';
 import { Logger, Metrics } from '../src/observability/metrics.js';
 import { ConsentStore } from '../src/policy/consent.js';
 import { speakerContext } from '../src/policy/identity.js';
@@ -512,4 +513,58 @@ test('provider heartbeat failure drains valid audio and keeps one specific prima
   expect(h.metrics.snapshot()).toMatchObject({ agent_errors: 1, playback_completed: 1, turn_completion_missing: 1 });
   expect(h.metrics.snapshot().agent_turns_completed ?? 0).toBe(0);
   expect(h.manager.activeCount).toBe(0);
+});
+
+test.each(['start', 'write', 'done'] as const)('playback %s failures preserve their safe original code and request incident', async (phase) => {
+  let rejectDone!: (error: Error) => void;
+  const done = new Promise<void>((_resolve, reject) => { rejectDone = reject; });
+  void done.catch(() => undefined);
+  const failure = new DiagnosticError('network', 'ECONNRESET');
+  failure.message = secret;
+  const playback: Playback = {
+    isPlaying: false, stopUser: vi.fn(), stop: vi.fn(),
+    startStream: vi.fn(() => {
+      if (phase === 'start') throw failure;
+      return { done, end: vi.fn(), cancel: vi.fn(), write: vi.fn(async () => {
+        if (phase === 'write') throw failure;
+      }) };
+    }),
+  };
+  const h = setup(false, undefined, { playback });
+  const receipt = await h.ask();
+  h.text(); h.audio(); await settle();
+  if (phase === 'done') { rejectDone(failure); await settle(); }
+  const summary = h.failed('PLAYBACK_FAILED');
+  expect(summary).toMatchObject({ incident: receipt.turnId, category: 'playback', cause_code: 'ECONNRESET',
+    playback_stage: phase === 'start' ? 'player_start' : phase === 'write' ? 'pcm_input' : 'player' });
+  const originals = h.logs.filter(line => line.event === 'jarvis_playback_failed');
+  expect(originals).toHaveLength(1);
+  expect(originals[0]).toMatchObject({ incident: receipt.turnId, category: 'network', code: 'ECONNRESET', stage: 'playback' });
+  expect(h.manager.activeCount).toBe(0);
+});
+
+test('real playback diagnostics survive a later generic stream rejection without losing encoder and player state', async () => {
+  const playback: Playback = {
+    isPlaying: false, stopUser: vi.fn(), stop: vi.fn(),
+    startStream: vi.fn((_id, _rate, _owner, options) => ({
+      done: new Promise<void>(() => undefined), end: vi.fn(), cancel: vi.fn(),
+      write: vi.fn(async () => {
+        options?.onDiagnostic?.({ playback_stage: 'player', player_status: 'buffering', previous_player_status: 'idle' });
+        options?.onDiagnostic?.({ category: 'playback', code: 'PLAYBACK_ENCODER_FAILED', cause_code: 'UNKNOWN',
+          playback_stage: 'opus_encode', opus_error_code: -2, player_status: 'buffering', voice_status: 'ready', dave_ready: true });
+        throw new Error(secret);
+      }),
+    })),
+  };
+  const h = setup(false, undefined, { playback });
+  const receipt = await h.ask();
+  h.text(); h.audio(); await settle();
+  const summary = h.failed('PLAYBACK_FAILED');
+  expect(summary).toMatchObject({ incident: receipt.turnId, cause_code: 'PLAYBACK_ENCODER_FAILED', playback_stage: 'opus_encode',
+    opus_error_code: -2, player_status: 'buffering', voice_status: 'ready', dave_ready: true });
+  expect(h.logs.filter(line => line.event === 'jarvis_playback_failed')).toEqual([
+    expect.objectContaining({ incident: receipt.turnId, code: 'PLAYBACK_ENCODER_FAILED', playback_stage: 'opus_encode', opus_error_code: -2 }),
+  ]);
+  expect(h.logs).toContainEqual(expect.objectContaining({ event: 'jarvis_playback_state', incident: receipt.turnId,
+    player_status: 'buffering', previous_player_status: 'idle' }));
 });

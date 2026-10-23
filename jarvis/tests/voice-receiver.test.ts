@@ -5,7 +5,9 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { VoiceReceiver, type VoiceTurnTiming } from '../src/discord/voice-receiver.js';
 
 const decode = vi.hoisted(() => vi.fn((packet: Buffer) => Buffer.from(packet)));
+const decoderSetup = vi.hoisted(() => vi.fn());
 vi.mock('../src/audio/opus-decoder.js', () => ({ OpusDecoder: class {
+  constructor() { decoderSetup(); }
   decode = decode;
   delete = vi.fn();
 } }));
@@ -19,6 +21,7 @@ function harness(maxTurnSeconds = 12) {
   const subscriptions: string[] = [];
   const delivered: { userId: string; pcm: Buffer; timing: VoiceTurnTiming }[] = [];
   const metric = vi.fn();
+  const diagnostic = vi.fn();
   let playing = true;
   let enabled = true;
   const connection = Object.assign(new EventEmitter(), {
@@ -35,9 +38,10 @@ function harness(maxTurnSeconds = 12) {
     canBargeIn: (id) => enabled && id === 'owner', maxTurnSeconds,
     onTurn(userId, pcm, timing) { delivered.push({ userId, pcm: Buffer.from(pcm), timing }); },
     onMetric: metric,
+    onDiagnostic: diagnostic,
   });
   receiver.start();
-  return { receiver, speaking, streams, consent, subscriptions, delivered, metric, connection,
+  return { receiver, speaking, streams, consent, subscriptions, delivered, metric, diagnostic, connection,
     setPlaying(value: boolean) { playing = value; }, setEnabled(value: boolean) { enabled = value; } };
 }
 
@@ -244,4 +248,82 @@ test('receiver states distinguish standby, transport recovery and shutdown witho
   receiver.stop();
   expect(receiver.state).toBe('stopped');
   expect(onState.mock.calls.map(([state]) => state)).toEqual(['ready', 'suspended', 'ready', 'stopped']);
+});
+
+test.each([
+  ['DecryptionFailed: PRIVATE-provider-details', 'dave', 'DAVE_DECRYPTION_FAILED', 'voice_receive_dave_errors'],
+  ['Unsupported state or unable to authenticate data', 'voice', 'VOICE_DECRYPTION_FAILED', 'voice_receive_transport_decrypt_errors'],
+  ['Failed to parse packet', 'voice', 'VOICE_PACKET_PARSE_FAILED', 'voice_receive_packet_parse_errors'],
+  ['PRIVATE-unknown-stream-error', 'voice', 'VOICE_RECEIVE_FAILED', 'voice_receive_other_errors'],
+])('receive errors classify %s without emitting raw exception text or speaker identity', (message, category, code, counter) => {
+  const h = harness(); h.setPlaying(false); h.consent.add('PRIVATE-speaker-id');
+  h.speaking.emit('start', 'PRIVATE-speaker-id');
+  const stream = h.streams.get('PRIVATE-speaker-id')!;
+  stream.write(packet());
+  stream.emit('error', new Error(message));
+  expect(h.diagnostic).toHaveBeenCalledOnce();
+  expect(h.diagnostic).toHaveBeenCalledWith({
+    incident: expect.stringMatching(/^[0-9A-F]{8}$/), stage: 'voice_capture', receive_stage: 'stream',
+    category, code, receiver_state: 'ready', voice_status: 'ready',
+    capture_active: true, capture_has_pcm: true, capture_has_voice: true,
+  });
+  expect(JSON.stringify(h.diagnostic.mock.calls)).not.toContain('PRIVATE');
+  expect(h.metric).toHaveBeenCalledWith('voice_receive_errors', 1);
+  expect(h.metric).toHaveBeenCalledWith('voice_receive_stream_errors', 1);
+  expect(h.metric).toHaveBeenCalledWith(counter, 1);
+  expect(h.delivered).toHaveLength(0);
+  expect(stream.destroyed).toBe(true);
+  h.receiver.stop();
+});
+
+test('a late receive error after cleanup is observable without dropping the next capture', () => {
+  const h = harness(); h.setPlaying(false); h.consent.add('guest');
+  h.speaking.emit('start', 'guest');
+  const old = h.streams.get('guest')!;
+  h.receiver.stopUser('guest');
+  h.speaking.emit('start', 'guest');
+  const current = h.streams.get('guest')!;
+  old.emit('error', new Error('DecryptionFailed'));
+  expect(h.diagnostic).toHaveBeenCalledWith(expect.objectContaining({
+    capture_active: false, capture_has_pcm: false, capture_has_voice: false,
+  }));
+  expect(h.metric).toHaveBeenCalledWith('voice_receive_after_cleanup_errors', 1);
+  expect(current.destroyed).toBe(false);
+  h.receiver.stop();
+});
+
+test.each(['subscribe', 'decoder_setup'] as const)('%s failures retain their origin and release any allocated receive stream', (stage) => {
+  const h = harness(); h.setPlaying(false); h.consent.add('guest');
+  if (stage === 'subscribe') vi.spyOn(h.connection.receiver, 'subscribe').mockImplementationOnce(() => {
+    throw Object.assign(new Error('PRIVATE-network-detail'), { code: 'ECONNRESET' });
+  });
+  else decoderSetup.mockImplementationOnce(() => { throw new Error('PRIVATE-native-detail'); });
+  h.speaking.emit('start', 'guest');
+  expect(h.diagnostic).toHaveBeenCalledWith(expect.objectContaining({
+    receive_stage: stage, capture_active: false,
+    code: stage === 'subscribe' ? 'ECONNRESET' : 'OPUS_DECODER_FAILED',
+  }));
+  expect(h.metric).toHaveBeenCalledWith('voice_receive_errors', 1);
+  expect(h.metric).toHaveBeenCalledWith(`voice_receive_${stage}_errors`, 1);
+  expect(JSON.stringify(h.diagnostic.mock.calls)).not.toContain('PRIVATE');
+  if (stage === 'decoder_setup') expect(h.streams.get('guest')!.destroyed).toBe(true);
+  h.receiver.stop();
+});
+
+test('Opus packet failures stay separate from receive errors even if the diagnostic callback throws', () => {
+  const h = harness(); h.setPlaying(false); h.consent.add('guest');
+  h.diagnostic.mockImplementationOnce(() => { throw new Error('diagnostic sink failed'); });
+  h.speaking.emit('start', 'guest');
+  const stream = h.streams.get('guest')!;
+  stream.write(packet());
+  decode.mockImplementationOnce(() => { throw new Error('PRIVATE-invalid-opus'); });
+  expect(() => stream.write(Buffer.from([255]))).not.toThrow();
+  expect(h.diagnostic).toHaveBeenCalledWith(expect.objectContaining({
+    receive_stage: 'decode', code: 'OPUS_DECODE_FAILED', capture_active: true,
+  }));
+  expect(h.metric).toHaveBeenCalledWith('voice_decode_errors', 1);
+  expect(h.metric).not.toHaveBeenCalledWith('voice_receive_errors', 1);
+  expect(h.delivered).toHaveLength(0);
+  expect(stream.destroyed).toBe(true);
+  h.receiver.stop();
 });

@@ -3,15 +3,14 @@ import { AgentError, type AgentCallbacks, type AgentConversationText, type Agent
 import { WakeError } from './wake-detector.js';
 import { convertPcm } from '../audio/pcm-conversion.js';
 import { CaptureWindows, type CaptureTiming } from '../audio/capture-window.js';
-import type { PlaybackStream } from '../audio/playback.js';
+import { playbackFailureFields, type PlaybackStream, type PlaybackStreamOptions } from '../audio/playback.js';
 import type { SpeakerContext } from '../policy/identity.js';
-import { Logger, newIncident, type DiagnosticFields, type ErrorCode } from '../observability/metrics.js';
+import { Logger, newIncident, sanitizeDiagnosticFields, type DiagnosticFields, type ErrorCode } from '../observability/metrics.js';
 
 export interface Playback {
   readonly isPlaying: boolean;
   startStream(userId: string, sampleRate: number, owner: boolean,
-    options?: { isAllowed?: () => boolean;
-      onProgress?: (event: 'first_packet' | 'drained' | 'resumed', elapsedMs: number) => void }): PlaybackStream;
+    options?: PlaybackStreamOptions): PlaybackStream;
   stopUser(userId: string): void;
   stop(): void;
 }
@@ -112,6 +111,7 @@ interface Entry {
   turnReleased: boolean;
   voiceInput: boolean;
   userTurnRecognized: boolean;
+  recognizedAt?: number;
   acceptedUserEventId?: number;
   userTextPending: boolean;
   recognizedUserEventIds: Set<number>;
@@ -135,6 +135,7 @@ interface Entry {
   conversationResponseSafe: boolean;
   conversationTextIds: Set<string>;
   contextExpiresAt?: number;
+  playbackFailure?: DiagnosticFields;
 }
 export class SessionError extends Error {
   constructor(readonly code: 'consent' | 'busy' | 'limit' | 'closed',
@@ -248,7 +249,8 @@ export class SessionManager {
     this.options.metric?.('voice_turns_captured');
     this.inputReport(incident, 'jarvis_voice_captured', 'voice_capture', {
       capture_bytes: pcm.length, capture_ms: Math.round(pcm.length / 192_000 * 1000),
-      ...(timing ? { capture_wait_ms: timing.captureMs, end_detection_ms: timing.endDetectionMs } : {}),
+      ...(timing ? { capture_wait_ms: timing.captureMs, end_detection_ms: timing.endDetectionMs,
+        first_pcm_ms: timing.firstPcmMs, voice_start_ms: timing.voiceStartMs } : {}),
     });
     const abort = new AbortController();
     let owned: Buffer | undefined = Buffer.from(pcm);
@@ -384,10 +386,14 @@ export class SessionManager {
     const abort = new AbortController();
     entry.upload = abort;
     const rate = entry.session!.inputSampleRate;
+    const prepareStarted = performance.now();
     const mono = convertPcm(pcm, 48_000, 2, rate, 1);
     const frameSamples = Math.round(rate / 50);
     const tail = Buffer.alloc(silencePaddingSamples(mono, rate, frameSamples) * 2);
     entry.inputSilenceTailMs = Math.round(tail.length / (rate * 2) * 1_000);
+    const prepareMs = Math.max(0, performance.now() - prepareStarted);
+    this.options.metric?.('agent_audio_prepare_ms', prepareMs);
+    this.report(entry, 'jarvis_agent_input_prepared', undefined, prepareMs);
     const uploadStartedAt = performance.now();
     entry.inputStartedAt = uploadStartedAt;
     this.report(entry, 'jarvis_agent_input_started');
@@ -536,6 +542,7 @@ export class SessionManager {
         }
         if (current.userTurnRecognized) return;
         current.userTurnRecognized = true;
+        current.recognizedAt = performance.now();
         if (current.recognitionDeadline) clearTimeout(current.recognitionDeadline);
         current.recognitionDeadline = undefined;
         current.acceptedUserEventId = identity?.eventId;
@@ -555,7 +562,10 @@ export class SessionManager {
           current.textReceived = true;
           if (first) {
             if (current.voiceInput) this.options.metric?.('agent_responses_after_recognition');
-            this.report(current, 'jarvis_agent_response_observed');
+            if (current.recognizedAt !== undefined) this.options.metric?.('agent_recognition_to_response_ms',
+              Math.max(0, performance.now() - current.recognizedAt));
+            this.report(current, 'jarvis_agent_response_observed', undefined,
+              current.recognizedAt === undefined ? undefined : Math.max(0, performance.now() - current.recognizedAt));
           }
           this.progress(current);
         }
@@ -615,6 +625,7 @@ export class SessionManager {
     entry.request = request;
     entry.voiceInput = request.pcm !== undefined;
     entry.userTurnRecognized = false;
+    entry.recognizedAt = undefined;
     entry.acceptedUserEventId = undefined;
     entry.userTextPending = false;
     entry.inputAudioChunks = entry.inputAudioBytes = 0;
@@ -634,6 +645,7 @@ export class SessionManager {
     for (const id of entry.responseIds) entry.completedResponseIds.add(id);
     entry.responseIds.clear();
     entry.stream = undefined;
+    entry.playbackFailure = undefined;
     entry.ingressEnded = false;
     entry.playbackDone = false;
     entry.recovering = false;
@@ -779,9 +791,13 @@ export class SessionManager {
     if (entry.firstAudioAt === undefined) {
       entry.firstAudioAt = entry.lastAudioAt;
       this.options.metric?.('agent_first_audio_ms', Math.round(entry.firstAudioAt - entry.turnStarted));
+      if (entry.recognizedAt !== undefined) this.options.metric?.('agent_recognition_to_first_audio_ms',
+        Math.max(0, entry.firstAudioAt - entry.recognizedAt));
       if (entry.inputFinishedAt !== undefined) this.options.metric?.('agent_remote_first_audio_ms',
         Math.max(0, Math.round(entry.firstAudioAt - entry.inputFinishedAt)));
       else if (entry.voiceInput) this.options.metric?.('agent_audio_before_input_finished');
+      this.report(entry, 'jarvis_agent_first_audio', undefined, entry.recognizedAt === undefined
+        ? undefined : Math.max(0, entry.firstAudioAt - entry.recognizedAt));
     }
     entry.acceptingAudio = true;
     this.progress(entry);
@@ -792,6 +808,7 @@ export class SessionManager {
           entry.session.outputSampleRate, entry.speaker.isOwner, {
             isAllowed: () => this.usable(entry),
             onProgress: (event) => this.playbackProgress(entry, event),
+            onDiagnostic: (fields) => this.playbackDiagnostic(entry, fields),
           });
         entry.stream = stream;
         void stream.done.then(() => {
@@ -800,13 +817,15 @@ export class SessionManager {
           entry.playing = false;
           this.report(entry, 'jarvis_agent_playback_completed');
           this.finishTurn(entry);
-        }, () => { if (this.usable(entry) && entry.stream === stream) this.fail(entry, 'PLAYBACK_FAILED'); });
+        }, (error: unknown) => {
+          if (this.usable(entry) && entry.stream === stream) this.playbackError(entry, error, 'player');
+        });
       }
       // Acceptance is bounded by the playback queue's capacity. The adapter
       // serializes these writes and pauses provider input under backpressure.
       await entry.stream.write(pcm);
-    } catch {
-      if (this.usable(entry)) this.fail(entry, 'PLAYBACK_FAILED');
+    } catch (error) {
+      if (this.usable(entry)) this.playbackError(entry, error, entry.stream ? 'pcm_input' : 'player_start');
     } finally {
       entry.acceptingAudio = false;
       if (this.usable(entry)) {
@@ -898,6 +917,8 @@ export class SessionManager {
     if (event === 'first_packet' && entry.firstPlaybackAt === undefined) {
       entry.firstPlaybackAt = now;
       this.options.metric?.('agent_first_playback_ms', Math.round(now - entry.turnStarted));
+      if (entry.firstAudioAt !== undefined) this.options.metric?.('agent_audio_buffering_ms',
+        Math.max(0, now - entry.firstAudioAt));
       if (entry.request?.captureStartedAt !== undefined) this.options.metric?.('agent_end_to_end_first_playback_ms',
         Math.max(0, Math.round(now - entry.request.captureStartedAt)));
     }
@@ -912,8 +933,29 @@ export class SessionManager {
       entry.followupUntil = Date.now() + this.options.followupSeconds * 1000;
       this.rememberFollowup(entry.speaker);
     } else if (event === 'resumed') entry.localDrained = false;
-    this.report(entry, 'jarvis_agent_audio_progress');
+    this.report(entry, 'jarvis_agent_audio_progress', undefined,
+      event === 'first_packet' && entry.firstAudioAt !== undefined ? Math.max(0, now - entry.firstAudioAt) : undefined);
     this.retireForQueued(entry);
+  }
+
+  private playbackDiagnostic(entry: Entry, fields: DiagnosticFields): void {
+    const clean = sanitizeDiagnosticFields(fields);
+    if (clean.code && !entry.playbackFailure) entry.playbackFailure = {
+      // The terminal summary wraps this failure as PLAYBACK_FAILED. Keep its
+      // specific classification even when the upstream native code is unknown.
+      ...clean, cause_code: clean.code,
+    };
+    try {
+      this.options.logger?.event(clean.code ? 'jarvis_playback_failed' : 'jarvis_playback_state',
+        clean.code ? 'error' : 'info', {
+          ...clean, incident: entry.incident, operation: 'agent_turn', stage: 'playback',
+        });
+    } catch { /* A diagnostic sink cannot abort playback or replace its primary failure. */ }
+  }
+
+  private playbackError(entry: Entry, error: unknown, stage: DiagnosticFields['playback_stage']): void {
+    if (!entry.playbackFailure) this.playbackDiagnostic(entry, { playback_stage: stage, ...playbackFailureFields(error) });
+    this.fail(entry, 'PLAYBACK_FAILED');
   }
 
   private retireForQueued(entry: Entry): void {
@@ -988,11 +1030,14 @@ export class SessionManager {
     this.options.metric?.('agent_completion_missing');
   }
 
-  private report(entry: Entry, event: string, code?: ErrorCode): void {
+  private report(entry: Entry, event: string, code?: ErrorCode, stageDurationMs?: number): void {
     this.options.logger?.event(event, code ? 'error' : 'info', {
+      ...(code === 'PLAYBACK_FAILED' ? entry.playbackFailure : {}),
       incident: entry.incident, operation: 'agent_turn',
-      stage: event === 'jarvis_agent_input_started' || event === 'jarvis_agent_input_sent' ? 'agent_audio_upload'
+      stage: event === 'jarvis_agent_input_started' || event === 'jarvis_agent_input_sent'
+        || event === 'jarvis_agent_input_prepared' ? 'agent_audio_upload'
         : event === 'jarvis_agent_session_ready' ? 'agent_connect'
+        : event === 'jarvis_agent_first_audio' ? 'agent_audio_wait'
         : event === 'jarvis_agent_user_turn_recognized' ? 'agent_user_recognition'
         : entry.voiceInput && !entry.userTurnRecognized ? 'agent_user_recognition'
         : entry.playing ? 'playback' : entry.textReceived && !entry.audioBytes ? 'agent_audio_wait'
@@ -1000,6 +1045,7 @@ export class SessionManager {
       ...(code ? { code, category: code === 'PLAYBACK_FAILED' ? 'playback' : 'agent' } : {}),
       ...(code === 'AGENT_USER_TURN_MISSING' ? { timeout_ms: USER_RECOGNITION_TIMEOUT_MS } : {}),
       duration_ms: Math.max(0, Math.round(performance.now() - entry.turnStarted)),
+      ...(stageDurationMs === undefined ? {} : { stage_duration_ms: Math.max(0, Math.round(stageDurationMs)) }),
       audio_chunks: entry.audioChunks, audio_bytes: entry.audioBytes,
       text_received: entry.textReceived, completion_received: entry.completionReceived,
       ingress_ended: entry.ingressEnded, playback_drained: entry.playbackDone,

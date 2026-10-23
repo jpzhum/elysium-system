@@ -751,6 +751,31 @@ describe('RAM-only delivered conversation handoff', () => {
     expect(h.metric.mock.calls.filter(([name]) => name === 'agent_end_to_end_first_playback_ms')).toHaveLength(0);
   });
 
+  test('recognition, response events and local buffering retain separate monotonic boundaries', async () => {
+    let now = 1_000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const h = harness({ pace: async () => { now += 20; } });
+    const startStream = vi.mocked(h.playback.startStream);
+    const createStream = startStream.getMockImplementation()!;
+    startStream.mockImplementationOnce((...args) => {
+      const stream = createStream(...args);
+      return { ...stream, write: pcm => { now = 4_700; return stream.write(pcm); } };
+    });
+    await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1)); await settle();
+    const cb = h.callbacks.get('guest')!;
+    now = 4_000;
+    cb.onUserTranscript?.({ eventId: 10 });
+    now = 4_200;
+    cb.onTextResponse?.({ responseId: 'synthetic' });
+    now = 4_500;
+    await cb.onAudio(Buffer.alloc(480), 11, { responseId: 'synthetic' });
+    expect(h.metric).toHaveBeenCalledWith('agent_recognition_to_response_ms', 200);
+    expect(h.metric).toHaveBeenCalledWith('agent_recognition_to_first_audio_ms', 500);
+    expect(h.metric).toHaveBeenCalledWith('agent_audio_buffering_ms', 200);
+    expect(h.metric).toHaveBeenCalledWith('agent_first_audio_ms', 3_500);
+    expect(h.metric).toHaveBeenCalledWith('agent_first_playback_ms', 3_700);
+  });
+
   test('unconfirmed drained output preserves real final text as observed without treating it as a complete answer', async () => {
     const onTurnDelivered = vi.fn();
     const h = harness({ onTurnDelivered });

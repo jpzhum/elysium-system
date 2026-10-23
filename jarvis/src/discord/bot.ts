@@ -4,7 +4,7 @@ import {
 } from 'discord.js';
 import { VoiceConnectionStatus, type VoiceConnection } from '@discordjs/voice';
 import type { Config } from '../config.js';
-import { Logger, Metrics, type DiagnosticFields } from '../observability/metrics.js';
+import { diagnosticCommands, Logger, Metrics, newIncident, type DiagnosticFields, type DiagnosticStage } from '../observability/metrics.js';
 import { operationalStatus } from '../observability/status.js';
 import { DiagnosticError, JoinDiagnostics, sanitizeError } from '../observability/diagnostics.js';
 import { inspectVoiceRuntime } from '../observability/voice-runtime.js';
@@ -18,7 +18,7 @@ import { SessionError, SessionManager, type TurnNotification, type TurnReceipt }
 import { ElevenWakeDetector, WakeError } from '../agents/wake-detector.js';
 import { createGameSearch, type GameSearchResult } from '../tools/game-search.js';
 import { createVoiceParticipantsTool } from '../tools/voice-participants.js';
-import { PlaybackQueue } from '../audio/playback.js';
+import { PlaybackQueue, playbackFailureFields } from '../audio/playback.js';
 import { rms } from '../audio/voice-activity.js';
 import { PlaybackEchoGuard } from '../audio/echo-guard.js';
 import { VoiceConnectionManager } from './voice-connection.js';
@@ -64,7 +64,9 @@ export class JarvisBot {
     this.client.on(Events.ShardError, () => this.logger.event('discord_gateway_error', 'warn'));
     this.client.on(Events.InteractionCreate, (interaction) => {
       if (interaction.isChatInputCommand() && interaction.commandName === 'jarvis') {
-        void this.handle(interaction).catch(() => this.logger.event('interaction_response_failed', 'warn'));
+        void this.handle(interaction).catch((error: unknown) => this.logger.event('interaction_response_failed', 'warn', {
+          command: 'unknown', stage: 'command_execute', ...sanitizeError(error),
+        }));
       }
     });
     this.client.on(Events.VoiceStateUpdate, (before, after) => {
@@ -111,7 +113,7 @@ export class JarvisBot {
   private requireRoom(interaction: Interaction): Room {
     const room = this.room;
     if (!room || interaction.member.voice.channelId !== room.channel.id) {
-      throw new Error('same_channel');
+      throw new DiagnosticError('channel', 'SAME_CHANNEL_REQUIRED');
     }
     return room;
   }
@@ -122,24 +124,34 @@ export class JarvisBot {
     }
     const command = interaction.options.getSubcommand();
     const diagnostic = command === 'join' ? new JoinDiagnostics(this.logger) : undefined;
+    const incident = diagnostic?.incident ?? newIncident();
+    const safeCommand = diagnosticCommands.find(value => value === command) ?? 'unknown';
+    const group = interaction.options.getSubcommandGroup?.() === 'context' ? 'context' : undefined;
+    const started = performance.now();
+    let stage: DiagnosticStage = 'command_execute';
+    let playbackSnapshot: DiagnosticFields = {};
+    const reply = async (content: string, ephemeral = true): Promise<void> => {
+      stage = 'command_reply';
+      await this.reply(interaction, content, ephemeral);
+    };
     try {
       if (interaction.options.getSubcommandGroup?.() === 'context') {
         const room = this.room;
         if (command === 'clear') {
           room?.sessions.cancelUser(interaction.user.id);
           room?.recent.forget(interaction.user.id);
-          await this.reply(interaction, 'Seu contexto curto foi apagado e suas perguntas em andamento foram canceladas. '
+          await reply('Seu contexto curto foi apagado e suas perguntas em andamento foram canceladas. '
             + 'Isso não apaga dados já processados pela ElevenLabs.');
         } else {
           const count = room?.recent.count(this.context(room, interaction.member)) ?? 0;
-          await this.reply(interaction, `Contexto curto em RAM: ${this.config.JARVIS_SHORT_MEMORY_TTL_SECONDS > 0 ? 'habilitado' : 'desativado'}; `
+          await reply(`Contexto curto em RAM: ${this.config.JARVIS_SHORT_MEMORY_TTL_SECONDS > 0 ? 'habilitado' : 'desativado'}; `
             + `${count} interações suas nesta chamada; até 10 no total do canal; prazo de ${this.config.JARVIS_SHORT_MEMORY_TTL_SECONDS} s. `
             + 'Sem memória durável. /jarvis context clear apaga as suas.');
         }
         return;
       }
       if (command === 'privacy') {
-        await this.reply(interaction, privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke,
+        await reply(privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke,
           this.config.JARVIS_FOLLOWUP_SECONDS, this.config.JARVIS_BARGE_IN_ENABLED, this.config.JARVIS_SHORT_MEMORY_TTL_SECONDS)); return;
       }
       if (command === 'status') {
@@ -150,7 +162,7 @@ export class JarvisBot {
           probe = '\nProva por falante consentido: ' + JSON.stringify(Object.fromEntries(room.probe));
         }
         const pages = operationalStatus(this.metrics.snapshot());
-        await this.reply(interaction, `${room ? 'Conectado' : 'Desconectado'}; modo: ${this.config.daveSmoke
+        await reply(`${room ? 'Conectado' : 'Desconectado'}; modo: ${this.config.daveSmoke
           ? 'diagnóstico DAVE local' : this.config.JARVIS_VOICE_INPUT}; sessões: ${room?.sessions.activeCount ?? 0};`
           + ` voz Discord: ${this.voice.connection?.state.status ?? 'desconectada'}; receiver: ${room?.receiver.state ?? 'stopped'};`
           + ` perguntas na fila: ${room?.sessions.queuedCount ?? 0}; interrupção por voz: ${this.config.JARVIS_BARGE_IN_ENABLED ? 'experimental' : 'desativada'}.`
@@ -162,7 +174,7 @@ export class JarvisBot {
       }
       if (command === 'revoke') {
         if (this.room) this.revoke(this.room, interaction.user.id);
-        await this.reply(interaction, 'Consentimento revogado; sua captura, sessão e resposta foram canceladas.'); return;
+        await reply('Consentimento revogado; sua captura, sessão e resposta foram canceladas.'); return;
       }
       if (command === 'join') {
         diagnostic!.stage('authorize');
@@ -174,51 +186,69 @@ export class JarvisBot {
         diagnostic!.stage('channel_lookup');
         await this.join(interaction, diagnostic);
         diagnostic!.stage('join_reply');
-        await this.reply(interaction, 'Jarvis conectado. ' + privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke,
+        await reply('Jarvis conectado. ' + privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke,
           this.config.JARVIS_FOLLOWUP_SECONDS, this.config.JARVIS_BARGE_IN_ENABLED, this.config.JARVIS_SHORT_MEMORY_TTL_SECONDS), false);
         diagnostic!.success();
         return;
       }
       if (command === 'leave') {
+        stage = 'authorize';
         authorize(interaction.user.id, 'leave', this.config.JARVIS_OWNER_USER_ID);
+        stage = 'previous_room_cleanup';
         this.reset();
-        await this.reply(interaction, 'Jarvis desconectado; consentimentos e buffers apagados.'); return;
+        await reply('Jarvis desconectado; consentimentos e buffers apagados.'); return;
       }
+      stage = 'channel_lookup';
       const room = this.requireRoom(interaction);
+      stage = 'command_execute';
       if (command === 'cancel') {
         room.sessions.cancelUser(interaction.user.id);
-        await this.reply(interaction, 'Suas perguntas pendentes e sua resposta em andamento foram canceladas.'); return;
+        await reply('Suas perguntas pendentes e sua resposta em andamento foram canceladas.'); return;
       }
       if (command === 'tone') {
+        stage = 'authorize';
         authorize(interaction.user.id, 'configure', this.config.JARVIS_OWNER_USER_ID);
+        stage = 'interaction_ack';
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const tone = Buffer.alloc(48_000 * 2);
         for (let i = 0; i < 48_000; i++) tone.writeInt16LE(Math.round(1200 * Math.sin(2 * Math.PI * 440 * i / 48_000)), i * 2);
-        await room.playback.play(interaction.user.id, tone, 48_000, true);
-        tone.fill(0);
-        await this.reply(interaction, 'Tom reproduzido. Confirme a audição para registrar o teste de playback.'); return;
+        stage = 'playback';
+        try {
+          await room.playback.play(interaction.user.id, tone, 48_000, true, {
+            onDiagnostic: (fields) => {
+              if (fields.code || !playbackSnapshot.code) playbackSnapshot = fields;
+              this.logger.event(fields.code ? 'jarvis_playback_failed' : 'jarvis_playback_state', fields.code ? 'error' : 'info', {
+                ...fields, incident, command: 'tone', stage: 'playback',
+              });
+            },
+          });
+        } finally { tone.fill(0); }
+        await reply('Tom reproduzido. Confirme a audição para registrar o teste de playback.'); return;
       }
       if (command === 'consent') {
         const audio = interaction.options.getBoolean('audio') === true;
         if (audio && !this.config.daveSmoke && this.config.JARVIS_VOICE_INPUT === 'disabled') {
-          await this.reply(interaction, 'Captura de voz desativada. Use /jarvis consent sem áudio e /jarvis ask.'); return;
+          await reply('Captura de voz desativada. Use /jarvis consent sem áudio e /jarvis ask.'); return;
         }
         this.revoke(room, interaction.user.id);
         room.consent.grant(interaction.user.id, audio);
-        await this.reply(interaction, (audio ? 'Aceite de áudio registrado. ' : 'Aceite de perguntas escritas registrado. ')
+        await reply((audio ? 'Aceite de áudio registrado. ' : 'Aceite de perguntas escritas registrado. ')
           + privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke,
             this.config.JARVIS_FOLLOWUP_SECONDS, this.config.JARVIS_BARGE_IN_ENABLED, this.config.JARVIS_SHORT_MEMORY_TTL_SECONDS)); return;
       }
       if (command === 'ask') {
-        if (this.config.daveSmoke) { await this.reply(interaction, 'Diagnóstico DAVE não conecta à ElevenLabs.'); return; }
+        if (this.config.daveSmoke) { await reply('Diagnóstico DAVE não conecta à ElevenLabs.'); return; }
+        stage = 'authorize';
         authorize(interaction.user.id, 'ask', this.config.JARVIS_OWNER_USER_ID);
         const speaker = this.context(room, interaction.member);
-        if (!speaker.consented) { await this.reply(interaction, 'Leia /jarvis privacy e aceite com /jarvis consent.'); return; }
+        if (!speaker.consented) { await reply('Leia /jarvis privacy e aceite com /jarvis consent.'); return; }
+        stage = 'interaction_ack';
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         let acknowledge!: () => void;
         const acknowledged = new Promise<void>((resolve) => { acknowledge = resolve; });
         let receipt: TurnReceipt | undefined;
         try {
+          stage = 'turn_enqueue';
           receipt = await room.sessions.ask(speaker, interaction.options.getString('texto', true), async (event) => {
             if (event.type === 'queued') return;
             await acknowledged;
@@ -227,7 +257,7 @@ export class JarvisBot {
             const content = this.turnNotice(event);
             if (content) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
           });
-          await this.reply(interaction, receipt.queued
+          await reply(receipt.queued
             ? `Pergunta enfileirada (posição ${receipt.position}). Avisarei quando começar ou for cancelada.`
             : 'Pergunta aceita. A resposta será falada nesta chamada.');
         } finally { acknowledge(); }
@@ -235,6 +265,19 @@ export class JarvisBot {
     } catch (error) {
       // Report before attempting a Discord response, which can fail independently.
       diagnostic?.failure(error);
+      if (!diagnostic) {
+        let classification: DiagnosticFields = error instanceof SessionError
+          ? { category: error.code === 'consent' ? 'authorization' : error.code === 'closed' ? 'cancelled' : 'runtime',
+            code: error.code === 'consent' ? 'CONSENT_REQUIRED' : error.code === 'busy' ? 'SESSION_BUSY'
+              : error.code === 'limit' ? 'USAGE_LIMIT' : 'SESSION_CLOSED' } as const
+          : playbackFailureFields(error);
+        if (classification.code === 'UNKNOWN' && playbackSnapshot.code) classification = playbackSnapshot;
+        this.logger.event('jarvis_command_failed', 'warn', {
+          ...playbackSnapshot, ...classification, incident, command: safeCommand, command_group: group, stage,
+          voice_status: playbackSnapshot.voice_status ?? this.voice.connection?.state.status,
+          duration_ms: Math.max(0, Math.round(performance.now() - started)),
+        });
+      }
       let message: string;
       if (error instanceof AuthorizationError) message = 'Ação reservada ao criador autenticado do Jarvis.';
       else if (error instanceof SessionError) {
@@ -243,9 +286,10 @@ export class JarvisBot {
           : error.code === 'limit' ? this.limitNotice(error)
               : 'A sessão foi encerrada. Tente novamente.';
       } else {
-        const id = diagnostic?.incident ?? this.logger.event('jarvis_command_failed', 'warn');
+        const id = incident;
         message = (error instanceof Error && error.message === 'same_channel')
           || (error instanceof DiagnosticError && error.code === 'CHANNEL_NOT_FOUND')
+          || (error instanceof DiagnosticError && error.code === 'SAME_CHANNEL_REQUIRED')
           ? 'Entre na mesma chamada que Jarvis antes de usar este comando.'
           : error instanceof DiagnosticError && error.code === 'CHANNEL_RESTRICTED'
             ? 'Este canal de voz não é o canal configurado para Jarvis.'
@@ -259,8 +303,10 @@ export class JarvisBot {
       if (diagnostic && !message.includes(diagnostic.incident)) message += ` Incidente ${diagnostic.incident}.`;
       try { await this.reply(interaction, message); }
       catch (responseError) {
-        if (!diagnostic) throw responseError;
-        diagnostic.event('interaction_response_failed', 'error', { stage: 'join_reply', ...sanitizeError(responseError) });
+        if (diagnostic) diagnostic.event('interaction_response_failed', 'error', { stage: 'join_reply', ...sanitizeError(responseError) });
+        else this.logger.event('interaction_response_failed', 'error', {
+          incident, command: safeCommand, command_group: group, stage: 'command_reply', ...sanitizeError(responseError),
+        });
       }
     }
   }
@@ -320,10 +366,21 @@ export class JarvisBot {
       initialized = room;
       diagnostic?.stage('session_setup');
       room.sessions = new SessionManager({
-        connect: (speaker, callbacks, signal) => connectAgent({
+        connect: (speaker, callbacks, signal) => {
+          const openingIncident = room.sessions.turnIncident(speaker);
+          return connectAgent({
           apiKey: this.config.ELEVENLABS_API_KEY!, agentId: this.config.ELEVENLABS_AGENT_ID!,
           suppressFirstMessage: this.config.JARVIS_SUPPRESS_FIRST_MESSAGE,
           dynamicVariables: promptVariables(speaker, channel.guild.name, { channelName: channel.name }), callbacks, signal,
+          onConnectionStage: (event) => {
+            const metric = { signed_url: 'agent_signed_url_ms', websocket_handshake: 'agent_websocket_handshake_ms',
+              audio_negotiation: 'agent_audio_negotiation_ms' } as const;
+            this.metrics.record(metric[event.stage], event.durationMs);
+            this.logger.event('jarvis_agent_connection_stage', 'info', {
+              incident: openingIncident, operation: 'agent_turn', stage: 'agent_connect',
+              connection_stage: event.stage, duration_ms: Math.round(event.durationMs),
+            });
+          },
           onToolEvent: (event) => {
             this.metrics.add(`client_tools_${event.stage}`);
             this.logger.event('jarvis_tool_event', event.stage === 'failed' ? 'warn' : 'info', {
@@ -371,12 +428,14 @@ export class JarvisBot {
             this.logger.event('jarvis_search_result', result.status === 'success' ? 'info' : 'warn', {
               incident, operation: 'search', stage: 'search_request', search_status: result.status,
               duration_ms: Math.max(0, Math.round(performance.now() - started)), source_count: result.sources.length,
+              rate_limit_source: result.rate_limit_source,
               search_key_configured: Boolean(this.config.JARVIS_SEARCH_API_KEY),
             });
             if (!allowed()) throw new AuthorizationError();
             return result;
           },
-        }),
+          });
+        },
         prepareSession: (speaker, session, reused, metadata) => {
           if (!metadata || !this.allowed(room, speaker)) throw new AuthorizationError();
           const variables = promptVariables(speaker, channel.guild.name, { channelName: channel.name });
@@ -467,6 +526,7 @@ export class JarvisBot {
             }
           }
         }, onMetric: this.metrics.record,
+        onDiagnostic: (fields) => this.logger.event('jarvis_voice_receive_error', 'warn', fields),
         onState: (state) => this.logger.event('jarvis_voice_receiver_state', 'info', {
           stage: 'receiver_setup', receiver_state: state, voice_status: connection!.state.status,
         }),

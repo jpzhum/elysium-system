@@ -1,3 +1,5 @@
+import { WindowedSinc } from './windowed-sinc.js';
+
 /** Signed 16-bit, little-endian PCM. Buffers never contain container headers. */
 export function convertPcm(
   pcm: Buffer,
@@ -29,27 +31,20 @@ export function convertPcm(
     return toChannels === 1 ? (first + second) / 2 : channel === 0 ? first : second;
   };
   // A finite windowed-sinc low-pass filter also limits aliasing when downsampling.
-  const cutoff = Math.min(1, toRate / fromRate);
-  const radius = Math.ceil(12 / cutoff);
+  const filter = new WindowedSinc(fromRate, toRate);
   for (let frame = 0; frame < outputFrames; frame += 1) {
     const position = frame * fromRate / toRate;
+    const kernel = fromRate === toRate ? undefined : filter.at(position);
     for (let channel = 0; channel < toChannels; channel += 1) {
       let value = 0;
-      if (fromRate === toRate) {
+      if (!kernel) {
         value = read(frame, channel);
       } else {
-        let weightSum = 0;
         const center = Math.floor(position);
-        for (let sample = center - radius + 1; sample <= center + radius; sample += 1) {
-          const distance = position - sample;
-          const scaled = Math.PI * distance * cutoff;
-          const sinc = Math.abs(scaled) < 1e-10 ? 1 : Math.sin(scaled) / scaled;
-          const window = 0.5 + 0.5 * Math.cos(Math.PI * distance / radius);
-          const weight = sinc * window * cutoff;
-          value += read(sample, channel) * weight;
-          weightSum += weight;
+        for (let index = 0; index < kernel.weights.length; index += 1) {
+          value += read(center - filter.radius + 1 + index, channel) * kernel.weights[index]!;
         }
-        value /= weightSum;
+        value /= kernel.sum;
       }
       output.writeInt16LE(Math.max(-32_768, Math.min(32_767, Math.round(value))),
         (frame * toChannels + channel) * 2);

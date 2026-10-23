@@ -133,10 +133,12 @@ export class ElevenWakeDetector {
     this.metric('wake_checks');
     this.metric('wake_audio_seconds', pcm.length / 32_000);
     pcm.fill(0);
+    this.metric('wake_audio_prepare_ms', Math.max(0, performance.now() - started));
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(), 8_000);
     timer.unref();
     const combined = entry.signal ? AbortSignal.any([entry.signal, timeout.signal]) : timeout.signal;
+    const requestStarted = performance.now();
     try {
       const response = await this.requestAudio(form, combined);
       if (!response.ok) {
@@ -158,6 +160,7 @@ export class ElevenWakeDetector {
       throw new WakeError('wake_provider_failed');
     } finally {
       clearTimeout(timer);
+      this.metric('wake_stt_request_ms', Math.max(0, performance.now() - requestStarted));
       this.metric('wake_recognition_ms', Math.round(performance.now() - started));
     }
   }
