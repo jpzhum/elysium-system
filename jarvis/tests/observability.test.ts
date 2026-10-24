@@ -255,6 +255,16 @@ test('metrics counters preserve existing names, bounds and snapshots', () => {
   expect(metrics.snapshot()).toEqual({ voice_turns: 3 });
 });
 
+test('turn latency logs accept bounded fractional encoder time and never malformed values', () => {
+  const state = capture();
+  state.logger.event('jarvis_playback_state', 'info', { opus_encode_ms: 1.25 });
+  expect(state.records()[0]).toMatchObject({ opus_encode_ms: 1.25 });
+  for (const opus_encode_ms of [NaN, Infinity, -1, 3_600_001]) {
+    state.logger.event('jarvis_playback_state', 'info', { opus_encode_ms });
+    expect(state.records().at(-1)).not.toHaveProperty('opus_encode_ms');
+  }
+});
+
 test('stream diagnostics keep completion, drain, recovery and tool state separate without content', () => {
   const state = capture();
   state.logger.event('jarvis_agent_turn_recovering', 'warn', {

@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, expect, test, vi } from 'vitest';
-import { createAgentConnector, type AgentDependencies } from '../src/agents/elevenlabs-client.js';
+import { AgentError, createAgentConnector, type AgentDependencies } from '../src/agents/elevenlabs-client.js';
 import { SessionManager, type Playback, type SessionOptions } from '../src/agents/session-manager.js';
 import { WakeError } from '../src/agents/wake-detector.js';
 import type { PlaybackStream } from '../src/audio/playback.js';
@@ -127,6 +127,27 @@ function setup(pendingPlayback = false, pace?: SessionOptions['pace'], options: 
 afterEach(() => {
   for (const manager of active.splice(0)) manager.close();
   vi.useRealTimers();
+});
+
+test.each([
+  ['agent_request_timeout', 'AGENT_REQUEST_TIMEOUT'],
+  ['agent_closed_before_metadata', 'AGENT_PREMATURE_CLOSE'],
+])('keeps the technical classification of %s without retaining the provider message', async (cause, code) => {
+  const h = setup(false, undefined, { connect: async () => { throw new AgentError(cause); } });
+  await h.ask();
+  h.failed(code);
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+});
+
+test('emits one content-free cancellation outcome for an accepted turn', async () => {
+  const h = setup();
+  const receipt = await h.ask();
+  h.manager.cancelUser(h.speaker.discordUserId, 'revoked');
+  h.manager.cancelUser(h.speaker.discordUserId, 'revoked');
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_cancelled')).toMatchObject([
+    { incident: receipt.turnId, turn_outcome: 'cancelled', operation: 'agent_turn' },
+  ]);
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
 });
 
 test('invalid capture rejection logs only its category before wake detection or provider connection', async () => {

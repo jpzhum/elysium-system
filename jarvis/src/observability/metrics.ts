@@ -101,6 +101,7 @@ export const errorCodes = [
   'AGENT_GUARDRAIL_REJECTED', 'AGENT_CONCURRENCY_LIMIT',
   'AGENT_CALLBACK_ERROR', 'AGENT_BACKPRESSURE', 'PLAYBACK_FAILED', 'AGENT_USER_TURN_MISSING', 'AGENT_INITIATION_REJECTED',
   'AGENT_INPUT_INCOMPLETE', 'AGENT_INPUT_INVALID',
+  'AGENT_REQUEST_TIMEOUT', 'AGENT_INPUT_SEND_FAILED', 'AGENT_CONNECT_FAILED',
   'TOOL_UNAVAILABLE', 'TOOL_FAILED', 'TOOL_TIMEOUT', 'TOOL_CANCELLED',
   'PLAYBACK_ENCODER_FAILED', 'PLAYBACK_RESOURCE_ENDED', 'PLAYBACK_RESOURCE_IN_USE',
   'PLAYBACK_PLAYER_ERROR', 'PLAYBACK_STREAM_FAILED', 'PLAYBACK_PREMATURE_IDLE',
@@ -183,6 +184,14 @@ export interface DiagnosticFields {
   first_playback_ms?: number;
   drain_ms?: number;
   next_question_ready_ms?: number;
+  speech_end_to_first_packet_ms?: number;
+  wake_detection_ms?: number;
+  agent_connect_ms?: number;
+  remote_first_audio_ms?: number;
+  playback_start_ms?: number;
+  /** Sum of encoder CPU time for one local response resource; may be fractional. */
+  opus_encode_ms?: number;
+  deployed_revision?: string;
   first_message_override_requested?: boolean;
   input_kind?: 'voice' | 'text';
   capture_bytes?: number;
@@ -257,6 +266,7 @@ const events = new Set([
   'jarvis_voice_receiver_state', 'jarvis_voice_turn_rejected', 'jarvis_voice_capture_rejected',
   'jarvis_voice_receive_error', 'jarvis_playback_failed', 'jarvis_playback_state',
   'jarvis_agent_input_prepared', 'jarvis_agent_first_audio',
+  'jarvis_agent_turn_released', 'jarvis_agent_turn_cancelled',
 ]);
 
 export function newIncident(): string { return randomBytes(4).toString('hex').toUpperCase(); }
@@ -329,6 +339,8 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['audio_chunks', 0, 1_000_000], ['audio_bytes', 0, 128_000_000],
     ['queue_position', 0, 32], ['queue_depth', 0, 32],
     ['question_wait_ms', 0, 3_600_000], ['first_audio_ms', 0, 3_600_000], ['last_audio_ms', 0, 3_600_000],
+    ['speech_end_to_first_packet_ms', 0, 3_600_000], ['wake_detection_ms', 0, 3_600_000],
+    ['agent_connect_ms', 0, 3_600_000], ['remote_first_audio_ms', 0, 3_600_000], ['playback_start_ms', 0, 3_600_000],
     ['first_playback_ms', 0, 3_600_000], ['drain_ms', 0, 3_600_000], ['next_question_ready_ms', 0, 3_600_000],
     ['capture_bytes', 0, 5_760_000], ['capture_ms', 0, 30_000], ['capture_wait_ms', 0, 120_000],
     ['end_detection_ms', 0, 120_000], ['input_audio_chunks', 0, 10_000], ['input_audio_bytes', 0, 4_000_000],
@@ -349,19 +361,37 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
       result[key] = value;
     }
   }
+  const revision = diagnosticValue(fields, 'deployed_revision');
+  if (typeof revision === 'string' && /^[a-f0-9]{7,40}$/i.test(revision)) result.deployed_revision = revision.toLowerCase();
+  const encodingMs = diagnosticValue(fields, 'opus_encode_ms');
+  if (typeof encodingMs === 'number' && Number.isFinite(encodingMs) && encodingMs >= 0 && encodingMs <= 3_600_000) {
+    result.opus_encode_ms = encodingMs;
+  }
   return result as DiagnosticFields;
 }
 
+export type OperationalEvent = Readonly<DiagnosticFields & { event: string; level: LogLevel; incident: string }>;
+
 export class Logger {
+  private readonly observers = new Set<(event: OperationalEvent) => void>();
   constructor(
     private readonly minimum: LogLevel = 'info',
     private readonly write: (line: string) => void = (line) => { process.stdout.write(line); },
   ) {}
+  /** Status observes the same allowlist even when stdout is filtered to errors. */
+  observe(observer: (event: OperationalEvent) => void): () => void {
+    this.observers.add(observer);
+    return () => { this.observers.delete(observer); };
+  }
   event(name: string, level: LogLevel = 'info', fields: DiagnosticFields = {}): string {
     const suppliedIncident = diagnosticValue(fields, 'incident');
     const incident = typeof suppliedIncident === 'string' && /^[A-F0-9]{8}$/.test(suppliedIncident)
       ? suppliedIncident : newIncident();
     if (!events.has(name) || !['info', 'warn', 'error'].includes(level)) return incident;
+    const record: OperationalEvent = Object.freeze({ event: name, level, incident, ...sanitizeDiagnosticFields(fields) });
+    for (const observer of this.observers) {
+      try { observer(record); } catch { /* Observability cannot interrupt the voice pipeline. */ }
+    }
     if (['info', 'warn', 'error'].indexOf(level) >= ['info', 'warn', 'error'].indexOf(this.minimum)) {
       this.write(`${JSON.stringify({ time: new Date().toISOString(), level, event: name, incident, ...sanitizeDiagnosticFields(fields) })}\n`);
     }

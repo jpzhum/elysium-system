@@ -279,6 +279,7 @@ export class VoiceReceiver {
         endDetectionMs: Math.max(0, Math.round(now - state.lastVoicedAt)),
         firstPcmMs: state.firstPcmMs, voiceStartMs: state.voiceStartMs,
         captureId: state.captureId, captureStartedAtMs: state.startedAt, captureEndedAtMs: now,
+        speechEndedAtMs: state.lastVoicedAt,
         ...(state.playbackToken !== undefined ? { playbackToken: state.playbackToken } : {}) };
       this.metric("voice_turn_seconds", result.length / BYTES_PER_SECOND);
       this.metric('voice_capture_ms', timing.captureMs);

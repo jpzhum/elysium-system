@@ -6,6 +6,7 @@ import { VoiceConnectionStatus, type VoiceConnection } from '@discordjs/voice';
 import type { Config } from '../config.js';
 import { diagnosticCommands, Logger, Metrics, newIncident, type DiagnosticFields, type DiagnosticStage } from '../observability/metrics.js';
 import { operationalStatus } from '../observability/status.js';
+import { OperationalEvidence, deploymentRevision } from '../observability/operational-evidence.js';
 import { DiagnosticError, JoinDiagnostics, sanitizeError } from '../observability/diagnostics.js';
 import { inspectVoiceRuntime } from '../observability/voice-runtime.js';
 import { authorize, AuthorizationError } from '../policy/authorization.js';
@@ -42,6 +43,7 @@ export class JarvisBot {
   private readonly client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
   private readonly voice = new VoiceConnectionManager();
   private readonly metrics = new Metrics();
+  private readonly evidence: OperationalEvidence;
   private room?: Room;
   private joining = false;
   private closed = false;
@@ -50,6 +52,7 @@ export class JarvisBot {
   private readonly search: (game: string, query: string, signal?: AbortSignal) => Promise<GameSearchResult>;
 
   constructor(private readonly config: Config, private readonly logger: Logger) {
+    this.evidence = new OperationalEvidence(logger);
     this.wake = new ElevenWakeDetector(config.ELEVENLABS_API_KEY ?? '', config.JARVIS_WAKE_WORD,
       config.JARVIS_MAX_WAKE_CHECKS_PER_MINUTE, this.metrics.record);
     this.search = createGameSearch({ apiKey: config.JARVIS_SEARCH_API_KEY,
@@ -86,6 +89,7 @@ export class JarvisBot {
     await guild.commands.create(jarvisCommand.toJSON());
     this.logger.event(this.config.daveSmoke ? 'dave_probe_ready' : 'jarvis_ready', 'info', {
       diagnostics_version: 7, search_key_configured: Boolean(this.config.JARVIS_SEARCH_API_KEY),
+      deployed_revision: this.config.RENDER_GIT_COMMIT,
       ...(!this.config.daveSmoke ? { first_message_override_requested: this.config.JARVIS_SUPPRESS_FIRST_MESSAGE } : {}),
     });
   }
@@ -162,13 +166,18 @@ export class JarvisBot {
           probe = '\nProva por falante consentido: ' + JSON.stringify(Object.fromEntries(room.probe));
         }
         const pages = operationalStatus(this.metrics.snapshot());
+        const playback = room?.playback.diagnosticState;
         await reply(`${room ? 'Conectado' : 'Desconectado'}; modo: ${this.config.daveSmoke
           ? 'diagnóstico DAVE local' : this.config.JARVIS_VOICE_INPUT}; sessões: ${room?.sessions.activeCount ?? 0};`
           + ` voz Discord: ${this.voice.connection?.state.status ?? 'desconectada'}; receiver: ${room?.receiver.state ?? 'stopped'};`
           + ` perguntas na fila: ${room?.sessions.queuedCount ?? 0}; interrupção por voz: ${this.config.JARVIS_BARGE_IN_ENABLED ? 'experimental' : 'desativada'}.`
+          + `\nGateway Discord: ${this.client.isReady() ? 'Ready' : 'indisponível'}; turno ativo: ${room?.sessions.queueStatus.active ? 'sim' : 'não'};`
+          + ` playback local: ${playback?.available ? 'disponível' : 'indisponível'}; player: ${playback?.player_status ?? 'ausente'};`
+          + ` assinatura: ${playback?.subscribed ? 'atual' : 'ausente'}; DAVE: ${playback?.dave_ready === undefined ? 'sem observação' : playback.dave_ready ? 'pronto' : 'não pronto'}.`
+          + `\nRevisão Render: ${deploymentRevision(this.config.RENDER_GIT_COMMIT)}.`
           + `\nPesquisa Brave: ${this.config.JARVIS_SEARCH_API_KEY ? 'chave configurada; verificar execução' : 'sem chave configurada'}.`
-          + `\n${pages[0]}`);
-        for (const content of pages.slice(1)) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+          );
+        for (const content of [this.evidence.summary(), ...pages]) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
         if (probe) await interaction.followUp({ content: probe.slice(0, 1750), flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
         return;
       }
@@ -534,7 +543,7 @@ export class JarvisBot {
       this.room = room;
       connection.on('stateChange', (_oldState, state) => {
         if (state.status === VoiceConnectionStatus.Destroyed && this.room === room) this.reset('connection_destroyed');
-        else if (this.room === room && state.status === VoiceConnectionStatus.Disconnected) {
+        else if (this.room === room && state.status !== VoiceConnectionStatus.Ready) {
           for (const abort of room.interruptions.values()) abort.abort();
           room.interruptions.clear();
           room.echo.clear();
@@ -640,7 +649,9 @@ export class JarvisBot {
     if (this.closed) return;
     this.closed = true;
     this.reset('shutdown');
-    await this.client.destroy();
-    this.logger.event('jarvis_stopped');
+    try {
+      await this.client.destroy();
+      this.logger.event('jarvis_stopped');
+    } finally { this.evidence.close(); }
   }
 }

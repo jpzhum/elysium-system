@@ -8,6 +8,8 @@ export interface CaptureTiming {
   readonly captureId?: string;
   readonly captureStartedAtMs?: number;
   readonly captureEndedAtMs?: number;
+  /** Last received PCM frame classified as voice; not a remote acoustic measurement. */
+  readonly speechEndedAtMs?: number;
 }
 
 interface Window {

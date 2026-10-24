@@ -162,6 +162,18 @@ function statusCode(status: number): string {
   return 'agent_unavailable';
 }
 
+/** RFC 9110: delay-seconds or HTTP-date; never shorten a provider's requested pause. */
+function retryAfterMilliseconds(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  // All three HTTP-date representations begin with a weekday. Reject numeric
+  // garbage instead of letting Date.parse reinterpret it as a calendar date.
+  if (!/^[A-Za-z]{3}/.test(trimmed)) return undefined;
+  const timestamp = Date.parse(trimmed);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : undefined;
+}
+
 function abortableSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(new AgentError('agent_aborted')); return; }
@@ -234,10 +246,11 @@ async function getSignedUrl(options: ConnectAgentOptions, deps: AgentDependencie
       // Never parse, propagate or log an upstream error body or signed URL.
       void response.body?.cancel().catch(() => { /* Upstream error bodies are discarded. */ });
       if (attempt < 2 && (response.status === 429 || (response.status >= 500 && response.status <= 599))) {
-        const retryAfter = Number(response.headers.get('retry-after'));
-        const delay = Number.isFinite(retryAfter) && retryAfter > 0
-          ? Math.min(retryAfter * 1000, 2000)
-          : 250 * 2 ** attempt * (0.5 + deps.random() * 0.5);
+        const retryAfter = retryAfterMilliseconds(response.headers.get('retry-after'));
+        // Keep the existing two-second wait ceiling without retrying earlier
+        // than the provider permits or extending a voice turn's opening delay.
+        if (retryAfter !== undefined && retryAfter > 2000) throw new AgentError(statusCode(response.status));
+        const delay = retryAfter ?? 250 * 2 ** attempt * (0.5 + deps.random() * 0.5);
         await deps.sleep(delay, options.signal);
         continue;
       }

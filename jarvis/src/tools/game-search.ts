@@ -39,6 +39,18 @@ export interface GameSearchOptions {
 const DEFAULT_TIMEOUT_MS = 5000;
 const UNAVAILABLE = 'Não consegui concluir a pesquisa desta vez, senhor. Posso tentar novamente.';
 
+/** RFC 9110 allows delay-seconds or an HTTP date. Never retain the provider header. */
+function retryAfterSeconds(value: string | null, now: number): number | undefined {
+  if (value === null) return undefined;
+  const normalized = value.trim();
+  if (/^\d+$/.test(normalized)) {
+    const seconds = Number(normalized);
+    return Number.isFinite(seconds) ? seconds : undefined;
+  }
+  const date = Date.parse(normalized);
+  return Number.isFinite(date) ? Math.max(0, (date - now) / 1000) : undefined;
+}
+
 /** One instance per worker: at most one request in flight and one start per second. */
 export function createGameSearch(options: GameSearchOptions): (
   game: string, query: string, signal?: AbortSignal,
@@ -69,8 +81,8 @@ export function createGameSearch(options: GameSearchOptions): (
     nextRequestSource = 'worker_interval';
     try {
       return report(await performSearch(game, query, options.apiKey, signal, response => {
-        // Honor all quota windows reported by Brave without retaining headers or
-        // waiting/retrying inside an active conversational turn. Bound corrupt values.
+        // Brave reports seconds until reset for each quota window, including monthly
+        // quotas. Keep only a timestamp, without a timer or retry inside the turn.
         const remaining = response.headers.get('x-ratelimit-remaining')?.split(',');
         const resets = response.headers.get('x-ratelimit-reset')?.split(',');
         const waits = (remaining ?? []).flatMap((value, index) => {
@@ -78,11 +90,11 @@ export function createGameSearch(options: GameSearchOptions): (
           return value.trim() === '0' && Number.isFinite(reset) && reset > 0 ? [reset] : [];
         });
         if (response.status === 429) {
-          const retry = Number(response.headers.get('retry-after'));
-          waits.push(Number.isFinite(retry) && retry > 0 ? retry : 5);
+          waits.push(retryAfterSeconds(response.headers.get('retry-after'), Date.now()) ?? 5);
         }
         if (waits.length) {
-          nextRequestAt = Math.max(nextRequestAt, Date.now() + Math.min(120, Math.max(...waits)) * 1000);
+          // Saturate arithmetic instead of shortening a valid provider cooldown.
+          nextRequestAt = Math.max(nextRequestAt, Math.min(Number.MAX_SAFE_INTEGER, Date.now() + Math.max(...waits) * 1000));
           nextRequestSource = response.status === 429 ? 'provider_429' : 'provider_quota';
         }
       }, options.timeoutMs));

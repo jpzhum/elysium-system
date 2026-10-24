@@ -31,6 +31,8 @@ const schema = z.object({
   JARVIS_SEARCH_API_KEY: z.string().trim().min(1).optional(),
   JARVIS_SEARCH_TIMEOUT_MS: integer(5000, 1000, 15000),
   JARVIS_LOG_LEVEL: z.enum(['info', 'warn', 'error']).default('info'),
+  // Render supplies this automatically. Never derive a deployment revision from local HEAD.
+  RENDER_GIT_COMMIT: z.string().trim().regex(/^[a-f0-9]{7,40}$/i).transform(value => value.toLowerCase()).optional(),
 });
 
 export type Config = z.infer<typeof schema> & { readonly daveSmoke: boolean };

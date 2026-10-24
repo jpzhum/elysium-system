@@ -128,7 +128,7 @@ test('capture and end-of-speech latency are numeric and a barge-in retains its p
   await vi.advanceTimersByTimeAsync(600);
   stream.emit('end');
   expect(h.delivered[0]!.timing).toMatchObject({ duringPlayback: true, captureMs: 640, endDetectionMs: 600,
-    captureStartedAtMs: 0, captureEndedAtMs: 640 });
+    captureStartedAtMs: 0, captureEndedAtMs: 640, speechEndedAtMs: 40 });
   expect(h.delivered[0]!.timing.captureId).toMatch(/:1$/);
   expect(h.metric).toHaveBeenCalledWith('voice_capture_ms', 640);
   expect(h.metric).toHaveBeenCalledWith('voice_capture_active_ms', 40);

@@ -147,21 +147,60 @@ describe('game search', () => {
     expect(JSON.stringify(diagnostics.mock.calls)).not.toMatch(/key-secret|private-query|example.com|Evidence/);
   });
 
-  it('honors Brave quota windows and bounded 429 cooldown without automatic retries', async () => {
+  it('honors the longest Brave quota window without truncating a monthly cooldown or retrying', async () => {
     vi.useFakeTimers();
     const request = vi.fn<typeof fetch>().mockResolvedValue(new Response('private upstream body', {
-      status: 429, headers: { 'x-ratelimit-remaining': '0, 0', 'x-ratelimit-reset': '1, 99999999', 'retry-after': '10' },
+      status: 429, headers: { 'x-ratelimit-remaining': '0, 0', 'x-ratelimit-reset': '1, 1419704', 'retry-after': '10' },
     }));
     vi.stubGlobal('fetch', request);
     const search = createGameSearch({ apiKey: 'secret' });
     expect(await search('Game', 'quest')).toMatchObject({ status: 'rate_limited', rate_limit_source: 'provider_429' });
-    await vi.advanceTimersByTimeAsync(119_999);
+    await vi.advanceTimersByTimeAsync(120_000);
     expect(await search('Game', 'quest')).toMatchObject({ status: 'rate_limited', rate_limit_source: 'provider_429' });
+    expect(request).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_419_704_000 - 120_001);
+    expect((await search('Game', 'quest')).status).toBe('rate_limited');
+    await vi.advanceTimersByTimeAsync(1);
+    request.mockResolvedValue(new Response('{}'));
+    expect((await search('Game', 'quest')).status).toBe('no_sources');
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('honors Retry-After HTTP dates without waiting inside the conversational tool', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-24T12:00:00Z'));
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response('discarded', {
+      status: 429, headers: { 'retry-after': 'Sat, 24 Oct 2026 12:05:00 GMT' },
+    }));
+    vi.stubGlobal('fetch', request);
+    const search = createGameSearch({ apiKey: 'secret' });
+    expect((await search('Game', 'quest')).status).toBe('rate_limited');
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(299_999);
+    expect((await search('Game', 'quest')).status).toBe('rate_limited');
     expect(request).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1);
     request.mockResolvedValue(new Response('{}'));
     expect((await search('Game', 'quest')).status).toBe('no_sources');
     expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to a short cooldown for invalid Retry-After without persisting provider text', async () => {
+    vi.useFakeTimers();
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response('discarded', {
+      status: 429, headers: { 'retry-after': 'private-invalid-provider-value' },
+    }));
+    vi.stubGlobal('fetch', request);
+    const diagnostics = vi.fn();
+    const search = createGameSearch({ apiKey: 'secret', onDiagnostic: diagnostics });
+    expect((await search('Game', 'quest')).status).toBe('rate_limited');
+    await vi.advanceTimersByTimeAsync(4999);
+    expect((await search('Game', 'quest')).status).toBe('rate_limited');
+    expect(request).toHaveBeenCalledOnce();
+    expect(JSON.stringify(diagnostics.mock.calls)).not.toContain('private-invalid-provider-value');
+    await vi.advanceTimersByTimeAsync(1);
+    request.mockResolvedValue(new Response('{}'));
+    expect((await search('Game', 'quest')).status).toBe('no_sources');
   });
 
   it('distinguishes a successful provider quota cooldown from HTTP 429 without spending extra requests', async () => {

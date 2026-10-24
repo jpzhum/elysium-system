@@ -3,6 +3,18 @@ import { loadConfig, ConfigError } from '../src/config.js';
 
 const base = { JARVIS_DISCORD_TOKEN: 'fictional-discord-token-for-tests', JARVIS_OWNER_USER_ID: '100000000000000001',
   JARVIS_GUILD_ID: '100000000000000002', ELEVENLABS_AGENT_ID: 'agent_test', ELEVENLABS_API_KEY: 'fictional-api-key' };
+test('Render revision is optional validated metadata and cannot leak arbitrary environment content', () => {
+  expect(loadConfig(base).RENDER_GIT_COMMIT).toBeUndefined();
+  expect(loadConfig({ ...base, RENDER_GIT_COMMIT: 'CFCdd03' }).RENDER_GIT_COMMIT).toBe('cfcdd03');
+  try {
+    loadConfig({ ...base, RENDER_GIT_COMMIT: 'PRIVATE https://signed' });
+    throw new Error('unexpected');
+  } catch (error) {
+    expect(error).toBeInstanceOf(ConfigError);
+    expect((error as Error).message).toContain('RENDER_GIT_COMMIT');
+    expect((error as Error).message).not.toMatch(/PRIVATE|signed/);
+  }
+});
 test('default is no voice capture; Elysium variables are unrelated', () => {
   expect(loadConfig(base).JARVIS_SUPPRESS_FIRST_MESSAGE).toBe(true);
   expect(loadConfig(base).JARVIS_VOICE_INPUT).toBe('disabled');

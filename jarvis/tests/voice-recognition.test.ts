@@ -112,6 +112,40 @@ function utterance(): Buffer {
 afterEach(() => { for (const manager of managers.splice(0)) manager.close(); vi.useRealTimers(); });
 
 describe('voice recognition fences initial agent greetings', () => {
+  test('measures the same turn from its last voiced PCM frame to the first local playback packet', async () => {
+    vi.useFakeTimers();
+    const h = harness({ detectWake: async () => { vi.advanceTimersByTime(75); return true; } });
+    vi.advanceTimersByTime(1_000);
+    await h.manager.voiceTurn(h.speaker(), utterance(), {
+      captureMs: 900, endDetectionMs: 200,
+      captureStartedAtMs: 100, captureEndedAtMs: 1_000, speechEndedAtMs: 800,
+    });
+    await settle();
+    vi.advanceTimersByTime(425);
+    const cb = h.callbacks.get('guest')!;
+    cb.onUserTranscript?.({ eventId: 10 });
+    await cb.onAudio(Buffer.alloc(480, 1), 11);
+    expect(h.metric).toHaveBeenCalledWith('speech_end_to_first_packet_ms', 700);
+    expect(h.metric).toHaveBeenCalledWith('agent_end_to_end_first_playback_ms', 1_400);
+    vi.advanceTimersByTime(200);
+    await cb.onAudio(Buffer.alloc(480, 1), 12);
+    expect(h.metric.mock.calls.filter(([name]) => name === 'speech_end_to_first_packet_ms')).toHaveLength(1);
+  });
+
+  test('omits speech-end latency when capture timing is impossible', async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    await h.manager.voiceTurn(h.speaker(), utterance(), {
+      captureMs: 0, endDetectionMs: 0,
+      captureStartedAtMs: 0, captureEndedAtMs: 0, speechEndedAtMs: 1_000,
+    });
+    await settle();
+    const cb = h.callbacks.get('guest')!;
+    cb.onUserTranscript?.({ eventId: 10 });
+    await cb.onAudio(Buffer.alloc(480, 1), 11);
+    expect(h.metric).not.toHaveBeenCalledWith('speech_end_to_first_packet_ms', expect.any(Number));
+  });
+
   test('sub-frame, silent and cancelling stereo captures cannot buy wake detection or a session, including follow-ups', async () => {
     const h = harness(); const speaker = h.speaker();
     await h.manager.ask(speaker, 'Primeira pergunta'); await settle();

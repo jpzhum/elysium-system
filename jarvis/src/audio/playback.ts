@@ -60,6 +60,8 @@ interface Playback {
   settled: boolean;
   consumedChunks: number;
   packetChunks: WeakMap<Buffer, number>;
+  encodeAttempts: number;
+  encodeMs: number;
 }
 
 class PlaybackCancelledError extends Error {
@@ -144,9 +146,12 @@ export class PlaybackQueue {
       this.connectionFailure('VOICE_DESTROYED', next.status);
       this.stop();
     }
-    else if (next.status === VoiceConnectionStatus.Disconnected) {
+    else if (next.status !== VoiceConnectionStatus.Ready) {
+      // The pinned voice library can go Ready -> Signalling -> Connecting
+      // without emitting Disconnected. Fence that transport replacement too;
+      // accepted responses are cancelled once and never replayed after recovery.
       this.disconnected = true;
-      this.connectionFailure('VOICE_DISCONNECTED', next.status);
+      this.connectionFailure(next.status === VoiceConnectionStatus.Disconnected ? 'VOICE_DISCONNECTED' : 'VOICE_NOT_READY', next.status);
       this.cancelAll();
     } else if (next.status === VoiceConnectionStatus.Ready) this.disconnected = false;
   };
@@ -203,6 +208,14 @@ export class PlaybackQueue {
   get isAudible(): boolean { return this.active !== undefined && !this.active.drained; }
   get currentStreamToken(): number | undefined { return this.active?.token; }
 
+  /** Local readiness only: neither a Ready transport nor consumed PCM proves remote audibility. */
+  get diagnosticState(): Readonly<DiagnosticFields & { available: boolean; stopped: boolean }> {
+    const fields = this.snapshot(this.active);
+    return Object.freeze({ ...fields, stopped: this.stopped,
+      available: !this.stopped && !this.disconnected && fields.voice_status === VoiceConnectionStatus.Ready &&
+        fields.subscribed === true && fields.dave_ready !== false });
+  }
+
   startStream(userId: string, sampleRate: number, isOwner: boolean,
     options: PlaybackStreamOptions = {}): PlaybackStream {
     if (this.stopped) this.rejectStart('Fila de áudio encerrada.', 'PLAYBACK_QUEUE_CLOSED', options, true);
@@ -222,7 +235,7 @@ export class PlaybackQueue {
     const item: Playback = {
       token: ++this.streamSequence,
       userId, isOwner, resolve, reject, finished: false, settled: false,
-      consumedChunks: 0, packetChunks: new WeakMap(),
+      consumedChunks: 0, packetChunks: new WeakMap(), encodeAttempts: 0, encodeMs: 0,
       created: performance.now(), firstPacket: false, drained: false, onProgress: options.onProgress,
       onDiagnostic: options.onDiagnostic,
       allowed: () => !this.stopped && !this.disconnected && !item.settled && (options.isAllowed?.() ?? true),
@@ -338,10 +351,15 @@ export class PlaybackQueue {
           if (!item.allowed()) throw new PlaybackCancelledError();
           this.options.onPcmFrame?.(frame);
           const encodingStarted = performance.now();
+          item.encodeAttempts++;
           let packet: Buffer;
           try { packet = codec.encode(frame, 960); }
           catch (error) { throw this.failure(item, error, 'opus_encode', 'PLAYBACK_ENCODER_FAILED', 'Falha ao codificar reprodução.'); }
-          this.options.onMetric?.('opus_encode_ms', Math.max(0, performance.now() - encodingStarted));
+          finally {
+            const encodingMs = Math.max(0, performance.now() - encodingStarted);
+            item.encodeMs += encodingMs;
+            this.options.onMetric?.('opus_encode_ms', encodingMs);
+          }
           item.packetChunks.set(packet, item.consumedChunks);
           item.consumedChunks = 0;
           yield packet;
@@ -355,6 +373,9 @@ export class PlaybackQueue {
     if (item.settled) return;
     item.settled = true;
     item.failure = error;
+    // CPU spent attempting this resource's frames, including a failed attempt.
+    // No sample is invented for resources cancelled before encoding starts.
+    if (item.encodeAttempts > 0) this.observe(item, { playback_stage: 'opus_encode', opus_encode_ms: item.encodeMs });
     if (error instanceof PlaybackFailure) this.observe(item, error.details);
     if (item.deadline) clearTimeout(item.deadline);
     if (item.drainTimer) clearTimeout(item.drainTimer);
@@ -441,7 +462,7 @@ export class PlaybackQueue {
     });
   }
 
-  private connectionFailure(code: 'VOICE_DESTROYED' | 'VOICE_DISCONNECTED',
+  private connectionFailure(code: 'VOICE_DESTROYED' | 'VOICE_DISCONNECTED' | 'VOICE_NOT_READY',
     status: DiagnosticFields['voice_status']): void {
     for (const item of [...this.waiting, ...(this.active ? [this.active] : [])]) {
       this.observe(item, { ...this.snapshot(item), voice_status: status,

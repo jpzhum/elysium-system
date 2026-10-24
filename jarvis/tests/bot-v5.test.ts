@@ -96,7 +96,7 @@ async function setup() {
   const config = loadConfig({ JARVIS_DISCORD_TOKEN: 'fictional-discord-token-for-v5-tests',
     JARVIS_OWNER_USER_ID: OWNER, JARVIS_GUILD_ID: GUILD,
     ELEVENLABS_API_KEY: 'fictional-elevenlabs-key', ELEVENLABS_AGENT_ID: 'fictional-agent',
-    JARVIS_VOICE_INPUT: 'elevenlabs-stt' });
+    JARVIS_VOICE_INPUT: 'elevenlabs-stt', RENDER_GIT_COMMIT: 'cfcdd03' });
   const logs: Record<string, unknown>[] = [];
   const bot = new JarvisBot(config, new Logger('info', line => logs.push(JSON.parse(line))));
   active.push(bot);
@@ -122,9 +122,9 @@ async function setup() {
   addMember(OWNER); addMember(GUEST); addMember(BOT, 'Jarvis', true);
   const interaction = (command: string, userId = OWNER, audio = false, group?: string) => {
     let deferred = false;
-    const reply = vi.fn(async () => undefined);
-    const editReply = vi.fn(async () => undefined);
-    const followUp = vi.fn(async () => undefined);
+    const reply = vi.fn(async (_payload: { content: string; flags?: number }) => undefined);
+    const editReply = vi.fn(async (_payload: { content: string; flags?: number }) => undefined);
+    const followUp = vi.fn(async (_payload: { content: string; flags?: number }) => undefined);
     const input = { inCachedGuild: () => true, guildId: GUILD, guild, user: { id: userId }, member: members.get(userId),
       options: { getSubcommand: () => command, getSubcommandGroup: () => group,
         getString: () => privateText, getBoolean: () => audio },
@@ -166,6 +166,24 @@ afterEach(async () => {
 });
 
 describe('V5 Discord integration with the real per-speaker session manager', () => {
+  test('status separates current connection from last technical failure and process outcomes without private content', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER).run();
+    await h.ask();
+    hooks.providers[0]!.options.callbacks.onError('agent_transport_error');
+    await settle();
+    const status = h.interaction('status');
+    await status.run();
+    const pages = [...status.reply.mock.calls, ...status.followUp.mock.calls].map(call => Reflect.get(call[0] as object, 'content') as string);
+    expect(pages[0]).toContain('voz Discord: ready');
+    expect(pages[0]).toContain('Revisão Render: cfcdd03');
+    expect(pages.join('\n')).toContain('AGENT_TRANSPORT_ERROR');
+    expect(pages.join('\n')).toContain('desde o início: n=1; confirmados=0; não confirmados=0; falhos=1; cancelados=0');
+    expect(pages.join('\n')).not.toMatch(/conteúdo privado|Mesmo nome|100000000000000|fictional|Canal privado/);
+    expect(pages.every(page => page.length <= 2000)).toBe(true);
+    expect([...status.reply.mock.calls, ...status.followUp.mock.calls].every(call => Reflect.get(call[0] as object, 'flags') === 64)).toBe(true);
+  });
+
   test('owner text and guest microphone inject all variables without display-name authority or last-writer identity', async () => {
     const h = await setup();
     await h.interaction('consent', OWNER).run();
@@ -258,7 +276,8 @@ describe('V5 Discord integration with the real per-speaker session manager', () 
     expect(hooks.providers.at(-1)!.session.sendText).toHaveBeenCalledWith(privateText);
   });
 
-  test('transient transport loss keeps individual consent, whereas destruction requires renewed authorization', async () => {
+  test.each([VoiceConnectionStatus.Disconnected, VoiceConnectionStatus.Signalling, VoiceConnectionStatus.Connecting])(
+    'transient %s keeps individual consent and suspends sessions until Ready', async unavailable => {
     const h = await setup();
     await h.interaction('consent', OWNER, true).run(); await h.interaction('consent', GUEST, true).run();
     const ownerConsent = h.room.consent.get(OWNER)!;
@@ -269,7 +288,7 @@ describe('V5 Discord integration with the real per-speaker session manager', () 
       const before = h.connection.state;
       Object.assign(h.connection, { state: { status } }); h.connection.emit('stateChange', before, h.connection.state);
     };
-    transition(VoiceConnectionStatus.Disconnected); await settle();
+    transition(unavailable); await settle();
     expect(original.session.close).toHaveBeenCalled();
     expect(h.access.room).toBe(h.room);
     expect(h.room.consent.get(OWNER)).toBe(ownerConsent);

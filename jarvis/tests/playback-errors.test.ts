@@ -93,6 +93,12 @@ test('encoder exception keeps its reviewed Opus code and stage, without upstream
     });
     const errors = events.filter(fields => fields.code);
     assert.equal(errors.length, 1);
+    const totals = events.filter(fields => fields.opus_encode_ms !== undefined);
+    assert.equal(totals.length, 1);
+    assert.equal(totals[0]!.playback_stage, 'opus_encode');
+    assert.equal(totals[0]!.code, undefined);
+    assert.equal(totals[0]!.opus_encode_ms, metrics.opus_encode_ms);
+    assert.ok(Number.isFinite(totals[0]!.opus_encode_ms) && totals[0]!.opus_encode_ms! >= 0);
     assert.equal(errors[0]!.voice_status, 'ready');
     assert.equal(errors[0]!.subscribed, true);
     assert.doesNotMatch(JSON.stringify(events), /PRIVATE|Internal error/);
@@ -167,6 +173,43 @@ test('initial disconnected connection fails immediately even without a new state
   } finally { queue.stop(); }
 });
 
+test.each(['signalling', 'connecting'])('transport %s suspends playback even without a Disconnected event', async status => {
+  const { queue, player, connection, metrics } = setup();
+  const events: DiagnosticFields[] = [];
+  const first = queue.startStream('a', 16_000, false, { onDiagnostic: fields => { events.push(fields); } });
+  const waiting = queue.startStream('b', 16_000, false);
+  await first.write(Buffer.alloc(1_280));
+  await waiting.write(Buffer.alloc(1_280));
+  const old = player.state.status === AudioPlayerStatus.Idle ? undefined : player.state.resource;
+  assert.ok(old);
+  const before = { ...connection.state };
+  connection.state.status = status;
+  connection.emit('stateChange', before, connection.state);
+  try {
+    assert.equal(player.state.status, AudioPlayerStatus.Idle);
+    await assert.rejects(first.done);
+    await assert.rejects(waiting.done);
+    assert.equal(metrics.playback_cancelled, 2);
+    assert.equal(metrics.audio_stream_buffer_bytes, 0);
+    assert.equal(queue.isPlaying, false);
+    assert.equal(events.filter(fields => fields.code === 'VOICE_NOT_READY').length, 1);
+    assert.throws(() => queue.startStream('c', 16_000, false), error => {
+      assert.equal(playbackFailureFields(error).code, 'VOICE_NOT_READY');
+      return true;
+    });
+    connection.state.status = 'ready';
+    connection.emit('stateChange', { status }, connection.state);
+    const recovered = queue.startStream('c', 16_000, false);
+    await recovered.write(Buffer.alloc(1_280));
+    old.playStream.emit('error', new Error('PRIVATE old response'));
+    await tick();
+    assert.equal(queue.isPlaying, true);
+    assert.equal(metrics.playback_started, 2); // Only A and the newly requested C; never replay A/B.
+    recovered.cancel();
+    await assert.rejects(recovered.done);
+  } finally { queue.stop(); }
+});
+
 test('cancelling an encoder waiting for more PCM disposes it exactly once', async () => {
   const { queue } = setup();
   const disposal = vi.spyOn(OpusScript.prototype, 'delete');
@@ -207,6 +250,27 @@ test('playback diagnostics preserve unready DAVE independently of a ready connec
   } finally { queue.stop(); }
 });
 
+test('local playback readiness requires its current subscription and reports DAVE separately from Ready', () => {
+  const { queue, connection, metrics } = setup();
+  assert.equal(queue.diagnosticState.available, true);
+  assert.equal(queue.diagnosticState.player_status, AudioPlayerStatus.Idle);
+  assert.equal(queue.diagnosticState.subscribed, true);
+  const subscription = connection.state.subscription;
+  connection.state.subscription = undefined;
+  assert.equal(queue.diagnosticState.available, false);
+  connection.state.subscription = subscription;
+  Object.assign(connection.state, { networking: { state: { code: 4,
+    dave: { protocolVersion: 1, session: { ready: false } } } } });
+  assert.equal(queue.diagnosticState.voice_status, 'ready');
+  assert.equal(queue.diagnosticState.available, false);
+  assert.equal(queue.diagnosticState.dave_ready, false);
+  assert.equal(metrics.playback_started, undefined);
+  assert.equal(metrics.playback_completed, undefined);
+  queue.stop();
+  assert.equal(queue.diagnosticState.available, false);
+  assert.equal(queue.diagnosticState.stopped, true);
+});
+
 test('a 33884-byte PCM16 mono chunk at 16 kHz encodes into 53 valid Discord packets', async () => {
   const { queue, player, metrics } = setup();
   const decoder = new OpusDecoder();
@@ -229,4 +293,40 @@ test('a 33884-byte PCM16 mono chunk at 16 kHz encodes into 53 valid Discord pack
     assert.equal(metrics.playback_failed, undefined);
     assert.equal(metrics.audio_stream_buffer_bytes, 0);
   } finally { decoder.delete(); queue.stop(); }
+});
+
+test('Opus CPU totals stay with each resource and are emitted once without claiming audibility', async () => {
+  const { queue, player, metrics } = setup();
+  const observed: DiagnosticFields[][] = [[], []];
+  try {
+    const untouched = queue.startStream('cancelled-in-queue', 16_000, false, {
+      onDiagnostic: fields => { observed[0]!.push(fields); },
+    });
+    untouched.cancel();
+    await assert.rejects(untouched.done);
+    assert.equal(observed[0]!.length, 0); // No attempted frame means no fabricated zero-time sample.
+    for (let index = 0; index < 2; index++) {
+      const stream = queue.startStream(`speaker-${index}`, 16_000, false, {
+        onDiagnostic: fields => { observed[index]!.push(fields); },
+      });
+      await stream.write(Buffer.alloc(1_280));
+      stream.end();
+      const resource = player.state.status === AudioPlayerStatus.Idle ? undefined : player.state.resource;
+      assert.ok(resource);
+      for await (const value of resource.playStream) assert.ok(Buffer.isBuffer(value));
+      player.stop(true);
+      await stream.done;
+      stream.cancel(); stream.end(); // Repeated termination cannot emit another subtotal.
+      await tick();
+      const totals = observed[index]!.filter(fields => fields.opus_encode_ms !== undefined);
+      assert.equal(totals.length, 1);
+      assert.equal(totals[0]!.playback_stage, 'opus_encode');
+      assert.equal(totals[0]!.code, undefined);
+      assert.equal(totals[0]!.playback_drained, undefined);
+      assert.ok(Number.isFinite(totals[0]!.opus_encode_ms) && totals[0]!.opus_encode_ms! >= 0);
+    }
+    const total = observed.flat().reduce((sum, fields) => sum + (fields.opus_encode_ms ?? 0), 0);
+    assert.ok(Math.abs(total - metrics.opus_encode_ms!) < 1e-6);
+    assert.equal(metrics.playback_completed, 2);
+  } finally { queue.stop(); }
 });

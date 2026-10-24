@@ -60,16 +60,21 @@ export interface TurnNotification {
 }
 interface TurnRequest {
   id: string;
+  inputKind: 'voice' | 'text';
   speaker: SpeakerContext;
   receivedAt: number;
   /** Monotonic timestamp supplied by this process's Discord capture, never wall time. */
   captureStartedAt?: number;
+  speechEndedAt?: number;
+  wakeMs?: number;
+  connectMs?: number;
   dispatchAt?: number;
   text?: string;
   pcm?: Buffer;
   timer?: ReturnType<typeof setTimeout>;
   cancelled: boolean;
   queuedNotified?: boolean;
+  terminalNotified?: boolean;
   notify?: (event: TurnNotification) => void | Promise<void>;
 }
 interface Entry {
@@ -216,7 +221,8 @@ export class SessionManager {
     notify?: (event: TurnNotification) => void | Promise<void>): Promise<TurnReceipt> {
     if (!text.trim() || text.length > 1800) throw new SessionError('limit');
     this.assertAllowed(speaker);
-    return this.enqueue({ id: newIncident(), speaker, text, notify, receivedAt: performance.now(), cancelled: false });
+    return this.enqueue({ id: newIncident(), inputKind: 'text', speaker, text, notify,
+      receivedAt: performance.now(), cancelled: false });
   }
 
   async voiceTurn(speaker: SpeakerContext, pcm: Buffer, timing?: CaptureTiming): Promise<TurnReceipt | undefined> {
@@ -262,6 +268,7 @@ export class SessionManager {
         && existing.followupUntil > Date.now()) || (prior && prior.consentVersion === speaker.consentVersion
           && prior.channelId === speaker.channelId && prior.until > Date.now());
       const wakeStart = performance.now();
+      let wakeMs: number | undefined;
       if (!followup) {
         let activated: boolean;
         try { activated = await this.options.detectWake(owned, abort.signal); }
@@ -273,7 +280,8 @@ export class SessionManager {
           });
           throw error;
         }
-        this.options.metric?.('wake_detection_ms', Math.round(performance.now() - wakeStart));
+        wakeMs = Math.max(0, Math.round(performance.now() - wakeStart));
+        this.options.metric?.('wake_detection_ms', wakeMs);
         // Cancellation settles the detector as false; it is not evidence that
         // consenting speech was inspected and lacked the wake word.
         if (abort.signal.aborted) return;
@@ -287,12 +295,17 @@ export class SessionManager {
       const receivedAt = performance.now();
       const captureStart = timing?.captureStartedAtMs;
       const captureEnd = timing?.captureEndedAtMs;
+      const speechEnd = timing?.speechEndedAtMs;
       const trustedCaptureTime = captureStart !== undefined && captureEnd !== undefined
         && Number.isFinite(captureStart) && Number.isFinite(captureEnd)
         && captureStart >= 0 && captureEnd >= captureStart && captureEnd <= receivedAt
         && receivedAt - captureStart <= 120_000;
-      const request: TurnRequest = { id: incident, speaker, pcm: owned,
-        receivedAt, cancelled: false, ...(trustedCaptureTime ? { captureStartedAt: captureStart } : {}) };
+      const trustedSpeechEnd = trustedCaptureTime && speechEnd !== undefined && Number.isFinite(speechEnd)
+        && speechEnd >= captureStart! && speechEnd <= captureEnd!;
+      const request: TurnRequest = { id: incident, inputKind: 'voice', speaker, pcm: owned,
+        receivedAt, cancelled: false, ...(trustedCaptureTime ? { captureStartedAt: captureStart } : {}),
+        ...(trustedSpeechEnd ? { speechEndedAt: speechEnd } : {}),
+        ...(wakeMs === undefined ? {} : { wakeMs }) };
       let receipt: TurnReceipt;
       try { receipt = this.enqueue(request); }
       catch (error) {
@@ -445,6 +458,16 @@ export class SessionManager {
     if (event.type === 'queued') {
       if (request.queuedNotified) return;
       request.queuedNotified = true;
+    }
+    if (event.type === 'cancelled' || event.type === 'failed') {
+      if (request.terminalNotified) return;
+      request.terminalNotified = true;
+      if (event.type === 'cancelled') this.options.logger?.event('jarvis_agent_turn_cancelled', 'info', {
+        incident: request.id, operation: 'agent_turn',
+        stage: request.dispatchAt === undefined ? 'turn_enqueue' : 'agent_response_wait',
+        turn_outcome: 'cancelled', input_kind: request.inputKind,
+        queue_depth: this.queue.length,
+      });
     }
     const notification = { ...event, turnId: request.id };
     try { void Promise.resolve(request.notify ? request.notify(notification)
@@ -602,7 +625,8 @@ export class SessionManager {
       current.session = session;
       current.opening = undefined;
       this.options.metric?.('agent_sessions_started');
-      this.options.metric?.('agent_session_open_ms', Math.round(performance.now() - startedAt));
+      request.connectMs = Math.max(0, Math.round(performance.now() - startedAt));
+      this.options.metric?.('agent_session_open_ms', request.connectMs);
       this.report(current, 'jarvis_agent_session_ready');
       this.idle(current);
       return current;
@@ -921,6 +945,8 @@ export class SessionManager {
         Math.max(0, now - entry.firstAudioAt));
       if (entry.request?.captureStartedAt !== undefined) this.options.metric?.('agent_end_to_end_first_playback_ms',
         Math.max(0, Math.round(now - entry.request.captureStartedAt)));
+      if (entry.request?.speechEndedAt !== undefined) this.options.metric?.('speech_end_to_first_packet_ms',
+        Math.max(0, Math.round(now - entry.request.speechEndedAt)));
     }
     if (event === 'drained') {
       entry.localDrained = true;
@@ -980,6 +1006,7 @@ export class SessionManager {
       Math.round(performance.now() - entry.drainedAt));
     if (entry.lastAudioAt !== undefined) this.options.metric?.('agent_last_audio_ms',
       Math.round(entry.lastAudioAt - entry.turnStarted));
+    this.report(entry, 'jarvis_agent_turn_released');
     this.active = undefined;
     entry.request = undefined;
     queueMicrotask(() => this.pump());
@@ -1065,10 +1092,25 @@ export class SessionManager {
       ...(entry.request?.dispatchAt === undefined ? {} : {
         question_wait_ms: Math.round(entry.request.dispatchAt - entry.request.receivedAt),
       }),
+      ...(entry.request?.wakeMs === undefined ? {} : { wake_detection_ms: entry.request.wakeMs }),
+      ...(entry.request?.connectMs === undefined ? {} : { agent_connect_ms: entry.request.connectMs }),
       ...(entry.firstAudioAt === undefined ? {} : { first_audio_ms: Math.round(entry.firstAudioAt - entry.turnStarted) }),
+      ...(entry.firstAudioAt === undefined || entry.inputFinishedAt === undefined
+        || entry.firstAudioAt < entry.inputFinishedAt ? {} : {
+          remote_first_audio_ms: Math.round(entry.firstAudioAt - entry.inputFinishedAt),
+        }),
       ...(entry.lastAudioAt === undefined ? {} : { last_audio_ms: Math.round(entry.lastAudioAt - entry.turnStarted) }),
       ...(entry.firstPlaybackAt === undefined ? {} : { first_playback_ms: Math.round(entry.firstPlaybackAt - entry.turnStarted) }),
+      ...(entry.firstPlaybackAt === undefined || entry.firstAudioAt === undefined ? {} : {
+        playback_start_ms: Math.max(0, Math.round(entry.firstPlaybackAt - entry.firstAudioAt)),
+      }),
+      ...(entry.firstPlaybackAt === undefined || entry.request?.speechEndedAt === undefined ? {} : {
+        speech_end_to_first_packet_ms: Math.max(0, Math.round(entry.firstPlaybackAt - entry.request.speechEndedAt)),
+      }),
       ...(entry.drainedAt === undefined ? {} : { drain_ms: Math.round(entry.drainedAt - entry.turnStarted) }),
+      ...(event !== 'jarvis_agent_turn_released' || entry.drainedAt === undefined ? {} : {
+        next_question_ready_ms: Math.max(0, Math.round(performance.now() - entry.drainedAt)),
+      }),
     });
   }
 
@@ -1101,6 +1143,10 @@ export class SessionManager {
       agent_transport_error: 'AGENT_TRANSPORT_ERROR', invalid_agent_event: 'AGENT_INVALID_EVENT',
       invalid_output_audio: 'AGENT_INVALID_EVENT', unsupported_audio_format: 'AGENT_AUDIO_FORMAT_UNSUPPORTED',
       agent_metadata_timeout: 'AGENT_METADATA_TIMEOUT', agent_credit_limit: 'AGENT_CREDIT_LIMIT',
+      agent_request_timeout: 'AGENT_REQUEST_TIMEOUT',
+      invalid_input_audio: 'AGENT_INPUT_INVALID', agent_send_failed: 'AGENT_INPUT_SEND_FAILED',
+      agent_connect_failed: 'AGENT_CONNECT_FAILED',
+      agent_closed: 'AGENT_PREMATURE_CLOSE', agent_closed_before_metadata: 'AGENT_PREMATURE_CLOSE',
       agent_rate_limited: 'AGENT_RATE_LIMITED', agent_authentication_failed: 'AGENT_AUTHENTICATION_FAILED',
       agent_callback_error: 'AGENT_CALLBACK_ERROR', agent_backpressure: 'AGENT_BACKPRESSURE',
       agent_audio_backpressure: 'AGENT_BACKPRESSURE',

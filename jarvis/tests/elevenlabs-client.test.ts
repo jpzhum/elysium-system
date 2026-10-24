@@ -465,11 +465,37 @@ describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
 
   it('retries transient HTTP failures with bounded delays and at most three requests', async () => {
     const h = harness();
-    h.request.mockReset().mockImplementation(async () => new Response('private', { status: 429, headers: { 'retry-after': '99999' } }));
+    h.request.mockReset().mockImplementation(async () => new Response('private', { status: 429, headers: { 'retry-after': '2' } }));
     await expect(h.connect()).rejects.toMatchObject({ code: 'agent_rate_limited' });
     expect(h.request).toHaveBeenCalledTimes(3);
     expect(h.sleep.mock.calls.map(call => call[0])).toEqual([2000, 2000]);
     expect(h.createSocket).not.toHaveBeenCalled();
+  });
+
+  it.each([429, 503])('does not shorten a long Retry-After or retry HTTP %s before the requested time', async status => {
+    const h = harness();
+    h.request.mockResolvedValueOnce(new Response('private', { status, headers: { 'retry-after': '99999' } }));
+    await expect(h.connect()).rejects.toMatchObject({ code: status === 429 ? 'agent_rate_limited' : 'agent_unavailable' });
+    expect(h.request).toHaveBeenCalledOnce();
+    expect(h.sleep).not.toHaveBeenCalled();
+    expect(h.createSocket).not.toHaveBeenCalled();
+  });
+
+  it.each([1, 60])('honors an HTTP-date Retry-After %s seconds ahead without extending the delay ceiling', async seconds => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.UTC(2026, 0, 1));
+    const h = harness();
+    h.request.mockResolvedValueOnce(new Response('private', { status: 429, headers: {
+      'retry-after': new Date(Date.now() + seconds * 1000).toUTCString(),
+    } }));
+    if (seconds <= 2) {
+      await h.connect();
+      expect(h.sleep).toHaveBeenCalledExactlyOnceWith(seconds * 1000, undefined);
+      expect(h.request).toHaveBeenCalledTimes(2);
+    } else {
+      await expect(h.connect()).rejects.toMatchObject({ code: 'agent_rate_limited' });
+      expect(h.request).toHaveBeenCalledOnce();
+      expect(h.sleep).not.toHaveBeenCalled();
+    }
   });
 
   it.each([

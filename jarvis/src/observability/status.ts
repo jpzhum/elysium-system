@@ -41,11 +41,13 @@ const durations = [
   ['agent_recognition_to_response_ms', 'Reconhecimento → sinal de resposta'],
   ['agent_recognition_to_first_audio_ms', 'Reconhecimento → primeiro áudio'],
   ['agent_audio_buffering_ms', 'Primeiro áudio → primeiro pacote local'],
+  ['speech_end_to_first_packet_ms', 'Fim da fala → primeiro pacote local (sem prova acústica)'],
   ['agent_end_to_end_first_playback_ms', 'Início da captura → primeiro pacote local'],
   ['agent_first_audio_ms', 'Pergunta → primeiro áudio'], ['pcm_conversion_ms', 'Conversão PCM por lote'],
   ['opus_encode_ms', 'Opus por frame'], ['agent_first_playback_ms', 'Pergunta → primeiro pacote local'],
   ['agent_playback_ms', 'Primeiro pacote local → drain'],
   ['next_question_ready_ms', 'Drain → próxima disponibilidade'], ['search_duration_ms', 'Pesquisa externa'],
+  ['agent_turn_logical_end_ms', 'Início do turno → liberação lógica'],
   ['short_memory_prepare_ms', 'Preparação do contexto curto'],
 ] as const;
 
