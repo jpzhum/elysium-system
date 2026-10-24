@@ -6,6 +6,11 @@ resposta audível de `/ask` em produção. A revisão V4 de turnos consecutivos,
 fila e voz experimental ainda exige validação real. Consulte
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) antes de operar.
 
+A revisão de estabilização V5.6, suas causas reproduzidas, métricas correlacionadas,
+gates reais e rollback estão em [Project Rebirth](docs/V56_PROJECT_REBIRTH.md).
+Validação local não comprova resolução dos incidentes históricos ou audição na
+revisão implantada. O agente publicado e a voz existente não foram alterados.
+
 Para falhas de `/join`, timeout de resposta ou ausência de som no Render, consulte
 [o roteiro de diagnóstico e validação audível](docs/RENDER_INCIDENTS.md).
 Para cinco perguntas consecutivas, voz consentida e barge-in, siga o
