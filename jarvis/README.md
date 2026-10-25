@@ -17,6 +17,12 @@ perto do TTL, além de testar conversas prolongadas com os mesmos recursos. Veja
 causas reproduzidas, admissão wake, gates, métricas e rollback. A revisão Render
 e o teste real no Discord continuam necessários para aprovar a implantação.
 
+A V5.8 acrescenta divisão da quota wake entre participantes consentidos, uma
+continuação por resposta e avisos privados sem repetição durante o cooldown.
+Veja [Confiabilidade multiusuário](docs/V58_MULTIUSER_RELIABILITY.md) para causas,
+limites, métricas por falante mascarado e roteiro com Azrael/Kel. A chamada real
+continua pendente de validação da revisão implantada.
+
 Para falhas de `/join`, timeout de resposta ou ausência de som no Render, consulte
 [o roteiro de diagnóstico e validação audível](docs/RENDER_INCIDENTS.md).
 Para cinco perguntas consecutivas, voz consentida e barge-in, siga o
@@ -117,8 +123,9 @@ reiniciar exige consentimento novo. Revogar também cancela trabalho pendente.
 Perguntas são serializadas na chamada, com fila limitada e aviso privado ao
 solicitante quando precisam esperar ou são canceladas. Por padrão, cabem oito
 perguntas em espera e até duas por participante; a espera expira em 60 s. O
-proprietário ganha prioridade entre itens em espera e não corta uma resposta
-ativa de convidado. Limite excedido recebe rejeição explícita. Revogação, saída
+proprietário ganha prioridade entre itens em espera, mas suas continuações não
+ultrapassam repetidamente um convidado já esperando atrás da resposta dele.
+Nenhuma pergunta nova corta a resposta ativa. Limite excedido recebe rejeição explícita. Revogação, saída
 e cancelamento impedem execução posterior de tarefas daquele participante.
 
 ## ElevenLabs
@@ -186,7 +193,10 @@ e de resposta têm etapas distintas: uma saudação espontânea não comprova qu
 fala do usuário virou mensagem conversacional.
 
 O follow-up dura 18 s por padrão após a drenagem local, só para aquele falante.
-Essa janela autoriza sua próxima fala sem repetir wake; não confirma conclusão
+Cada resposta concede uma única continuação, consumida quando aceita. Falha,
+cancelamento ou novo áudio depois de um drain temporário invalidam a autorização
+antiga; callbacks tardios não a renovam. A janela não distingue com certeza uma
+fala ambiente de uma pergunta e não confirma conclusão
 do provedor. Uma sessão com conclusão explícita pode ser reutilizada; sem esse
 sinal, a pergunta seguinte segue a recuperação e pode abrir outra sessão.
 Durante playback a captura normal é suprimida para reduzir eco.
@@ -210,6 +220,21 @@ gasto com fala ambiente, mas pode adiar um wake legítimo daquele falante após
 duas falas sem ativação. `/jarvis ask` é alternativa; `/jarvis status` mostra vagas
 globais e quantidade de participantes em pausa. Vários falantes ainda podem
 esgotar o teto compartilhado. Revogação e nova sala não reiniciam a quota paga.
+
+Na V5.8, dois IDs com aceite atual de áudio recebem até três verificações por
+minuto cada; sozinho, o participante mantém as seis. Para N participantes, a
+parcela é `max(1, ceil(limite_global/N))`, sempre subordinada ao teto global. Uma
+vaga reservada a outra pessoa não é emprestada automaticamente e pode ficar
+ociosa. Fila conhecida como cheia rejeita antes de comprar STT. Renovar o aceite
+não devolve orçamento individual/global; follow-ups válidos não consomem wake.
+
+Confirmações de fila e falhas de voz são enviadas por DM, com o incidente estável
+da pergunta; o resultado atualiza o mesmo aviso quando possível. Rejeições
+automáticas têm no máximo um aviso por pessoa/categoria durante a pausa. Se DMs
+estiverem bloqueadas, a sala recebe no máximo um resumo anônimo por minuto.
+Avisos não prendem o PCM. `/jarvis status detalhes:true`, para o criador, mostra
+janela recente de 60 s por falante numerado, chamadas e tempos, sem nomes, IDs
+completos ou transcrições.
 
 Interrupções do provedor cancelam o upload e o áudio daquele turno. PCM recebido segue progressivamente para Opus/Discord,
 com conversão contínua, buffers limitados e backpressure. Não é preciso esperar

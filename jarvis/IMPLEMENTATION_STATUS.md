@@ -1,5 +1,30 @@
 # Estado da implementação — 25/10/2026
 
+## Revisão V5.8: admissão de voz multiusuário
+
+Preparação local para validação com Azrael/Kel. O teto padrão continua seis
+wakes/minuto; dois consentidos recebem até três por ID. Follow-up concede uma
+continuação por resposta e falha/retomada do áudio invalida a autorização antiga.
+Fila cheia é verificada antes do STT; continuações do criador não ultrapassam
+repetidamente um convidado aguardando atrás da resposta dele.
+
+Avisos de voz são privados, atualizados por turno e limitados por pessoa/categoria;
+fallback público é resumido e anônimo. Métricas recentes por falante numerado
+distinguem admissão, quota, perguntas, entrega e playback. A frase exata de
+desconexão pertence ao `/jarvis leave` autenticado no código local; sem SHA/log
+do serviço não se atribui esse caminho à ocorrência real.
+
+Render/configuração operacional desconhecidos; `audit:agent` retornou
+`missing_configuration`. Sem push/deploy, alteração de agente/voz/prompt,
+dependências ou Elysium Python. Causas, resultados finais, matriz A–T e rollback:
+[relatório V5.8](docs/V58_MULTIUSER_RELIABILITY.md). Os números abaixo são históricos.
+
+Gate local final: 740 testes passaram em 38 arquivos e um gate real foi ignorado;
+23 testes de resistência sequencial, typecheck, lint, build, benchmark e
+`git diff --check` aprovados. Commit de implementação `4912d6f`. A sequência
+controlada de 20 turnos alternados terminou com 19 confirmadas, uma parcial
+injetada e quatro chamadas wake; isso não certifica a experiência em chamada.
+
 ## Revisão V5.7: confiabilidade em conversas prolongadas
 
 Entrega local com causas reproduzidas e suíte sequencial usando o mesmo runtime.
