@@ -1,5 +1,24 @@
 # Estado da implementação — 25/10/2026
 
+## P0: áudio recebido, reprodução não iniciada
+
+Commit local `7355ba9`: repara assinatura perdida/obsoleta no caminho de saída e
+impede que pacotes descartados na limpeza contem como início ou drain completo.
+`/ask`, `/tone` e `/status incidente` permitem correlacionar recurso, player,
+assinatura, DAVE e a exceção original sanitizada. Nenhum timeout foi aumentado.
+
+751 testes passaram em 39 arquivos, um gate real ignorado; typecheck, lint,
+build e `git diff --check` aprovados. As duas sequências de 20 turnos mantêm o
+mesmo AudioPlayer real com transporte controlado e falhas no terceiro/quarto
+turnos. Texto: 18 concluídas, uma falha e uma parcial; tons: 18 concluídos e duas
+falhas. Não houve captura, chamada paga, push ou deploy.
+
+**Causa histórica em produção e aceitação audível ainda pendentes.** O aviso
+significa PCM recebido sem primeiro pacote local observado; não identifica
+sozinho um timeout ou falha do decoder de entrada. Causas reproduzidas, arquivos,
+limitações e roteiro de `/tone` + `/ask` sem microfone:
+[relatório P0](docs/P0_OUTPUT_PLAYBACK_RELIABILITY.md). Os números abaixo são históricos.
+
 ## Revisão V5.8: admissão de voz multiusuário
 
 Preparação local para validação com Azrael/Kel. O teto padrão continua seis

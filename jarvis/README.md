@@ -23,6 +23,11 @@ Veja [Confiabilidade multiusuário](docs/V58_MULTIUSER_RELIABILITY.md) para caus
 limites, métricas por falante mascarado e roteiro com Azrael/Kel. A chamada real
 continua pendente de validação da revisão implantada.
 
+O P0 de áudio recebido sem reprodução corrige assinatura perdida e falsa contagem
+de pacotes durante limpeza. Veja [Playback de saída](docs/P0_OUTPUT_PLAYBACK_RELIABILITY.md)
+para evidência, sequências de 20 turnos e roteiro Discord. A causa do incidente
+histórico e a audição em produção continuam pendentes de validação.
+
 Para falhas de `/join`, timeout de resposta ou ausência de som no Render, consulte
 [o roteiro de diagnóstico e validação audível](docs/RENDER_INCIDENTS.md).
 Para cinco perguntas consecutivas, voz consentida e barge-in, siga o
