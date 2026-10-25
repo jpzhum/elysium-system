@@ -11,6 +11,12 @@ gates reais e rollback estão em [Project Rebirth](docs/V56_PROJECT_REBIRTH.md).
 Validação local não comprova resolução dos incidentes históricos ou audição na
 revisão implantada. O agente publicado e a voz existente não foram alterados.
 
+A V5.7 corrige encerramento de turnos, captura truncada e reutilização de sessões
+perto do TTL, além de testar conversas prolongadas com os mesmos recursos. Veja
+[Confiabilidade conversacional](docs/V57_CONVERSATIONAL_RELIABILITY.md) para
+causas reproduzidas, admissão wake, gates, métricas e rollback. A revisão Render
+e o teste real no Discord continuam necessários para aprovar a implantação.
+
 Para falhas de `/join`, timeout de resposta ou ausência de som no Render, consulte
 [o roteiro de diagnóstico e validação audível](docs/RENDER_INCIDENTS.md).
 Para cinco perguntas consecutivas, voz consentida e barge-in, siga o
@@ -93,7 +99,7 @@ um tom sintético de 1 s para separar playback Discord da resposta ElevenLabs.
 | `/jarvis join` | Criador: entra na própria sala |
 | `/jarvis leave` | Criador: sai, cancela sessões e apaga consentimentos |
 | `/jarvis tone` | Criador na sala: teste de saída com tom sintético |
-| `/jarvis status` | Estado/contadores em resposta privada; sem transcrições |
+| `/jarvis status` | Estado/resumo privado; `detalhes:true` inclui contadores, `incidente:XXXXXXXX` consulta evidência técnica recente |
 | `/jarvis privacy` | Aviso de processamento e retenção |
 | `/jarvis consent` | Participante na sala: aceita perguntas escritas |
 | `/jarvis consent audio:true` | Aceite adicional para diagnóstico/voz experimental |
@@ -169,6 +175,11 @@ fila avança. Esse prazo não é o watchdog de geração de 45 s nem o deadline 
 O turno enviado inclui a pergunta completa capturada, sem recortar tudo após um
 timestamp presumido da wake word. O fim de captura usa 600 ms de silêncio, RMS
 mínimo de 0,008 e teto de 12 s por padrão; 600 ms não é a duração total da captura.
+O teto inclui a pausa final: fala contínua de 12 s não cabe no padrão. Atingir o
+teto sem fim VAD descarta a captura com aviso; nenhum prefixo vira pergunta paga.
+`JARVIS_MAX_AUDIO_SECONDS_PER_TURN` já aceita até 30 s. Os testes locais preservam
+fala sintética de 20 s com orçamento de 21/30 s; reconhecimento remoto e custo
+precisam ser validados antes de aumentar o valor no worker.
 O upload usa frames de 20 ms e acrescenta 0,8 s de silêncio. Esses ajustes locais
 não substituem o VAD/turn-taking configurado no agente. Os sinais de reconhecimento
 e de resposta têm etapas distintas: uma saudação espontânea não comprova que a
@@ -190,6 +201,16 @@ O comando fica vinculado ao stream ouvido durante a captura; um resultado STT
 tardio não pode interromper uma resposta nova.
 O padrão permanece desabilitado e exige `JARVIS_VOICE_INPUT=elevenlabs-stt`.
 
+O teto wake padrão continua em seis chamadas numa janela móvel de 60 s por worker.
+Após duas inspeções sem wake do mesmo participante, há espera local de 10 s;
+novas inspeções negativas elevam a espera a 20/40/60 s. Uma ativação zera essa
+sequência, e o estado expira após 60 s sem inspeção. A espera é isolada por ID,
+canal e versão do consentimento; não afeta follow-up já autorizado. Isso reduz
+gasto com fala ambiente, mas pode adiar um wake legítimo daquele falante após
+duas falas sem ativação. `/jarvis ask` é alternativa; `/jarvis status` mostra vagas
+globais e quantidade de participantes em pausa. Vários falantes ainda podem
+esgotar o teto compartilhado. Revogação e nova sala não reiniciam a quota paga.
+
 Interrupções do provedor cancelam o upload e o áudio daquele turno. PCM recebido segue progressivamente para Opus/Discord,
 com conversão contínua, buffers limitados e backpressure. Não é preciso esperar
 `agent_response_complete` para ouvir.
@@ -210,6 +231,11 @@ explícita e playback terminado. Na recuperação sem confirmação, pergunta e 
 observado do agente ficam rotulados separadamente, sem afirmar entrega integral.
 Revogação, saída, limpeza, expiração e restart removem referências.
 Não há memória compartilhada entre contas nem transcrição contínua da sala.
+
+Antes de reutilizar uma sessão ociosa, o worker verifica a vida restante para
+entrada e prazos existentes de reconhecimento/resposta. Se insuficiente, abre
+uma sessão para a pergunta aceita, sem reenviar conteúdo. O TTL absoluto da
+sessão continua efetivo durante respostas excepcionalmente longas.
 
 Sem nova pergunta, 45 s sem progresso e sem ferramenta pendente disparam a
 recuperação existente, com áudio válido drenado e resultado não confirmado, sem
@@ -268,7 +294,7 @@ maiúsculos. As etapas medem fila, abertura/reutilização, primeiro áudio, in�
 drenagem de playback e liberação do turno; ausência de evento não vira duração
 inventada. `/status` mostra contadores e durações locais agregadas, sem afirmar
 latência acústica ou crédito disponível. No diagnóstico, apenas o criador vê contadores por Discord
-ID em resposta privada, para verificar atribuição; não se imprime conteúdo falado.
+ID mascarado em resposta privada, para verificar atribuição; não se imprime conteúdo falado.
 SIGINT/SIGTERM cancelam recepção, uploads, WS, sessões, playback e conexão Discord,
 com prazo de saída de 8 s. Não execute duas instâncias com o mesmo bot/guild.
 

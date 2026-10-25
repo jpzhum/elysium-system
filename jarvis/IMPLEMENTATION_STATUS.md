@@ -1,4 +1,32 @@
-# Estado da implementação — 22/10/2026
+# Estado da implementação — 25/10/2026
+
+## Revisão V5.7: confiabilidade em conversas prolongadas
+
+Entrega local com causas reproduzidas e suíte sequencial usando o mesmo runtime.
+As correções preservam V5.6, voz, dependências, protocolos e consentimento; cobrem
+socket perdido durante contexto, terminal/liberação únicos, tools tardias,
+prefixo descartado ao exceder captura e renovação antes de reutilizar sessão
+sem vida restante suficiente. Quota wake continua limitada; admissão por
+participante reduz chamadas desperdiçadas após falas sem ativação.
+
+`/jarvis status` distingue resumo, detalhes opcionais e incidentes técnicos;
+playback parcial/expiração não são sucesso confirmado. O prompt local recebe
+ajustes pequenos de continuidade e naturalidade, sem publicação remota.
+
+A revisão Render e seus valores efetivos não foram identificados. **Aceitação
+real continua pendente**, incluindo ASR, DAVE/rede, áudio ouvido, personalidade,
+latência e custo. Nenhum push/deploy foi realizado. Baseline limpa: 632 testes
+aprovados e 1 gate real ignorado; resultados finais, 15 cenários, métricas,
+limitações, roteiro Discord e rollback estão no
+[relatório V5.7](docs/V57_CONVERSATIONAL_RELIABILITY.md).
+
+Gate local final: typecheck, lint, build, benchmark e `git diff --check` aprovados;
+697 testes passaram em 36 arquivos, 1 gate real ignorado. Os 16 testes de
+resistência cobrem os 15 cenários exigidos e falhas adicionais. Benchmark separa
+entregas não confirmadas de sucesso; nenhuma redução de latência real é afirmada.
+Commit de implementação: `798a9ad`.
+
+Os números das revisões abaixo são históricos.
 
 ## Revisão V5.2: continuidade, turnos e personalidade
 

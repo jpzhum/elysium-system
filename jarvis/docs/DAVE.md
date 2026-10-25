@@ -30,7 +30,7 @@ O gate de wake word é **somente de transcrição**; não é um detector acústi
 1. Rode `npm ci`, `npm run build`, `npm run typecheck`, `npm run lint` e `npm test`. A suíte marca o cenário DAVE real como pendente, não como sucesso.
 2. Configure token do **novo bot**, guild/canal de teste e proprietário por environment local não versionado. Não use token Elysium. Registre build dos clientes Discord manualmente e `node --version` / `npm ls @discordjs/voice discord.js @snazzah/davey opusscript`.
 3. Use o comando de smoke descrito no README, com IDs explicitamente consentidos. Avise os participantes: este spike conta frames/RMS e não grava voz. Permissões mínimas: View Channel, Connect, Speak; sem Administrator ou intents privilegiados.
-4. Com uma pessoa já na call, conecte o bot e fale imediatamente. Repita pelo menos 10 entradas/saídas: a falha reportada é intermitente. Verifique pacotes decodificados, RMS maior que zero e atribuição ao ID correto, sem salvar áudio.
+4. Com uma pessoa já na call, conecte o bot e fale imediatamente. Repita pelo menos 10 entradas/saídas: a falha reportada é intermitente. Verifique pacotes decodificados, RMS maior que zero e atribuição ao ID correto, sem salvar áudio. O status de smoke mostra somente rótulos numerados e os quatro dígitos finais do ID, em resposta privada ao criador; use falas individuais para conferir a correspondência e não registre IDs completos.
 5. Refaça entrando com o bot primeiro e humanos depois; depois dois humanos alternando e sobrepondo falas, mantendo consentimento separado. Revogue um usuário no meio da fala: nenhum turno dele pode ser entregue depois da revogação.
 6. Force uma mudança de grupo MLS entrando/saindo com outro cliente. Teste reconexão temporária e troca de endpoint. Para reconexão manual reproduzível, rode `/jarvis leave` e `/jarvis join`, renove consentimentos se a sessão tiver sido encerrada e fale imediatamente com humanos já presentes; repita a ordem inversa. Confirme que um erro de stream não derruba o processo e que um novo evento speaking permite inscrição futura. Registre apenas nome do cenário, versões, contadores e classe sanitizada da falha.
 7. Em `npm run smoke:dave`, use `/jarvis tone` para confirmar saída audível com tom sintético sem ElevenLabs. Depois rode o worker normal e `/jarvis ask` para confirmar a voz ElevenAgents. Habilite o fluxo de voz de forma explícita e teste a resposta real à palavra de ativação. Não confunda o fallback de texto com aprovação de recepção.
@@ -42,7 +42,7 @@ Se #11653 for reproduzida, registre sequência/versões e mantenha o gate bloque
 
 Preencher com evidência da chamada; as linhas atuais documentam o que ainda falta.
 
-| Cenário | Discord build | Node | voice / Davey | DAVE / MLS | Repetições reais | Recepção por user_id / RMS | Playback | Resultado |
+| Cenário | Discord build | Node | voice / Davey | DAVE / MLS | Repetições reais | Recepção por falante / RMS | Playback | Resultado |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Humanos antes do bot | não informado | 24.19.0 local | 0.19.2 / 0.1.12 | padrão, não observado | 0 | não executado | não executado | pendente |
 | Bot antes dos humanos | não informado | 24.19.0 local | 0.19.2 / 0.1.12 | padrão, não observado | 0 | não executado | não executado | pendente |
