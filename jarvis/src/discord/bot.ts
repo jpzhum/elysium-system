@@ -173,8 +173,17 @@ export class JarvisBot {
         const room = this.room;
         const requestedIncident = interaction.options.getString?.('incidente');
         if (requestedIncident) {
-          await reply(`Revisão Render: ${deploymentRevision(this.config.RENDER_GIT_COMMIT)}.\n`
-            + this.evidence.incidentDetails(requestedIncident.toUpperCase()));
+          const text = `Revisão Render: ${deploymentRevision(this.config.RENDER_GIT_COMMIT)}.\n`
+            + this.evidence.incidentDetails(requestedIncident.toUpperCase());
+          const pages: string[] = [];
+          let page = '';
+          for (const line of text.split('\n')) {
+            if (page && page.length + line.length + 1 > 1800) { pages.push(page); page = ''; }
+            page += (page ? '\n' : '') + line;
+          }
+          if (page) pages.push(page);
+          await reply(pages[0]!);
+          for (const content of pages.slice(1)) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
           return;
         }
         let probe = '';
@@ -262,7 +271,7 @@ export class JarvisBot {
             },
           });
         } finally { tone.fill(0); }
-        await reply('Tom reproduzido. Confirme a audição para registrar o teste de playback.'); return;
+        await reply(`Tom reproduzido. Confirme a audição para registrar o teste de playback. Incidente ${incident}.`); return;
       }
       if (command === 'consent') {
         const audio = interaction.options.getBoolean('audio') === true;
@@ -295,11 +304,11 @@ export class JarvisBot {
             // Replies contain only status. Do not re-send questions or provider text.
             if (event.type === 'started' && (!receipt?.queued || this.closed || this.room !== room)) return;
             const content = this.turnNotice(event);
-            if (content) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+            if (content) await interaction.followUp({ content: `${content} Incidente ${event.turnId}.`, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
           });
           await reply(receipt.queued
-            ? `Pergunta enfileirada (posição ${receipt.position}). Avisarei quando começar ou for cancelada.`
-            : 'Pergunta aceita. A resposta será falada nesta chamada.');
+            ? `Pergunta enfileirada (posição ${receipt.position}). Avisarei quando começar ou for cancelada. Incidente ${receipt.turnId}.`
+            : `Pergunta aceita. A resposta será falada nesta chamada. Incidente ${receipt.turnId}.`);
         } finally { acknowledge(); }
       }
     } catch (error) {

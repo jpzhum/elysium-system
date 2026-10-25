@@ -110,8 +110,9 @@ class ControlledVoice extends EventEmitter {
     this.streams.push(stream);
     return stream;
   } };
-  subscribe(_player: AudioPlayer): PlayerSubscription {
-    const subscription = { unsubscribe: () => { this.state.subscription = undefined; } } as PlayerSubscription;
+  subscribe(player: AudioPlayer): PlayerSubscription {
+    const subscription = { connection: this as unknown as VoiceConnection, player,
+      unsubscribe: () => { this.state.subscription = undefined; } } as PlayerSubscription;
     this.state.subscription = subscription;
     return subscription;
   }

@@ -43,10 +43,11 @@ test('player start exception is preserved instead of becoming cancellation', asy
       return true;
     });
     await assert.rejects(stream.done, error => error === failure);
-    assert.equal(events.length, 1);
-    assert.equal(events[0]!.playback_stage, 'player_start');
-    assert.equal(events[0]!.resource_ended, true);
-    assert.equal(events[0]!.subscribed, true);
+    const errors = events.filter(fields => fields.code);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0]!.playback_stage, 'player_start');
+    assert.equal(errors[0]!.resource_ended, true);
+    assert.equal(errors[0]!.subscribed, true);
     assert.equal(metrics.playback_failed, 1);
     assert.equal(metrics.playback_cancelled, undefined);
   } finally { queue.stop(); }
@@ -271,6 +272,126 @@ test('local playback readiness requires its current subscription and reports DAV
   assert.equal(queue.diagnosticState.stopped, true);
 });
 
+test('Ready recovery restores a removed subscription before the next resource is played', async () => {
+  const { queue, player, connection } = setup();
+  const previous = connection.state.subscription;
+  assert.ok(previous);
+  previous.unsubscribe();
+  connection.state.subscription = undefined;
+  connection.state.status = 'connecting';
+  connection.emit('stateChange', { status: 'ready' }, connection.state);
+  connection.state.status = 'ready';
+  connection.emit('stateChange', { status: 'connecting' }, connection.state);
+  try {
+    assert.notEqual(connection.state.subscription, previous);
+    assert.equal((connection.state.subscription as PlayerSubscription | undefined)?.player, player);
+    assert.equal(queue.diagnosticState.available, true);
+    const stream = queue.startStream('a', 16_000, false);
+    await stream.write(Buffer.alloc(1_280)); stream.end();
+    await tick();
+    for (let frame = 0; queue.isPlaying && frame < 30; frame++) {
+      if (Reflect.get(player, 'checkPlayable').call(player)) Reflect.get(player, '_stepPrepare').call(player);
+      await tick();
+    }
+    await stream.done;
+    assert.equal(player.state.status, AudioPlayerStatus.Idle);
+  } finally { queue.stop(); }
+});
+
+test('a subscription removed while Ready is repaired before accepting new PCM', async () => {
+  const { queue, player, connection } = setup();
+  const previous = connection.state.subscription;
+  assert.ok(previous);
+  previous.unsubscribe();
+  connection.state.subscription = undefined;
+  const stream = queue.startStream('a', 16_000, false);
+  try {
+    assert.equal((connection.state.subscription as PlayerSubscription | undefined)?.player, player);
+    assert.notEqual(connection.state.subscription, previous);
+    assert.equal(queue.diagnosticState.available, true);
+    stream.cancel();
+    await assert.rejects(stream.done);
+  } finally { queue.stop(); }
+});
+
+test('a stale own subscription pointer is checked against the real player receiver registry', async () => {
+  const { queue, player, connection } = setup();
+  const previous = connection.state.subscription;
+  assert.ok(previous);
+  Reflect.get(player, 'unsubscribe').call(player, previous);
+  assert.equal(connection.state.subscription, previous);
+  assert.deepEqual(player.playable, []);
+  try {
+    assert.equal(queue.diagnosticState.available, false);
+    const stream = queue.startStream('a', 16_000, false);
+    assert.notEqual(connection.state.subscription, previous);
+    assert.deepEqual(player.playable, [connection]);
+    assert.equal(queue.diagnosticState.available, true);
+    stream.cancel();
+    await assert.rejects(stream.done);
+  } finally { queue.stop(); }
+});
+
+test('an existing subscription to another player is rejected without replacing it', () => {
+  const { queue, connection, metrics } = setup();
+  const previous = connection.state.subscription;
+  assert.ok(previous);
+  previous.unsubscribe();
+  const foreign = createAudioPlayer();
+  const current = Reflect.get(foreign, 'subscribe').call(foreign, connection) as PlayerSubscription;
+  connection.state.subscription = current;
+  const subscribe = vi.spyOn(connection, 'subscribe');
+  const diagnostics: DiagnosticFields[] = [];
+  try {
+    assert.throws(() => queue.startStream('a', 16_000, false, {
+      onDiagnostic: fields => { diagnostics.push(fields); },
+    }), error => {
+      const fields = playbackFailureFields(error);
+      assert.equal(fields.code, 'PLAYBACK_SUBSCRIBE_FAILED');
+      assert.equal(fields.playback_stage, 'subscribe');
+      assert.equal(fields.subscribed, false);
+      return true;
+    });
+    assert.equal(subscribe.mock.calls.length, 0);
+    assert.equal(connection.state.subscription, current);
+    assert.equal(diagnostics.length, 1);
+    assert.equal(metrics.playback_failed, 1);
+    assert.equal(metrics.playback_started, undefined);
+    assert.equal(queue.isPlaying, false);
+  } finally { queue.stop(); current.unsubscribe(); }
+});
+
+test('a stopped finished encoder with unread packets cannot report successful playback', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const { queue, player, metrics } = setup();
+  const progress: string[] = [];
+  const diagnostics: DiagnosticFields[] = [];
+  const prepare = Reflect.get(player, '_stepPrepare');
+  Reflect.set(player, '_stepPrepare', () => undefined);
+  const stream = queue.startStream('a', 16_000, false, {
+    onProgress: event => { progress.push(event); }, onDiagnostic: fields => { diagnostics.push(fields); },
+  });
+  try {
+    await stream.write(Buffer.alloc(640)); stream.end();
+    const resource = player.state.status === AudioPlayerStatus.Idle ? undefined : player.state.resource;
+    assert.ok(resource);
+    for (let turn = 0; turn < 10 && !resource.started; turn++) await tick();
+    assert.equal(resource.playStream.readableLength, 1);
+    assert.equal(resource.playbackDuration, 0);
+    assert.deepEqual(progress, []); // Readability/prefetch does not count as resource consumption.
+    player.stop(true);
+    await assert.rejects(stream.done, error => playbackFailureFields(error).code === 'PLAYBACK_PREMATURE_IDLE');
+    assert.deepEqual(progress, []);
+    assert.equal(diagnostics.filter(fields => fields.playback_event === 'packet_read').length, 0);
+    const settled = diagnostics.find(fields => fields.playback_event === 'settled');
+    assert.equal(settled?.encoded_packets, 1);
+    assert.equal(settled.consumed_packets, 0);
+    assert.equal(settled.stream_destroyed, true);
+    assert.equal(metrics.playback_completed, undefined);
+    assert.equal(metrics.playback_failed, 1);
+  } finally { queue.stop(); Reflect.set(player, '_stepPrepare', prepare); vi.useRealTimers(); }
+});
+
 test('a 33884-byte PCM16 mono chunk at 16 kHz encodes into 53 valid Discord packets', async () => {
   const { queue, player, metrics } = setup();
   const decoder = new OpusDecoder();
@@ -304,7 +425,7 @@ test('Opus CPU totals stay with each resource and are emitted once without claim
     });
     untouched.cancel();
     await assert.rejects(untouched.done);
-    assert.equal(observed[0]!.length, 0); // No attempted frame means no fabricated zero-time sample.
+    assert.equal(observed[0]!.filter(fields => fields.opus_encode_ms !== undefined).length, 0);
     for (let index = 0; index < 2; index++) {
       const stream = queue.startStream(`speaker-${index}`, 16_000, false, {
         onDiagnostic: fields => { observed[index]!.push(fields); },
@@ -408,6 +529,18 @@ test('one real AudioPlayer and PlaybackQueue survive twenty responses with a fou
       assert.ok(resourceTimers.length >= turn);
       for (const timer of resourceTimers) assert.ok(clearedTimers.has(timer), `turn ${turn} cleared every resource timer`);
       assert.equal(diagnostics.filter(fields => fields.opus_encode_ms !== undefined).length, 1);
+      assert.equal(diagnostics.filter(fields => fields.playback_event === 'stream_accepted').length, 1);
+      assert.equal(diagnostics.filter(fields => fields.playback_event === 'subscribed').length, 1);
+      assert.equal(diagnostics.filter(fields => fields.playback_event === 'pcm_accepted').length, 1);
+      assert.equal(diagnostics.filter(fields => fields.playback_event === 'resource_created').length, 1);
+      assert.equal(diagnostics.filter(fields => fields.playback_event === 'play_called').length, 1);
+      assert.equal(diagnostics.filter(fields => fields.playback_event === 'packet_read').length, 1);
+      const settled = diagnostics.filter(fields => fields.playback_event === 'settled');
+      assert.equal(settled.length, 1);
+      assert.equal(settled[0]!.stream_destroyed, true);
+      assert.ok(settled[0]!.consumed_packets! > 0);
+      assert.equal(settled[0]!.playback_token, turn);
+      if (turn !== 4) assert.equal(settled[0]!.consumed_packets, settled[0]!.encoded_packets);
       assert.doesNotMatch(JSON.stringify(diagnostics), /PRIVATE/);
     }
     assert.equal(metrics.playback_started, 20);

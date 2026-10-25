@@ -175,6 +175,40 @@ afterEach(async () => {
 });
 
 describe('V5 Discord integration with the real per-speaker session manager', () => {
+  test('text-only failure reports its stable incident and paged output evidence stays private', async () => {
+    const h = await setup(); await h.interaction('consent', OWNER).run();
+    const ask = await h.ask(OWNER);
+    const provider = hooks.providers.at(-1)!;
+    // Failure before the first player packet, with no microphone consent or STT.
+    const playback = (Reflect.get(h.room.sessions, 'options') as SessionOptions).playback;
+    vi.spyOn(playback, 'startStream').mockImplementationOnce(() => { throw new Error('controlled player start failure'); });
+    await provider.options.callbacks.onAudio(Buffer.alloc(960, 3), 300); await settle();
+    const failure = ask.followUp.mock.calls.map(([payload]) => payload.content).find(content => content.includes('reprodução não começou'))!;
+    expect(failure).toBeDefined();
+    const incident = failure.match(/Incidente ([A-F0-9]{8})/)![1]!;
+    expect(ask.editReply.mock.calls[0]![0].content).toContain(incident);
+    expect(h.access.wake.detect).not.toHaveBeenCalled();
+    expect(h.room.consent.get(OWNER)?.audio).toBe(false);
+    const logger = Reflect.get(h.bot, 'logger') as Logger;
+    logger.event('jarvis_playback_failed', 'error', { incident, stage: 'playback',
+      code: 'PLAYBACK_ENCODER_FAILED', cause_code: 'UNKNOWN', cause_name: 'RangeError', opus_error_code: -3,
+      playback_stage: 'opus_encode', player_status: 'buffering', voice_status: 'ready',
+      subscribed: true, dave_ready: false, dave_protocol_version: 1, resource_started: false,
+      resource_ended: false, encoded_packets: 0, consumed_packets: 0 });
+    for (let step = 0; step < 24; step++) logger.event('jarvis_playback_state', 'info', {
+      incident, stage: 'playback', playback_elapsed_ms: step * 20, playback_token: 1,
+      previous_player_status: step % 2 ? 'playing' : 'buffering', player_status: step % 2 ? 'buffering' : 'playing',
+      resource_started: true, resource_ended: false, resource_current: true, stream_destroyed: false,
+      audio_chunks: 24, audio_bytes: 128_000, encoded_packets: step, consumed_packets: step,
+      resource_playback_ms: step * 20, subscribed: true, dave_ready: false,
+    });
+    const lookup = h.interaction('status', OWNER, false, undefined, { incident }); await lookup.run();
+    const pages = [...lookup.reply.mock.calls, ...lookup.followUp.mock.calls].map(([payload]) => payload);
+    expect(pages.length).toBeGreaterThan(1);
+    expect(pages.every(payload => payload.content.length <= 2000 && payload.flags === 64)).toBe(true);
+    expect(pages.map(payload => payload.content).join('\n')).toContain('Etapas de saída');
+    expect(pages.map(payload => payload.content).join('\n')).not.toMatch(/100000000000000|controlled player|conteúdo privado/);
+  });
   test('ten automatic quota rejections yield one private notice per speaker and no channel spam', async () => {
     const h = await setup();
     await h.interaction('consent', OWNER, true).run();

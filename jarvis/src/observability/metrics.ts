@@ -117,6 +117,7 @@ const voiceStatuses = ['signalling', 'connecting', 'ready', 'disconnected', 'des
 export const diagnosticCommands = ['join', 'leave', 'status', 'tone', 'privacy', 'consent', 'revoke', 'cancel', 'ask', 'clear', 'unknown'] as const;
 const playerStatuses = ['idle', 'buffering', 'playing', 'paused', 'autopaused'] as const;
 const playbackStages = ['subscribe', 'resource_create', 'player_start', 'pcm_input', 'opus_init', 'opus_encode', 'stream', 'player', 'connection', 'deadline'] as const;
+const playbackEvents = ['stream_accepted', 'pcm_accepted', 'resource_created', 'play_called', 'readable', 'packet_read', 'settled', 'subscribed'] as const;
 type VoiceStatus = typeof voiceStatuses[number];
 
 /** Only scalar, bounded operational metadata is accepted, including at runtime. */
@@ -132,6 +133,16 @@ export interface DiagnosticFields {
   cause_name?: 'Error' | 'TypeError' | 'RangeError' | 'AudioPlayerError' | 'DiagnosticError';
   opus_error_code?: number;
   playback_stage?: typeof playbackStages[number];
+  playback_event?: typeof playbackEvents[number];
+  /** Process-local resource identity, unrelated to Discord or provider IDs. */
+  playback_token?: number;
+  playback_elapsed_ms?: number;
+  encoded_packets?: number;
+  consumed_packets?: number;
+  resource_started?: boolean;
+  stream_destroyed?: boolean;
+  resource_current?: boolean;
+  resource_playback_ms?: number;
   player_status?: typeof playerStatuses[number];
   previous_player_status?: typeof playerStatuses[number];
   resource_ended?: boolean;
@@ -299,6 +310,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['code', errorCodes], ['voice_status', voiceStatuses], ['previous_voice_status', voiceStatuses],
     ['cause_code', errorCodes], ['cause_name', ['Error', 'TypeError', 'RangeError', 'AudioPlayerError', 'DiagnosticError']],
     ['playback_stage', playbackStages], ['player_status', playerStatuses], ['previous_player_status', playerStatuses],
+    ['playback_event', playbackEvents],
     ['receive_stage', ['subscribe', 'decoder_setup', 'stream', 'decode']],
     ['rate_limit_source', ['worker_busy', 'worker_interval', 'provider_quota', 'provider_429']],
     ['turn_outcome', ['completed', 'superseded', 'unconfirmed', 'cancelled', 'failed', 'partial', 'expired']],
@@ -332,6 +344,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     'search_key_configured', 'wait_for_response', 'participants_available', 'participants_complete',
     'context_injected',
     'resource_ended', 'subscribed', 'capture_active', 'capture_has_pcm', 'capture_has_voice',
+    'resource_started', 'stream_destroyed', 'resource_current',
   ]) {
     const value = diagnosticValue(fields, key);
     if (typeof value === 'boolean') result[key] = value;
@@ -339,6 +352,8 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
   for (const [key, minimum, maximum] of [
     ['duration_ms', 0, 86_400_000], ['stage_duration_ms', 0, 86_400_000], ['timeout_ms', 0, 300_000],
     ['opus_error_code', -7, -1],
+    ['playback_token', 1, 2_147_483_647], ['playback_elapsed_ms', 0, 300_000],
+    ['encoded_packets', 0, 15_000], ['consumed_packets', 0, 15_000], ['resource_playback_ms', 0, 300_000],
     ['network_status', 0, 6], ['previous_network_status', 0, 6],
     ['websocket_close_code', 1_000, 4_999], ['disconnect_reason', 0, 4],
     ['dave_protocol_version', 0, 65_535], ['diagnostics_version', 1, 7], ['pending_tools', 0, 128],

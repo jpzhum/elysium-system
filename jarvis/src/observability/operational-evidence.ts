@@ -3,6 +3,11 @@ import { type DiagnosticFields, type ErrorCode, type Logger, type OperationalEve
 type Outcome = 'completed' | 'unconfirmed' | 'failed' | 'partial' | 'cancelled' | 'expired';
 const emptyOutcomes = (): Record<Outcome, number> => ({ completed: 0, unconfirmed: 0, failed: 0, partial: 0, cancelled: 0, expired: 0 });
 interface Observation { at: number; description: string; }
+interface IncidentRecord extends DiagnosticFields {
+  failureStage?: DiagnosticFields['stage'];
+  originalPlaybackFailure?: DiagnosticFields;
+  playbackTrail?: string[];
+}
 
 /** Bounded technical evidence, never a health claim or a record of conversational content. */
 export class OperationalEvidence {
@@ -10,7 +15,7 @@ export class OperationalEvidence {
   private readonly dispose: () => void;
   private readonly lifetime = emptyOutcomes();
   private readonly recent = new Map<string, Outcome>();
-  private readonly incidents = new Map<string, DiagnosticFields & { failureStage?: DiagnosticFields['stage'] }>();
+  private readonly incidents = new Map<string, IncidentRecord>();
   private lastSuccessAt?: number;
   private failure?: Observation & { incident: string; code: ErrorCode };
   private recovery?: Observation;
@@ -33,7 +38,26 @@ export class OperationalEvidence {
     const genericPlaybackSummary = code === 'PLAYBACK_FAILED' && previous?.code !== undefined
       && previous.code !== 'UNKNOWN' && previous.code !== 'PLAYBACK_FAILED'
       && (!event.cause_code || event.cause_code === 'UNKNOWN' || event.cause_code === previous.code);
-    const record = { ...previous, ...event };
+    const record: IncidentRecord = { ...previous, ...event };
+    if (name === 'jarvis_playback_failed' && !previous?.originalPlaybackFailure) {
+      const originalKeys: (keyof DiagnosticFields)[] = ['code', 'cause_code', 'cause_name', 'opus_error_code',
+        'playback_stage', 'player_status', 'voice_status', 'subscribed', 'dave_ready', 'dave_protocol_version',
+        'resource_started', 'resource_ended', 'encoded_packets', 'consumed_packets'];
+      record.originalPlaybackFailure = Object.fromEntries(originalKeys.flatMap(key => event[key] === undefined ? [] : [[key, event[key]]]));
+    }
+    if (event.stage === 'playback' && (event.playback_event || event.previous_player_status)) {
+      const state = [event.previous_player_status, event.player_status].filter(Boolean).join('→');
+      const phase = event.playback_event ?? 'state';
+      const sample = `${event.playback_elapsed_ms ?? '?'}ms #${event.playback_token ?? '?'} ${phase} ${state}`
+        + ` sub=${event.subscribed === undefined ? '?' : Number(event.subscribed)}`
+        + ` dave=${event.dave_ready === undefined ? '?' : Number(event.dave_ready)}`
+        + ` packets=${event.consumed_packets ?? '?'}/${event.encoded_packets ?? '?'}`;
+      const trail = [...previous?.playbackTrail ?? []];
+      if (trail.at(-1) !== sample) trail.push(sample);
+      // Keep the first setup evidence and the latest state/settlement, bounded.
+      if (trail.length > 16) trail.splice(8, 1);
+      record.playbackTrail = trail;
+    }
     // A manager rollup carries the turn result, not a new cause. Keep the
     // specific player/encoder failure even if another incident arrived meanwhile.
     if (genericPlaybackSummary) {
@@ -94,13 +118,18 @@ export class OperationalEvidence {
     if (!/^[A-F0-9]{8}$/.test(incident)) return 'Informe um incidente com oito caracteres hexadecimais.';
     const record = this.incidents.get(incident);
     if (!record) return 'Incidente não encontrado nos últimos 64 incidentes deste processo.';
-    const keys: (keyof DiagnosticFields)[] = ['stage', 'category', 'code', 'cause_code', 'playback_stage',
+    const keys: (keyof DiagnosticFields)[] = ['stage', 'category', 'code', 'cause_code', 'cause_name', 'opus_error_code', 'playback_stage',
       'input_kind', 'turn_outcome', 'turn_delivery', 'cancellation_reason', 'completion_received',
       'local_playback_drained', 'playback_drained', 'first_playback_ms', 'duration_ms', 'queue_depth',
-      'voice_status', 'receiver_state', 'rejection_reason', 'capture_rejection', 'retry_after_ms'];
+      'voice_status', 'receiver_state', 'rejection_reason', 'capture_rejection', 'retry_after_ms',
+      'playback_token', 'playback_event', 'subscribed', 'dave_ready', 'dave_protocol_version',
+      'resource_started', 'resource_ended', 'resource_current', 'stream_destroyed',
+      'audio_bytes', 'audio_chunks', 'encoded_packets', 'consumed_packets', 'resource_playback_ms'];
     const values = { ...Object.fromEntries(keys.flatMap(key => record[key] === undefined ? [] : [[key, record[key]]])),
       ...(record.failureStage ? { failure_stage: record.failureStage } : {}) };
-    return `Incidente ${incident}, deste processo. Últimos campos técnicos observados:\n${JSON.stringify(values)}`;
+    return `Incidente ${incident}, deste processo. Últimos campos técnicos observados:\n${JSON.stringify(values)}`
+      + (record.originalPlaybackFailure ? `\nExceção original sanitizada:\n${JSON.stringify(record.originalPlaybackFailure)}` : '')
+      + (record.playbackTrail?.length ? `\nEtapas de saída (primeiras/últimas; pacotes locais, sem prova de audição):\n${record.playbackTrail.join('\n')}` : '');
   }
 
   /** Rates use terminated requests as denominator, explicitly including queued cancellations. */

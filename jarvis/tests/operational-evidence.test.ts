@@ -149,3 +149,36 @@ test('an observer cannot mutate log fields, leak arbitrary content or interrupt 
   expect(deploymentRevision(undefined)).toBe('não informada');
   expect(deploymentRevision('CFCdd03')).toBe('cfcdd03');
 });
+
+test('output lifecycle preserves the original sanitized exception separately from cleanup and bounds its incident trail', () => {
+  const logger = new Logger('error', () => undefined);
+  const evidence = new OperationalEvidence(logger);
+  const incident = 'AABBCCDD';
+  logger.event('jarvis_playback_state', 'info', { incident, stage: 'playback', playback_token: 1,
+    playback_event: 'resource_created', playback_elapsed_ms: 1, player_status: 'idle', subscribed: true });
+  logger.event('jarvis_playback_failed', 'error', { incident, stage: 'playback', playback_token: 1,
+    code: 'PLAYBACK_ENCODER_FAILED', cause_name: 'RangeError', cause_code: 'UNKNOWN', opus_error_code: -3,
+    playback_stage: 'opus_encode', player_status: 'buffering', consumed_packets: 0, encoded_packets: 0,
+    ...{ message: 'PRIVATE signed URL', stack: 'PRIVATE', pcm: Buffer.alloc(20) } } as DiagnosticFields);
+  for (let event = 0; event < 40; event++) logger.event('jarvis_playback_state', 'info', {
+    incident, stage: 'playback', playback_token: 1, playback_elapsed_ms: event + 2,
+    previous_player_status: event % 2 ? 'playing' : 'buffering', player_status: event % 2 ? 'buffering' : 'playing',
+    subscribed: true, dave_ready: false, encoded_packets: event, consumed_packets: 0,
+  });
+  logger.event('jarvis_playback_state', 'info', { incident, stage: 'playback', playback_event: 'settled',
+    playback_token: 1, player_status: 'idle', resource_ended: true, stream_destroyed: true });
+  logger.event('jarvis_agent_turn_failed', 'error', { incident, code: 'PLAYBACK_FAILED',
+    cause_code: 'PLAYBACK_ENCODER_FAILED', turn_outcome: 'failed', turn_delivery: 'not_started' });
+  const details = evidence.incidentDetails(incident);
+  expect(details).toContain('"turn_delivery":"not_started"');
+  expect(details).toContain('"stream_destroyed":true');
+  const original = JSON.parse(details.split('Exceção original sanitizada:\n')[1]!.split('\n')[0]!);
+  expect(original).toMatchObject({ code: 'PLAYBACK_ENCODER_FAILED', cause_name: 'RangeError', opus_error_code: -3,
+    playback_stage: 'opus_encode', player_status: 'buffering', consumed_packets: 0 });
+  expect(details).toContain('resource_created'); expect(details).toContain('settled');
+  expect(details.split('Etapas de saída')[1]!.split('\n').slice(1)).toHaveLength(16);
+  expect(details).not.toContain('PRIVATE');
+  for (const line of details.split('\n')) expect(line.length).toBeLessThanOrEqual(1800);
+  expect(evidence.summary()).toContain('confirmados=0');
+  evidence.close();
+});

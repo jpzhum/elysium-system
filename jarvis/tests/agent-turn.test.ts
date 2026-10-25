@@ -604,6 +604,68 @@ test.each(['start', 'write', 'done'] as const)('playback %s failures preserve th
   expect(h.manager.activeCount).toBe(0);
 });
 
+test('text output reports not_started only for a real playback failure before a consumed packet', async () => {
+  vi.useFakeTimers();
+  const notify = vi.fn();
+  let rejectDone!: (error: Error) => void;
+  const done = new Promise<void>((_resolve, reject) => { rejectDone = reject; });
+  void done.catch(() => undefined);
+  const playback: Playback = {
+    isPlaying: true, stopUser: vi.fn(), stop: vi.fn(),
+    startStream: vi.fn(() => ({ done, write: vi.fn(async () => undefined), end: vi.fn(), cancel: vi.fn() })),
+  };
+  const h = setup(false, undefined, { playback, notify });
+  const receipt = await h.ask();
+  h.audio(); h.complete(); await settle();
+  // Completion has sealed ingress. Buffering itself has no invented short
+  // start deadline, and the existing response deadline cannot fabricate failure.
+  await vi.advanceTimersByTimeAsync(45_001); await settle();
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: true });
+  expect(notify.mock.calls.filter(([, event]) => event.type === 'failed')).toHaveLength(0);
+  rejectDone(new DiagnosticError('playback', 'PLAYBACK_RESOURCE_ENDED')); await settle();
+  expect(h.failed('PLAYBACK_FAILED')).toMatchObject({ incident: receipt.turnId, input_kind: 'text',
+    audio_chunks: 1, audio_bytes: 4, input_audio_chunks: 0, input_audio_bytes: 0,
+    turn_delivery: 'not_started', completion_received: true, cause_code: 'PLAYBACK_RESOURCE_ENDED' });
+  expect(notify).toHaveBeenLastCalledWith(h.speaker, expect.objectContaining({
+    type: 'failed', turnId: receipt.turnId, delivery: 'not_started', generationComplete: true,
+  }));
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  expect(h.logs.filter(line => line.incident === receipt.turnId && line.event === 'jarvis_agent_turn_released')).toHaveLength(1);
+});
+
+test('a playback failure after a consumed packet reports partial output with its original sanitized observations', async () => {
+  const notify = vi.fn();
+  let rejectDone!: (error: Error) => void;
+  const done = new Promise<void>((_resolve, reject) => { rejectDone = reject; });
+  void done.catch(() => undefined);
+  const playback: Playback = {
+    isPlaying: true, stopUser: vi.fn(), stop: vi.fn(),
+    startStream: vi.fn((_id, _rate, _owner, options) => ({ done, end: vi.fn(), cancel: vi.fn(),
+      write: vi.fn(async () => {
+        options?.onProgress?.('first_packet', 0);
+        options?.onDiagnostic?.({ category: 'playback', code: 'PLAYBACK_ENCODER_FAILED', cause_name: 'RangeError',
+          playback_stage: 'opus_encode', opus_error_code: -2, player_status: 'playing', resource_ended: false,
+          subscribed: true, voice_status: 'ready', dave_ready: true });
+      }),
+    })),
+  };
+  const h = setup(false, undefined, { playback, notify });
+  const receipt = await h.ask();
+  h.audio(); h.complete(); await settle();
+  rejectDone(new Error(secret)); await settle();
+  expect(h.failed('PLAYBACK_FAILED')).toMatchObject({ incident: receipt.turnId, turn_delivery: 'partial',
+    completion_received: true, input_kind: 'text', input_audio_chunks: 0, cause_code: 'PLAYBACK_ENCODER_FAILED',
+    cause_name: 'RangeError', playback_stage: 'opus_encode', opus_error_code: -2,
+    player_status: 'playing', resource_ended: false, subscribed: true, voice_status: 'ready', dave_ready: true });
+  expect(notify).toHaveBeenLastCalledWith(h.speaker, expect.objectContaining({ type: 'failed',
+    turnId: receipt.turnId, delivery: 'partial', generationComplete: true, localDrained: false }));
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_finished')).toHaveLength(0);
+  expect(h.logs.filter(line => line.incident === receipt.turnId && line.event === 'jarvis_agent_turn_released')).toHaveLength(1);
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
+});
+
 test('real playback diagnostics survive a later generic stream rejection without losing encoder and player state', async () => {
   const playback: Playback = {
     isPlaying: false, stopUser: vi.fn(), stop: vi.fn(),

@@ -62,6 +62,10 @@ interface Playback {
   packetChunks: WeakMap<Buffer, number>;
   encodeAttempts: number;
   encodeMs: number;
+  encodedPackets: number;
+  consumedPackets: number;
+  acceptedBytes: number;
+  acceptedChunks: number;
 }
 
 class PlaybackCancelledError extends Error {
@@ -99,6 +103,9 @@ class GuardedStream extends Readable {
   ) { super({ objectMode: true, highWaterMark: 2 }); }
 
   override read(size?: number): Buffer | null {
+    // AudioPlayer destroys an old resource and then reads it during teardown.
+    // Buffered packets returned by that cleanup are never prepared for Discord.
+    if (this.destroyed) return null;
     if (!this.allowed()) { this.denied(); return null; }
     const packet = super.read(size) as Buffer | null;
     if (packet) this.consumed(packet);
@@ -130,7 +137,7 @@ class GuardedStream extends Readable {
 /** One stream per response, with owner priority only between queued streams. */
 export class PlaybackQueue {
   private readonly player: AudioPlayer;
-  private readonly subscription: PlayerSubscription;
+  private subscription: PlayerSubscription;
   private readonly waiting: Playback[] = [];
   private active: Playback | undefined;
   private stopped = false;
@@ -153,7 +160,16 @@ export class PlaybackQueue {
       this.disconnected = true;
       this.connectionFailure(next.status === VoiceConnectionStatus.Disconnected ? 'VOICE_DISCONNECTED' : 'VOICE_NOT_READY', next.status);
       this.cancelAll();
-    } else if (next.status === VoiceConnectionStatus.Ready) this.disconnected = false;
+    } else if (next.status === VoiceConnectionStatus.Ready) {
+      this.disconnected = false;
+      try { this.ensureSubscription(); }
+      catch (error) {
+        for (const item of [...this.waiting, ...(this.active ? [this.active] : [])]) {
+          this.complete(item, this.failure(item, error, 'subscribe', 'PLAYBACK_SUBSCRIBE_FAILED',
+            'Conexão de voz indisponível para reprodução.'));
+        }
+      }
+    }
   };
 
   constructor(private readonly connection: VoiceConnection, private readonly options: PlaybackOptions = {}) {
@@ -181,7 +197,8 @@ export class PlaybackQueue {
     this.player.on(AudioPlayerStatus.Idle, (before?: AudioPlayerState) => {
       const item = this.active;
       if (!item || (before && ('resource' in before ? before.resource !== item.resource : true))) return;
-      this.complete(item, item.finished ? undefined : this.failure(item,
+      const drained = item.finished && item.firstPacket && item.consumedPackets === item.encodedPackets;
+      this.complete(item, drained ? undefined : this.failure(item,
         new Error('Reprodução encerrada antes de esvaziar o fluxo.'), 'player', 'PLAYBACK_PREMATURE_IDLE',
         'Reprodução encerrada antes de esvaziar o fluxo.'));
     });
@@ -228,6 +245,14 @@ export class PlaybackQueue {
     if (!Number.isInteger(sampleRate) || sampleRate < 8_000 || sampleRate > 192_000) {
       this.rejectStart('Formato PCM de reprodução inválido.', 'PLAYBACK_PCM_INVALID', options);
     }
+    try { this.ensureSubscription(); }
+    catch (error) {
+      const failure = this.failure(undefined, error, 'subscribe', 'PLAYBACK_SUBSCRIBE_FAILED',
+        'Conexão de voz indisponível para reprodução.');
+      this.options.onMetric?.('playback_failed', 1);
+      try { options.onDiagnostic?.({ ...failure.details }); } catch { /* Best effort. */ }
+      throw failure;
+    }
     let resolve!: () => void;
     let reject!: (error: Error) => void;
     const done = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
@@ -236,6 +261,8 @@ export class PlaybackQueue {
       token: ++this.streamSequence,
       userId, isOwner, resolve, reject, finished: false, settled: false,
       consumedChunks: 0, packetChunks: new WeakMap(), encodeAttempts: 0, encodeMs: 0,
+      encodedPackets: 0, consumedPackets: 0,
+      acceptedBytes: 0, acceptedChunks: 0,
       created: performance.now(), firstPacket: false, drained: false, onProgress: options.onProgress,
       onDiagnostic: options.onDiagnostic,
       allowed: () => !this.stopped && !this.disconnected && !item.settled && (options.isAllowed?.() ?? true),
@@ -252,6 +279,8 @@ export class PlaybackQueue {
     item.deadline = setTimeout(() => this.complete(item, this.failure(item,
       new Error('Reprodução excedeu o prazo.'), 'deadline', 'PLAYBACK_DEADLINE', 'Reprodução excedeu o prazo.')), this.maxWallMs);
     item.deadline.unref();
+    this.observe(item, { playback_stage: 'pcm_input', playback_event: 'stream_accepted' });
+    if (this.snapshot(item).subscribed) this.observe(item, { playback_stage: 'subscribe', playback_event: 'subscribed' });
     return {
       done,
       write: async (pcm) => {
@@ -262,6 +291,9 @@ export class PlaybackQueue {
           this.pump();
           await writing;
           if (!item.allowed()) throw item.failure ?? new PlaybackCancelledError();
+          item.acceptedBytes += pcm.length;
+          item.acceptedChunks++;
+          if (item.acceptedChunks === 1) this.observe(item, { playback_stage: 'pcm_input', playback_event: 'pcm_accepted' });
           this.pump();
         } catch (error) {
           const safe = item.failure ?? (!item.allowed() ? new PlaybackCancelledError()
@@ -318,12 +350,15 @@ export class PlaybackQueue {
     this.active = item;
     if (!item.allowed()) { this.complete(item, new PlaybackCancelledError()); return; }
     try {
+      this.ensureSubscription(item);
       item.stream = new GuardedStream(this.encode(item), item.allowed,
         () => this.complete(item, new PlaybackCancelledError()), (packet) => {
           this.resume(item);
+          item.consumedPackets++;
           if (!item.firstPacket) {
             item.firstPacket = true;
             this.progress(item, 'first_packet');
+            this.observe(item, { playback_stage: 'stream', playback_event: 'packet_read' });
           }
           const count = item.packetChunks.get(packet) ?? 0;
           if (count) this.options.onMetric?.('audio_chunks_played', count);
@@ -332,6 +367,11 @@ export class PlaybackQueue {
       item.stream.on('error', (error: Error) => this.complete(item,
         this.failure(item, error, 'stream', 'PLAYBACK_STREAM_FAILED', 'Falha ao preparar reprodução.')));
       item.resource = createAudioResource(item.stream, { inputType: StreamType.Opus });
+      this.observe(item, { playback_stage: 'resource_create', playback_event: 'resource_created' });
+      item.stream.once('readable', () => {
+        if (!item.settled) this.observe(item, { playback_stage: 'stream', playback_event: 'readable' });
+      });
+      this.observe(item, { playback_stage: 'player_start', playback_event: 'play_called' });
       this.player.play(item.resource);
       this.options.onMetric?.('audio_stream_started', 1);
       this.options.onMetric?.('playback_started', 1);
@@ -362,6 +402,7 @@ export class PlaybackQueue {
           }
           item.packetChunks.set(packet, item.consumedChunks);
           item.consumedChunks = 0;
+          item.encodedPackets++;
           yield packet;
         } finally { frame.fill(0); }
       }
@@ -393,6 +434,7 @@ export class PlaybackQueue {
     item.source.cancel();
     item.stream?.destroy();
     if (wasActive && error) this.player.stop(true);
+    this.observe(item, { playback_stage: 'player', playback_event: 'settled' });
     if (error) {
       this.options.onMetric?.(error instanceof PlaybackCancelledError ? 'playback_cancelled' : 'playback_failed', 1);
       item.reject(error);
@@ -424,19 +466,53 @@ export class PlaybackQueue {
     const state = this.connection.state;
     const network = state && 'networking' in state ? state.networking.state : undefined;
     const dave = network && 'dave' in network ? network.dave : undefined;
+    const playable = this.player.playable;
+    const registered = state?.status !== VoiceConnectionStatus.Ready || !Array.isArray(playable) || playable.includes(this.connection);
     return {
       ...(state ? { voice_status: state.status } : {}),
-      subscribed: Boolean(this.subscription && state && 'subscription' in state && state.subscription === this.subscription),
+      subscribed: Boolean(this.subscription && state && 'subscription' in state && state.subscription === this.subscription && registered),
       ...(network ? { network_status: network.code } : {}),
       ...(dave ? { dave_protocol_version: dave.protocolVersion, dave_ready: dave.session?.ready } : {}),
       ...(this.player.state ? { player_status: this.player.state.status } : {}),
       ...(item?.resource ? { resource_ended: item.resource.ended } : {}),
+      ...(item ? { playback_token: item.token, playback_elapsed_ms: Math.round(Math.max(0, performance.now() - item.created)),
+        encoded_packets: item.encodedPackets, consumed_packets: item.consumedPackets,
+        audio_bytes: item.acceptedBytes, audio_chunks: item.acceptedChunks } : {}),
+      ...(item?.stream ? { stream_destroyed: item.stream.destroyed } : {}),
+      ...(item?.resource ? { resource_started: item.resource.started, resource_playback_ms: item.resource.playbackDuration,
+        resource_current: Boolean(this.player.state && 'resource' in this.player.state && this.player.state.resource === item.resource) } : {}),
     };
   }
 
   private observe(item: Playback, fields: DiagnosticFields): void {
-    try { item.onDiagnostic?.(sanitizeDiagnosticFields(fields)); }
+    try { item.onDiagnostic?.(sanitizeDiagnosticFields({ ...this.snapshot(item), ...fields })); }
     catch { /* Observability cannot interrupt playback or cleanup. */ }
+  }
+
+  /** Reconnect normally preserves this in the pinned library; repair only genuine loss. */
+  private ensureSubscription(item?: Playback): void {
+    const state = this.connection.state;
+    if (!state || state.status !== VoiceConnectionStatus.Ready) return;
+    const current = 'subscription' in state ? state.subscription : undefined;
+    if (current) {
+      if (current.connection !== this.connection || current.player !== this.player) {
+        throw this.failure(item, new Error('Assinatura pertence a outro player.'), 'subscribe',
+          'PLAYBACK_SUBSCRIBE_FAILED', 'Conexão de voz indisponível para reprodução.');
+      }
+      const playable = this.player.playable;
+      if (!Array.isArray(playable) || playable.includes(this.connection)) {
+        this.subscription = current;
+        return;
+      }
+    }
+    let subscription: PlayerSubscription | undefined;
+    try { subscription = this.connection.subscribe(this.player); }
+    catch (error) { throw this.failure(item, error, 'subscribe', 'PLAYBACK_SUBSCRIBE_FAILED',
+      'Conexão de voz indisponível para reprodução.'); }
+    if (!subscription) throw this.failure(item, new Error('Assinatura de voz indisponível.'), 'subscribe',
+      'PLAYBACK_SUBSCRIBE_FAILED', 'Conexão de voz indisponível para reprodução.');
+    this.subscription = subscription;
+    if (item) this.observe(item, { playback_stage: 'subscribe', playback_event: 'subscribed' });
   }
 
   private failure(item: Playback | undefined, error: unknown, stage: DiagnosticFields['playback_stage'],
