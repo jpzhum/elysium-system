@@ -4,7 +4,7 @@ import { setImmediate as tick } from 'node:timers/promises';
 import { test, vi } from 'vitest';
 import OpusScript from 'opusscript';
 import { AudioPlayerError, AudioPlayerStatus, createAudioPlayer, type AudioPlayer, type PlayerSubscription,
-  type VoiceConnection } from '@discordjs/voice';
+  type VoiceConnection, type AudioResource } from '@discordjs/voice';
 import { PlaybackQueue, playbackFailureFields } from '../src/audio/playback.js';
 import { OpusDecoder } from '../src/audio/opus-decoder.js';
 import type { DiagnosticFields } from '../src/observability/metrics.js';
@@ -329,4 +329,96 @@ test('Opus CPU totals stay with each resource and are emitted once without claim
     assert.ok(Math.abs(total - metrics.opus_encode_ms!) < 1e-6);
     assert.equal(metrics.playback_completed, 2);
   } finally { queue.stop(); }
+});
+
+test('one real AudioPlayer and PlaybackQueue survive twenty responses with a fourth-turn stream failure', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  const scheduled = vi.spyOn(globalThis, 'setTimeout');
+  const cleared = vi.spyOn(globalThis, 'clearTimeout');
+  const { queue, player, connection, metrics } = setup();
+  const decoder = new OpusDecoder();
+  const disposal = vi.spyOn(OpusScript.prototype, 'delete');
+  const subscription = connection.state.subscription;
+  const listenerCounts = player.eventNames().map(name => [name, player.listenerCount(name)] as const);
+  const voiceListeners = connection.listenerCount('stateChange');
+  let packets = 0;
+  let failedResource: AudioResource | undefined;
+  Reflect.set(connection, 'prepareAudioPacket', (packet: Buffer) => {
+    assert.equal(decoder.decode(packet).length, 960 * 4);
+    if (packet.length > 3) packets++;
+  });
+  const pcm = Buffer.alloc(16_000 * 2 / 5);
+  for (let sample = 0; sample < pcm.length / 2; sample++) {
+    pcm.writeInt16LE(Math.round(8_000 * Math.sin(2 * Math.PI * 440 * sample / 16_000)), sample * 2);
+  }
+  try {
+    for (let turn = 1; turn <= 20; turn++) {
+      let terminal = 0;
+      const diagnostics: DiagnosticFields[] = [];
+      const stream = queue.startStream(turn % 2 ? 'a' : 'b', 16_000, false, {
+        onDiagnostic: fields => { diagnostics.push(fields); },
+      });
+      void stream.done.then(() => { terminal++; }, () => { terminal++; });
+      await stream.write(pcm); stream.end();
+      await tick();
+      const before = packets;
+      for (let frame = 0; queue.isPlaying && frame < 100; frame++) {
+        // Exercise the pinned player's real resource reader and packet preparation;
+        // only the Discord transport and wall-clock scheduler are controlled.
+        if (Reflect.get(player, 'checkPlayable').call(player)) {
+          Reflect.get(player, '_stepDispatch').call(player);
+          Reflect.get(player, '_stepPrepare').call(player);
+        }
+        await tick();
+        if (turn === 4 && frame === 2) {
+          failedResource = player.state.status === AudioPlayerStatus.Idle ? undefined : player.state.resource;
+          assert.ok(failedResource);
+          failedResource.playStream.emit('error', new Error('PRIVATE simulated stream failure'));
+        }
+        if (turn === 5 && frame === 2) {
+          assert.ok(failedResource);
+          failedResource.playStream.emit('error', new Error('PRIVATE disposed stream'));
+          player.emit('error', new AudioPlayerError(new Error('PRIVATE stale player error'), failedResource));
+        }
+      }
+      assert.equal(queue.isPlaying, false, `turn ${turn} released within the bounded player steps`);
+      if (turn === 4) await assert.rejects(stream.done);
+      else await stream.done;
+      await tick();
+      // Allow the library's process-wide 20 ms scheduler to observe Idle too.
+      // Resource deadlines must already be cancelled, rather than expiring here.
+      await vi.advanceTimersByTimeAsync(20);
+      await tick();
+      assert.ok(packets > before, `turn ${turn} consumed valid Opus locally`);
+      assert.equal(terminal, 1);
+      assert.equal(queue.isPlaying, false);
+      assert.equal(player.state.status, AudioPlayerStatus.Idle);
+      assert.equal(connection.state.subscription, subscription);
+      assert.equal(queue.diagnosticState.available, true);
+      assert.equal(metrics.audio_stream_buffer_bytes, 0);
+      assert.equal(disposal.mock.calls.length, turn);
+      assert.deepEqual(player.eventNames().map(name => [name, player.listenerCount(name)] as const), listenerCounts);
+      assert.equal(connection.listenerCount('stateChange'), voiceListeners);
+      // The pinned library also owns a process-wide AudioPlayer scheduler. Its
+      // pending setImmediate chain can overlap fake-clock boundaries; assert the
+      // resource deadlines/drain debounce owned by this queue are all cleared.
+      const clearedTimers = new Set(cleared.mock.calls.map(([timer]) => timer));
+      const resourceTimers = scheduled.mock.calls.flatMap(([, delay], index) =>
+        delay === 180_000 || delay === 250 ? [scheduled.mock.results[index]!.value] : []);
+      assert.ok(resourceTimers.length >= turn);
+      for (const timer of resourceTimers) assert.ok(clearedTimers.has(timer), `turn ${turn} cleared every resource timer`);
+      assert.equal(diagnostics.filter(fields => fields.opus_encode_ms !== undefined).length, 1);
+      assert.doesNotMatch(JSON.stringify(diagnostics), /PRIVATE/);
+    }
+    assert.equal(metrics.playback_started, 20);
+    assert.equal(metrics.playback_completed, 19);
+    assert.equal(metrics.playback_failed, 1);
+  } finally {
+    queue.stop();
+    disposal.mockRestore();
+    decoder.delete();
+    scheduled.mockRestore();
+    cleared.mockRestore();
+    vi.useRealTimers();
+  }
 });

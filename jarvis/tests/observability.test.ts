@@ -74,6 +74,19 @@ describe('bounded structured operational logging', () => {
     expect(record.incident).toMatch(/^[A-F0-9]{8}$/);
   });
 
+  test('speaker backoff remains distinguishable from the shared wake quota without speaker identifiers', () => {
+    const state = capture();
+    state.logger.event('jarvis_wake_failed', 'warn', {
+      stage: 'wake_detection', rejection_reason: 'wake_speaker_backoff', retry_after_ms: 10_000,
+    });
+    expect(state.records()[0]).toMatchObject({
+      rejection_reason: 'wake_speaker_backoff', retry_after_ms: 10_000, stage: 'wake_detection',
+    });
+    expect(Object.keys(state.records()[0]!)).toEqual([
+      'time', 'level', 'event', 'incident', 'stage', 'rejection_reason', 'retry_after_ms',
+    ]);
+  });
+
   test('rejects unknown event names even when a leaked string fits a name-shaped regex', () => {
     const state = capture();
     state.logger.event('private_token');

@@ -18,6 +18,8 @@ export interface VoiceReceiverOptions {
   playbackToken?: () => number | undefined;
   maxTurnSeconds: number;
   onTurn: (userId: string, pcm48kStereo: Buffer, timing: VoiceTurnTiming) => void | Promise<void>;
+  /** A bounded capture that still lacks an observed end must never become a partial question. */
+  onCaptureRejected?: (userId: string, reason: 'duration_limit') => void | Promise<void>;
   onMetric?: (name: string, value: number) => void;
   onState?: (state: VoiceReceiverState) => void;
   /** Content-free source and capture state; never forwards the original exception. */
@@ -191,7 +193,9 @@ export class VoiceReceiver {
       decoder = new OpusDecoder();
       const maxSeconds = duringPlayback ? Math.min(BARGE_IN_SECONDS, this.options.maxTurnSeconds)
         : this.options.maxTurnSeconds;
-      const timeout = setTimeout(() => this.finish(userId, true), maxSeconds * 1_000);
+      const timeout = setTimeout(() => {
+        if (state && this.turns.get(userId) === state) this.limit(userId, state);
+      }, maxSeconds * 1_000);
       timeout.unref();
       const now = performance.now();
       state = { stream, decoder, chunks: [], bytes: 0, voiced: false, silentBytes: 0, timeout,
@@ -247,14 +251,35 @@ export class VoiceReceiver {
       if (chunk !== pcm) pcm.fill(0);
       state.chunks.push(chunk);
       state.bytes += chunk.length;
-      if (state.bytes >= state.maxBytes || state.silentBytes >= BYTES_PER_SECOND * SILENCE_MS / 1_000) {
-        this.metric("voice_turn_limits", state.bytes >= state.maxBytes ? 1 : 0);
+      if (state.silentBytes >= BYTES_PER_SECOND * SILENCE_MS / 1_000) {
         this.finish(userId, true);
-      }
+      } else if (state.bytes >= state.maxBytes) this.limit(userId, state);
     } catch (error) {
       this.receiveError(error, 'decode', state);
       this.finish(userId, false);
     }
+  }
+
+  private limit(userId: string, state: IncomingTurn): void {
+    if (this.turns.get(userId) !== state) return;
+    this.metric('voice_turn_limits');
+    // Barge-in inspects a bounded stop-command excerpt by design. Normal questions
+    // require a genuine end of capture before the existing total duration budget.
+    if (state.duringPlayback) { this.finish(userId, true); return; }
+    const notify = state.voiced && state.bytes > 0 && this.allowed(userId) && !this.options.isPlaying();
+    this.finish(userId, false);
+    if (!notify) return;
+    this.metric('voice_capture_duration_limit_rejected');
+    try {
+      this.options.onDiagnostic?.({ incident: newIncident(), stage: 'voice_capture',
+        category: 'voice', code: 'AGENT_INPUT_INVALID', capture_rejection: 'duration_limit',
+        capture_bytes: state.bytes, capture_ms: Math.max(0, Math.round(performance.now() - state.startedAt)),
+        receiver_state: this.state, voice_status: this.connection.state.status });
+    } catch { /* Diagnostics cannot interrupt capture cleanup. */ }
+    try {
+      void Promise.resolve(this.options.onCaptureRejected?.(userId, 'duration_limit'))
+        .catch(() => this.metric('voice_capture_rejection_callback_failed'));
+    } catch { this.metric('voice_capture_rejection_callback_failed'); }
   }
 
   private finish(userId: string, deliver: boolean): void {

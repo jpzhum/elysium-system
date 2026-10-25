@@ -123,7 +123,8 @@ test('waiting STT expires after eight seconds without spending a request or sile
   try {
     let release!: (response: Response) => void;
     const request = vi.fn<typeof fetch>(() => new Promise<Response>((resolve) => { release = resolve; }));
-    const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 1, vi.fn(), request);
+    // Leave one paid-call slot available: an exhausted quota is rejected before queue admission.
+    const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 2, vi.fn(), request);
     const active = expect(detector.detect(Buffer.alloc(48_000))).rejects.toMatchObject({ code: 'wake_provider_failed' });
     const rejected = expect(detector.detect(Buffer.alloc(48_000))).rejects.toMatchObject({ code: 'wake_queue_timeout' });
     await vi.advanceTimersByTimeAsync(8_000);
@@ -190,4 +191,210 @@ test('in-flight revocation settles immediately even if the transport has not ret
   abort.abort();
   expect(await pending).toBe(false);
   expect(caller.every((value) => value === 1)).toBe(true);
+});
+
+test('six background transcripts spend the shared budget, reject the next wake explicitly, and recover on expiry', async () => {
+  vi.useFakeTimers();
+  try {
+    const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'fala de fundo sem ativação' }));
+    const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+    const pcm = Buffer.alloc(48_000, 1);
+    for (let turn = 0; turn < 6; turn++) expect(await detector.detect(pcm)).toBe(false);
+    expect(detector.operationalState).toEqual({ remaining: 0, queued: 0, active: false, retryAfterMs: 60_000 });
+    await expect(detector.detect(pcm)).rejects.toMatchObject({ code: 'wake_rate_limited', retryAfterMs: 60_000 });
+    expect(request).toHaveBeenCalledTimes(6);
+    await vi.advanceTimersByTimeAsync(60_000);
+    request.mockImplementationOnce(async () => Response.json({ text: 'Jarvis, agora sim' }));
+    expect(await detector.detect(pcm)).toBe(true);
+    expect(request).toHaveBeenCalledTimes(7);
+    expect(detector.operationalState).toEqual({ remaining: 5, queued: 0, active: false, retryAfterMs: 0 });
+  } finally { vi.useRealTimers(); }
+});
+
+test('a rolling minute prevents twelve paid wake checks around a fixed-window boundary', async () => {
+  vi.useFakeTimers();
+  try {
+    const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'Jarvis' }));
+    const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+    const pcm = Buffer.alloc(48_000, 1);
+    await vi.advanceTimersByTimeAsync(59_000);
+    for (let check = 0; check < 6; check++) expect(await detector.detect(pcm)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_001);
+    await expect(detector.detect(pcm)).rejects.toMatchObject({ code: 'wake_rate_limited', retryAfterMs: 58_999 });
+    expect(request).toHaveBeenCalledTimes(6);
+  } finally { vi.useRealTimers(); }
+});
+
+test('spent quota rejects before a new capture is copied or queued behind active STT', async () => {
+  let release!: (response: Response) => void;
+  const request = vi.fn<typeof fetch>(() => new Promise<Response>(resolve => { release = resolve; }));
+  const metric = vi.fn();
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 1, metric, request);
+  const pcm = Buffer.alloc(48_000, 1);
+  const active = detector.detect(pcm);
+  const copy = vi.spyOn(Buffer, 'from');
+  const rejected = detector.detect(pcm);
+  const copies = copy.mock.calls.length;
+  copy.mockRestore();
+  expect(copies).toBe(0);
+  expect(metric).not.toHaveBeenCalledWith('wake_queued');
+  await expect(rejected).rejects.toMatchObject({ code: 'wake_rate_limited' });
+  expect(detector.operationalState).toMatchObject({ remaining: 0, queued: 0, active: true });
+  release(Response.json({ text: 'Jarvis' }));
+  expect(await active).toBe(true);
+});
+
+const ambientSpeaker = { discordUserId: 'guest', consentVersion: 1, channelId: 'voice' };
+
+test('two negative wakes back off only that speaker and leave shared capacity for the creator', async () => {
+  vi.useFakeTimers();
+  try {
+    const metric = vi.fn();
+    const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'conversa ambiente' }));
+    const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, metric, request);
+    const pcm = Buffer.alloc(48_000, 1);
+    expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+    expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+    await expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({
+      code: 'wake_rate_limited', rateLimitSource: 'speaker_backoff', retryAfterMs: 10_000,
+    });
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(metric).toHaveBeenCalledWith('wake_speaker_backoff');
+    request.mockImplementationOnce(async () => Response.json({ text: 'Jarvis, responda' }));
+    expect(await detector.detect(pcm, undefined, { ...ambientSpeaker, discordUserId: 'owner' })).toBe(true);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+    await expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({
+      rateLimitSource: 'speaker_backoff', retryAfterMs: 20_000,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+    await expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({
+      rateLimitSource: 'speaker_backoff', retryAfterMs: 40_000,
+    });
+    expect(request).toHaveBeenCalledTimes(5); // Four ambient calls and one legitimate activation.
+    expect(detector.operationalState.remaining).toBe(1);
+    expect(JSON.stringify(metric.mock.calls)).not.toContain('guest');
+  } finally { vi.useRealTimers(); }
+});
+
+test('activation resets negative-wake history without increasing the shared paid-call budget', async () => {
+  vi.useFakeTimers();
+  try {
+    const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'fala ambiente' }));
+    const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+    const pcm = Buffer.alloc(48_000, 1);
+    await detector.detect(pcm, undefined, ambientSpeaker);
+    request.mockImplementationOnce(async () => Response.json({ text: 'Jarvis' }));
+    expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(true);
+    expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+    expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+    await expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({
+      rateLimitSource: 'speaker_backoff', retryAfterMs: 10_000,
+    });
+    expect(detector.operationalState.remaining).toBe(2);
+  } finally { vi.useRealTimers(); }
+});
+
+test('negative-wake backoff is scoped to verified ID, consent version and channel', async () => {
+  const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'fala ambiente' }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  const pcm = Buffer.alloc(48_000, 1);
+  await detector.detect(pcm, undefined, ambientSpeaker);
+  await detector.detect(pcm, undefined, ambientSpeaker);
+  await expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({ rateLimitSource: 'speaker_backoff' });
+  expect(await detector.detect(pcm, undefined, { ...ambientSpeaker, consentVersion: 2 })).toBe(false);
+  expect(await detector.detect(pcm, undefined, { ...ambientSpeaker, channelId: 'other' })).toBe(false);
+  expect(await detector.detect(pcm, undefined, { ...ambientSpeaker, discordUserId: 'other' })).toBe(false);
+  expect(request).toHaveBeenCalledTimes(5);
+});
+
+test('a queued inspection rechecks per-speaker backoff before spending another paid call', async () => {
+  let release!: (response: Response) => void;
+  const request = vi.fn<typeof fetch>(() => new Promise<Response>(resolve => { release = resolve; }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  const pcm = Buffer.alloc(48_000, 1);
+  const first = detector.detect(pcm, undefined, ambientSpeaker);
+  const second = detector.detect(pcm, undefined, ambientSpeaker);
+  const third = expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({ rateLimitSource: 'speaker_backoff' });
+  release(Response.json({ text: 'sem ativação' }));
+  expect(await first).toBe(false);
+  await Promise.resolve();
+  release(Response.json({ text: 'ainda sem ativação' }));
+  expect(await second).toBe(false);
+  await third;
+  expect(request).toHaveBeenCalledTimes(2);
+  expect(detector.operationalState).toMatchObject({ remaining: 4, active: false, queued: 0 });
+});
+
+test('negative-wake state is bounded and expires without retaining timers', async () => {
+  vi.useFakeTimers();
+  try {
+    const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 30, vi.fn(),
+      vi.fn<typeof fetch>(async () => Response.json({ text: 'sem ativação' })));
+    const pcm = Buffer.alloc(48_000, 1);
+    for (let index = 0; index < 20; index++) {
+      await detector.detect(pcm, undefined, { ...ambientSpeaker, discordUserId: `speaker-${index}` });
+    }
+    expect(detector.admissionState).toEqual({ tracked: 16, backingOff: 0 });
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(detector.admissionState).toEqual({ tracked: 0, backingOff: 0 });
+    expect(detector.operationalState.remaining).toBe(30);
+  } finally { vi.useRealTimers(); }
+});
+
+test('revocation and room teardown clear speaker backoff while preserving the worker cost ceiling', async () => {
+  const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'sem ativação' }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 4, vi.fn(), request);
+  const pcm = Buffer.alloc(48_000, 1);
+  await detector.detect(pcm, undefined, ambientSpeaker);
+  await detector.detect(pcm, undefined, ambientSpeaker);
+  detector.forget(ambientSpeaker.discordUserId);
+  expect(detector.admissionState.tracked).toBe(0);
+  expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+  detector.clearAdmission();
+  expect(detector.admissionState.tracked).toBe(0);
+  expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+  detector.clearAdmission();
+  await expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({ rateLimitSource: 'global_budget' });
+  expect(request).toHaveBeenCalledTimes(4);
+});
+
+test('forget fences late recognition from a revoked admission record without repopulating it', async () => {
+  let release!: (response: Response) => void;
+  const request = vi.fn<typeof fetch>(() => new Promise<Response>(resolve => { release = resolve; }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  const pcm = Buffer.alloc(48_000, 1);
+  const pending = detector.detect(pcm, undefined, ambientSpeaker);
+  detector.forget(ambientSpeaker.discordUserId);
+  release(Response.json({ text: 'Jarvis, conteúdo antigo' }));
+  expect(await pending).toBe(false);
+  expect(detector.admissionState).toEqual({ tracked: 0, backingOff: 0 });
+  expect(detector.operationalState.remaining).toBe(5);
+  const next = detector.detect(pcm, undefined, { ...ambientSpeaker, consentVersion: 2 });
+  release(Response.json({ text: 'fala sem ativação' }));
+  expect(await next).toBe(false);
+  expect(detector.admissionState).toEqual({ tracked: 1, backingOff: 0 });
+});
+
+test('cancelled and failed recognition do not count as negative wakes for speaker admission', async () => {
+  const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'fala ambiente' }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  const pcm = Buffer.alloc(48_000, 1);
+  expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+  request.mockImplementationOnce(async (_url, options) => {
+    await new Promise<void>(resolve => options!.signal!.addEventListener('abort', () => resolve(), { once: true }));
+    return Response.json({ text: 'Jarvis, resultado cancelado' });
+  });
+  const abort = new AbortController();
+  const cancelled = detector.detect(pcm, abort.signal, ambientSpeaker);
+  abort.abort();
+  expect(await cancelled).toBe(false);
+  request.mockImplementationOnce(async () => new Response('PRIVATE', { status: 429 }));
+  await expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({ code: 'wake_provider_failed' });
+  expect(detector.admissionState.backingOff).toBe(0);
+  expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+  await expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({ rateLimitSource: 'speaker_backoff' });
+  expect(request).toHaveBeenCalledTimes(4);
 });

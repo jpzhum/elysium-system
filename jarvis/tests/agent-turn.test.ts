@@ -46,7 +46,10 @@ function setup(pendingPlayback = false, pace?: SessionOptions['pace'], options: 
   const grant = consent.grant('guest', true);
   const speaker = speakerContext({ discordUserId: 'guest', displayName: secret, guildId: 'guild', channelId: 'room',
     consented: true, consentVersion: grant.version }, 'owner');
-  interface LocalStream extends PlaybackStream { userId: string; ended: boolean; settled: boolean; finish(): void; }
+  interface LocalStream extends PlaybackStream {
+    userId: string; ended: boolean; settled: boolean; finish(): void;
+    progress(event: 'first_packet' | 'drained' | 'resumed'): void;
+  }
   const streams: LocalStream[] = [];
   const copies: Buffer[] = [];
   let allowFinish = !pendingPlayback;
@@ -60,6 +63,7 @@ function setup(pendingPlayback = false, pace?: SessionOptions['pace'], options: 
       let started = false;
       const stream: LocalStream = {
         userId, done, ended: false, settled: false,
+        progress: event => options?.onProgress?.(event, 0),
         write: vi.fn(async (pcm) => {
           if (stream.settled || stream.ended || options?.isAllowed?.() === false) throw new Error('cancelled');
           // Synthetic consumer accepts bounded chunks and records copies before
@@ -129,6 +133,25 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+test('a partial answer followed by a transport error has one definitive terminal after local drain', async () => {
+  const notify = vi.fn();
+  const h = setup(true, undefined, { notify });
+  const receipt = await h.ask();
+  h.audio(); await settle();
+  h.streams[0]!.progress('first_packet');
+  h.socket.emit('error', new Error(secret)); await settle();
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_error')).toHaveLength(1);
+  expect(notify.mock.calls.filter(([, event]) => event.type === 'failed')).toHaveLength(0);
+  h.finishPlayback(); await settle();
+  const terminal = h.logs.filter(line => line.incident === receipt.turnId
+    && ['jarvis_agent_turn_failed', 'jarvis_agent_turn_finished', 'jarvis_agent_turn_cancelled'].includes(String(line.event)));
+  expect(terminal).toMatchObject([{ event: 'jarvis_agent_turn_failed', turn_outcome: 'partial', turn_delivery: 'partial', stage: 'playback' }]);
+  expect(h.logs.filter(line => line.incident === receipt.turnId && line.event === 'jarvis_agent_turn_released')).toHaveLength(1);
+  expect(notify).toHaveBeenLastCalledWith(h.speaker, expect.objectContaining({ type: 'failed', delivery: 'partial', turnId: receipt.turnId }));
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
+});
+
 test.each([
   ['agent_request_timeout', 'AGENT_REQUEST_TIMEOUT'],
   ['agent_closed_before_metadata', 'AGENT_PREMATURE_CLOSE'],
@@ -191,6 +214,23 @@ test('failed wake STT retains the capture incident without becoming a missed wak
     duration_ms: expect.any(Number),
   });
   expect(h.metrics.snapshot().wake_rejections ?? 0).toBe(0);
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
+});
+
+test.each([
+  ['global_budget', 'wake_rate_limited'],
+  ['speaker_backoff', 'wake_speaker_backoff'],
+] as const)('wake rejection preserves its %s admission source and bounded retry delay', async (source, rejectionReason) => {
+  const h = setup();
+  h.detectWake.mockRejectedValue(new WakeError('wake_rate_limited', 10_000, source));
+  await expect(h.manager.voiceTurn(h.speaker, Buffer.alloc(19_200, 1)))
+    .rejects.toMatchObject({ code: 'wake_rate_limited' });
+  expect(h.logs.find(line => line.event === 'jarvis_wake_failed')).toMatchObject({
+    rejection_reason: rejectionReason, retry_after_ms: 10_000, stage: 'wake_detection',
+  });
+  expect(h.detectWake).toHaveBeenCalledWith(expect.any(Buffer), expect.any(AbortSignal), h.speaker);
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  expect(h.manager.activeCount).toBe(0);
   expect(JSON.stringify(h.logs)).not.toContain(secret);
 });
 

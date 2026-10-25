@@ -166,8 +166,10 @@ test('an authenticated and consenting owner can stop output after an exact voice
   const h = setup();
   const inspect = vi.spyOn(h.access.wake, 'inspect').mockResolvedValue({ activated: true, interrupt: true });
   await h.access.voiceInterruption(h.room, h.members.get(OWNER)!, Buffer.alloc(19_200), 1);
-  expect(inspect).toHaveBeenCalledExactlyOnceWith(expect.any(Buffer), expect.any(AbortSignal),
-    { allowInterruption: true });
+  expect(inspect).toHaveBeenCalledOnce();
+  expect(inspect.mock.calls[0]![2]).toEqual({ allowInterruption: true,
+    speaker: expect.objectContaining({ discordUserId: OWNER, isOwner: true,
+      channelId: CHANNEL, consentVersion: h.room.consent.get(OWNER)!.version }) });
   expect(h.room.sessions.interruptOwner).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
     discordUserId: OWNER, isOwner: true,
   }));

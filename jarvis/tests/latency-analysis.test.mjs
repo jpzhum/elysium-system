@@ -3,6 +3,21 @@ import { createLatencyAnalysis } from '../scripts/analyze-latency.mjs';
 
 function add(analysis, incident, event, fields = {}) { analysis.addLine(JSON.stringify({ incident, event, ...fields })); }
 
+test('V57 causal errors remain nonterminal and partial/expired results keep their actual outcome', () => {
+  const analysis = createLatencyAnalysis();
+  add(analysis, 'AAAAAAAA', 'jarvis_agent_turn_started');
+  add(analysis, 'AAAAAAAA', 'jarvis_agent_turn_error', { code: 'AGENT_TRANSPORT_ERROR', turn_delivery: 'partial' });
+  expect(analysis.snapshot().terminal_turns).toBe(0);
+  add(analysis, 'AAAAAAAA', 'jarvis_agent_turn_failed', { turn_outcome: 'partial' });
+  add(analysis, 'AAAAAAAA', 'jarvis_agent_turn_released', { turn_outcome: 'partial' });
+  add(analysis, 'BBBBBBBB', 'jarvis_agent_turn_started');
+  add(analysis, 'BBBBBBBB', 'jarvis_agent_turn_cancelled', { turn_outcome: 'expired' });
+  const report = analysis.snapshot();
+  expect(report.outcomes).toMatchObject({ failed: 0, partial: 1, expired: 1, completed: 0 });
+  expect(report.terminal_turns).toBe(2);
+  expect(report.terminal_outcome_rates).toMatchObject({ denominator: 2, partial: 0.5, expired: 0.5 });
+});
+
 test('latency analysis correlates stages by incident, not line order or unrelated population averages', () => {
   const analysis = createLatencyAnalysis();
   for (const [incident, queue, upload, audio, playback] of [

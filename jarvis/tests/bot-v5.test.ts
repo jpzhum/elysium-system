@@ -92,11 +92,11 @@ interface Access {
 
 async function settle(): Promise<void> { for (let i = 0; i < 120; i++) await Promise.resolve(); }
 
-async function setup() {
+async function setup(daveSmoke = false) {
   const config = loadConfig({ JARVIS_DISCORD_TOKEN: 'fictional-discord-token-for-v5-tests',
     JARVIS_OWNER_USER_ID: OWNER, JARVIS_GUILD_ID: GUILD,
     ELEVENLABS_API_KEY: 'fictional-elevenlabs-key', ELEVENLABS_AGENT_ID: 'fictional-agent',
-    JARVIS_VOICE_INPUT: 'elevenlabs-stt', RENDER_GIT_COMMIT: 'cfcdd03' });
+    JARVIS_VOICE_INPUT: 'elevenlabs-stt', RENDER_GIT_COMMIT: 'cfcdd03' }, daveSmoke);
   const logs: Record<string, unknown>[] = [];
   const bot = new JarvisBot(config, new Logger('info', line => logs.push(JSON.parse(line))));
   active.push(bot);
@@ -120,14 +120,16 @@ async function setup() {
     members.set(id, member); return member;
   };
   addMember(OWNER); addMember(GUEST); addMember(BOT, 'Jarvis', true);
-  const interaction = (command: string, userId = OWNER, audio = false, group?: string) => {
+  const interaction = (command: string, userId = OWNER, audio = false, group?: string,
+    statusOptions: { details?: boolean; incident?: string } = {}) => {
     let deferred = false;
     const reply = vi.fn(async (_payload: { content: string; flags?: number }) => undefined);
     const editReply = vi.fn(async (_payload: { content: string; flags?: number }) => undefined);
     const followUp = vi.fn(async (_payload: { content: string; flags?: number }) => undefined);
     const input = { inCachedGuild: () => true, guildId: GUILD, guild, user: { id: userId }, member: members.get(userId),
       options: { getSubcommand: () => command, getSubcommandGroup: () => group,
-        getString: () => privateText, getBoolean: () => audio },
+        getString: (name: string) => name === 'texto' ? privateText : name === 'incidente' ? statusOptions.incident ?? null : null,
+        getBoolean: (name: string) => name === 'audio' ? audio : name === 'detalhes' ? statusOptions.details ?? false : false },
       get deferred() { return deferred; }, replied: false, reply, editReply, followUp,
       deferReply: vi.fn(async () => { deferred = true; }) };
     return { run: () => access.handle(input as unknown as ChatInputCommandInteraction), reply, editReply, followUp };
@@ -166,22 +168,99 @@ afterEach(async () => {
 });
 
 describe('V5 Discord integration with the real per-speaker session manager', () => {
+  test('DAVE probe status masks personal IDs and remains restricted to the creator', async () => {
+    const h = await setup(true);
+    await h.interaction('consent', OWNER, true).run();
+    await h.interaction('consent', GUEST, true).run();
+    await h.voice(OWNER); await h.voice(GUEST);
+    const owner = h.interaction('status'); await owner.run();
+    const content = owner.followUp.mock.calls.map(([payload]) => payload.content).join('\n');
+    expect(content).toContain('falante_1_…0001');
+    expect(content).toContain('falante_2_…0002');
+    expect(content).not.toContain(OWNER); expect(content).not.toContain(GUEST);
+    const guest = h.interaction('status', GUEST); await guest.run();
+    expect(guest.followUp.mock.calls.map(([payload]) => payload.content).join('\n')).not.toContain('Prova por falante');
+    expect(JSON.stringify(h.logs)).not.toContain(OWNER); expect(JSON.stringify(h.logs)).not.toContain(GUEST);
+  });
   test('status separates current connection from last technical failure and process outcomes without private content', async () => {
     const h = await setup();
     await h.interaction('consent', OWNER).run();
     await h.ask();
     hooks.providers[0]!.options.callbacks.onError('agent_transport_error');
+    hooks.providers[0]!.options.callbacks.onClose();
     await settle();
     const status = h.interaction('status');
     await status.run();
     const pages = [...status.reply.mock.calls, ...status.followUp.mock.calls].map(call => Reflect.get(call[0] as object, 'content') as string);
     expect(pages[0]).toContain('voz Discord: ready');
     expect(pages[0]).toContain('Revisão Render: cfcdd03');
+    expect(pages[0]).toContain('Wake STT: 6/6');
+    expect(pages).toHaveLength(2);
     expect(pages.join('\n')).toContain('AGENT_TRANSPORT_ERROR');
     expect(pages.join('\n')).toContain('desde o início: n=1; confirmados=0; não confirmados=0; falhos=1; cancelados=0');
     expect(pages.join('\n')).not.toMatch(/conteúdo privado|Mesmo nome|100000000000000|fictional|Canal privado/);
     expect(pages.every(page => page.length <= 2000)).toBe(true);
     expect([...status.reply.mock.calls, ...status.followUp.mock.calls].every(call => Reflect.get(call[0] as object, 'flags') === 64)).toBe(true);
+
+    const incident = h.logs.find(log => log.event === 'jarvis_agent_turn_failed')!.incident as string;
+    const lookup = h.interaction('status', OWNER, false, undefined, { incident: incident.toLowerCase() });
+    await lookup.run();
+    expect(lookup.reply.mock.calls[0]![0].content).toContain(incident);
+    expect(lookup.reply.mock.calls[0]![0].content).toContain('AGENT_TRANSPORT_ERROR');
+    expect(lookup.followUp).not.toHaveBeenCalled();
+    const detailed = h.interaction('status', OWNER, false, undefined, { details: true });
+    await detailed.run();
+    expect(detailed.followUp.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  test('capture overflow reports the real limit without sending a prefix or notifying a revoked participant', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER, true).run();
+    h.channel.send.mockClear();
+    await hooks.receiver!.onCaptureRejected?.(OWNER, 'duration_limit');
+    expect(h.channel.send).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('limite de captura (12 s)'), allowedMentions: { parse: [] },
+    }));
+    expect(hooks.connect).not.toHaveBeenCalled();
+    expect(h.access.wake.detect).not.toHaveBeenCalled();
+    await h.interaction('revoke', OWNER).run();
+    h.channel.send.mockClear();
+    await hooks.receiver!.onCaptureRejected?.(OWNER, 'duration_limit');
+    expect(h.channel.send).not.toHaveBeenCalled();
+  });
+
+  test('wake quota gives an actionable wait without describing it as a broken agent session', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER, true).run();
+    vi.spyOn(h.access.wake, 'detect').mockRejectedValueOnce(new WakeError('wake_rate_limited', 12_345));
+    await h.voice(OWNER);
+    expect(h.channel.send).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Aguarde 13 s ou use /jarvis ask') }));
+    expect(hooks.connect).not.toHaveBeenCalled();
+    expect(h.logs.find(log => log.event === 'jarvis_voice_turn_rejected')).toMatchObject({
+      rejection_reason: 'wake_rate_limited', retry_after_ms: 12_345,
+    });
+  });
+
+  test('negative wake backoff stays observable without channel spam and uses authenticated speaker context', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER, true).run();
+    h.channel.send.mockClear();
+    vi.spyOn(h.access.wake, 'detect').mockRejectedValue(new WakeError('wake_rate_limited', 10_000, 'speaker_backoff'));
+    await h.voice(OWNER); await h.voice(OWNER);
+    expect(h.channel.send).not.toHaveBeenCalled();
+    expect(hooks.connect).not.toHaveBeenCalled();
+    expect(h.access.wake.detect).toHaveBeenCalledWith(expect.any(Buffer), expect.any(AbortSignal),
+      expect.objectContaining({ discordUserId: OWNER, consentVersion: h.room.consent.get(OWNER)!.version, channelId: CHANNEL }));
+    expect(h.logs.filter(log => log.event === 'jarvis_voice_turn_rejected')).toHaveLength(2);
+    expect(h.logs.find(log => log.event === 'jarvis_voice_turn_rejected')).toMatchObject({
+      rejection_reason: 'wake_speaker_backoff', retry_after_ms: 10_000,
+    });
+    const forget = vi.spyOn(h.access.wake, 'forget');
+    await h.interaction('revoke', OWNER).run();
+    expect(forget).toHaveBeenCalledWith(OWNER);
+    const clear = vi.spyOn(h.access.wake, 'clearAdmission');
+    await h.interaction('leave').run();
+    expect(clear).toHaveBeenCalledOnce();
   });
 
   test('owner text and guest microphone inject all variables without display-name authority or last-writer identity', async () => {

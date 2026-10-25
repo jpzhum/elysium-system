@@ -17,7 +17,7 @@ export interface Playback {
 export interface SessionOptions {
   connect: (speaker: SpeakerContext, callbacks: AgentCallbacks, signal: AbortSignal) => Promise<AgentSession>;
   allowed: (speaker: SpeakerContext, audio?: boolean) => boolean;
-  detectWake: (pcm: Buffer, signal: AbortSignal) => Promise<boolean>;
+  detectWake: (pcm: Buffer, signal: AbortSignal, speaker?: SpeakerContext) => Promise<boolean>;
   playback: Playback;
   maxSessions: number;
   maxTurnSeconds: number;
@@ -57,7 +57,13 @@ export interface TurnNotification {
   turnId: string;
   position?: number;
   reason?: 'expired' | 'revoked' | 'interrupted' | 'closed' | 'provider' | 'limit';
+  /** Local delivery evidence only; never a claim that a listener heard the answer. */
+  delivery?: TurnDelivery;
+  generationComplete?: boolean;
+  localDrained?: boolean;
 }
+export type TurnDelivery = 'none' | 'not_started' | 'partial' | 'unconfirmed' | 'confirmed';
+type TurnOutcome = 'completed' | 'unconfirmed' | 'failed' | 'partial' | 'cancelled' | 'expired';
 interface TurnRequest {
   id: string;
   inputKind: 'voice' | 'text';
@@ -75,11 +81,14 @@ interface TurnRequest {
   cancelled: boolean;
   queuedNotified?: boolean;
   terminalNotified?: boolean;
+  terminalOutcome?: TurnOutcome;
+  released?: boolean;
   notify?: (event: TurnNotification) => void | Promise<void>;
 }
 interface Entry {
   speaker: SpeakerContext;
   abort: AbortController;
+  lifetimeExpiresAt: number;
   session?: AgentSession;
   opening?: Promise<AgentSession>;
   waiting: boolean;
@@ -102,6 +111,8 @@ interface Entry {
   completionIds: Set<number>;
   providerClosed: boolean;
   failed: boolean;
+  failureCode?: ErrorCode;
+  failureStage?: DiagnosticFields['stage'];
   idle?: ReturnType<typeof setTimeout>;
   lifetime?: ReturnType<typeof setTimeout>;
   deadline?: ReturnType<typeof setTimeout>;
@@ -150,6 +161,7 @@ export class SessionError extends Error {
 
 const MIN_CAPTURE_BYTES = 48_000 * 4 / 50; // One 20 ms Discord Opus frame.
 const USER_RECOGNITION_TIMEOUT_MS = 10_000;
+const RESPONSE_INACTIVITY_TIMEOUT_MS = 45_000;
 
 /** Match the actual stereo-to-mono input, including channels that cancel out. */
 function hasMonoSignal(pcm: Buffer): boolean {
@@ -271,11 +283,13 @@ export class SessionManager {
       let wakeMs: number | undefined;
       if (!followup) {
         let activated: boolean;
-        try { activated = await this.options.detectWake(owned, abort.signal); }
+        try { activated = await this.options.detectWake(owned, abort.signal, speaker); }
         catch (error) {
           if (!abort.signal.aborted) this.options.logger?.event('jarvis_wake_failed', 'warn', {
             incident, operation: 'agent_turn', stage: 'wake_detection', input_kind: 'voice',
-            rejection_reason: error instanceof WakeError ? error.code : 'unexpected',
+            rejection_reason: error instanceof WakeError
+              ? error.rateLimitSource === 'speaker_backoff' ? 'wake_speaker_backoff' : error.code : 'unexpected',
+            retry_after_ms: error instanceof WakeError ? error.retryAfterMs : undefined,
             duration_ms: Math.max(0, Math.round(performance.now() - wakeStart)),
           });
           throw error;
@@ -363,21 +377,51 @@ export class SessionManager {
 
   private async dispatch(request: TurnRequest): Promise<void> {
     let entry: Entry | undefined;
+    let stage: 'agent_connect' | 'session_setup' | 'agent_audio_upload' = 'agent_connect';
     try {
       this.assertAllowed(request.speaker, !!request.pcm);
       request.dispatchAt = performance.now();
       this.options.metric?.('question_queue_wait_ms', Math.round(request.dispatchAt - request.receivedAt));
       this.queueReport(request, 0);
-      entry = await this.ensure(request.speaker, request);
-      if (request.cancelled || this.active !== request) return;
-      this.assertAllowed(request.speaker, !!request.pcm);
-      await this.options.prepareSession?.(request.speaker, entry.session!, entry.sessionReused,
-        { incident: request.id, inputKind: request.pcm ? 'voice' : 'text' });
-      if (request.cancelled || this.active !== request || !this.usable(entry)) return;
+      let reacquired = false;
+      for (;;) {
+        const previous = this.entries.get(request.speaker.discordUserId);
+        try {
+          stage = 'agent_connect';
+          entry = await this.ensure(request.speaker, request);
+          if (request.cancelled || this.active !== request) return;
+          this.assertAllowed(request.speaker, !!request.pcm);
+          stage = 'session_setup';
+          await this.options.prepareSession?.(request.speaker, entry.session!, entry.sessionReused,
+            { incident: request.id, inputKind: request.inputKind });
+          if (request.cancelled || this.active !== request) return;
+          if (!this.usable(entry)) throw new AgentError('agent_closed');
+          if (entry.sessionReused && !this.hasTurnLifetime(entry, request)) {
+            this.options.metric?.('agent_lifetime_renewed_sessions');
+            this.remove(entry, false);
+            throw new AgentError('agent_closed');
+          }
+          break;
+        } catch (error) {
+          const lost = entry ?? previous;
+          if (request.cancelled || this.active !== request) return;
+          // Only a reused idle socket that disappeared before begin is eligible.
+          // No user text/PCM has been sent and the request budget is not reserved again.
+          if (!reacquired && lost?.sessionReused && this.entries.get(request.speaker.discordUserId) !== lost) {
+            this.assertAllowed(request.speaker, request.inputKind === 'voice');
+            reacquired = true;
+            this.options.metric?.('agent_idle_session_reacquired');
+            entry = undefined;
+            continue;
+          }
+          throw error;
+        }
+      }
       this.assertAllowed(request.speaker, !!request.pcm);
       this.begin(entry, request);
       this.options.metric?.('questions_started');
       this.notify(request, { type: 'started' });
+      stage = 'agent_audio_upload';
       if (request.text !== undefined) {
         entry.inputFinishedAt = performance.now();
         entry.session!.sendText(request.text);
@@ -385,11 +429,13 @@ export class SessionManager {
       } else if (request.pcm) await this.upload(entry, request.pcm);
     } catch (error) {
       if (!request.cancelled && this.active === request) {
-        if (entry) this.providerError(entry, error instanceof AgentError ? error.code : 'agent_send_failed');
+        const code = error instanceof AgentError ? error.code : stage === 'agent_connect' ? 'agent_connect_failed' : 'agent_send_failed';
+        if (entry?.request === request && this.entries.get(request.speaker.discordUserId) === entry) this.providerError(entry, code);
         else {
-          this.options.metric?.('questions_failed');
-          this.notify(request, { type: 'failed', reason: 'provider' });
-          this.active = undefined;
+          // A reused idle socket may disappear while trusted context refresh is
+          // awaiting. It does not own this newer request and cannot consume it.
+          if (entry && this.entries.get(request.speaker.discordUserId) === entry) this.remove(entry, false);
+          this.requestFailure(request, this.providerCode(code), stage);
         }
       }
     } finally { this.eraseRequest(request); }
@@ -462,12 +508,15 @@ export class SessionManager {
     if (event.type === 'cancelled' || event.type === 'failed') {
       if (request.terminalNotified) return;
       request.terminalNotified = true;
-      if (event.type === 'cancelled') this.options.logger?.event('jarvis_agent_turn_cancelled', 'info', {
-        incident: request.id, operation: 'agent_turn',
-        stage: request.dispatchAt === undefined ? 'turn_enqueue' : 'agent_response_wait',
-        turn_outcome: 'cancelled', input_kind: request.inputKind,
-        queue_depth: this.queue.length,
-      });
+      if (event.type === 'cancelled') {
+        request.terminalOutcome = event.reason === 'expired' ? 'expired' : 'cancelled';
+        this.options.logger?.event('jarvis_agent_turn_cancelled', 'info', {
+          incident: request.id, operation: 'agent_turn',
+          stage: request.dispatchAt === undefined ? 'turn_enqueue' : 'agent_response_wait',
+          turn_outcome: request.terminalOutcome, input_kind: request.inputKind,
+          cancellation_reason: event.reason, turn_delivery: event.delivery ?? 'none', queue_depth: this.queue.length,
+        });
+      }
     }
     const notification = { ...event, turnId: request.id };
     try { void Promise.resolve(request.notify ? request.notify(notification)
@@ -498,7 +547,13 @@ export class SessionManager {
     this.eraseRequest(request);
     this.options.metric?.('questions_cancelled');
     this.queueReport(request, 0);
+    request.released = true;
     this.notify(request, { type: 'cancelled', reason });
+    this.options.logger?.event('jarvis_agent_turn_released', 'info', {
+      incident: request.id, operation: 'agent_turn', stage: 'turn_enqueue', input_kind: request.inputKind,
+      turn_outcome: request.terminalOutcome, turn_delivery: 'none', queue_depth: this.queue.length,
+      duration_ms: Math.max(0, Math.round(performance.now() - request.receivedAt)),
+    });
   }
 
   private assertAllowed(speaker: SpeakerContext, audio = false): void {
@@ -514,6 +569,13 @@ export class SessionManager {
       // Only an idle socket can be considered here: the global scheduler keeps
       // a playing request active. Expiry never cuts packets from that request.
       this.options.metric?.('agent_context_expired_sessions');
+      this.remove(entry, false); entry = undefined;
+    }
+    if (entry && !this.hasTurnLifetime(entry, request)) {
+      // Renew only on a new accepted question. A known paced upload and the
+      // existing recognition/response deadlines must fit the remaining lifetime;
+      // otherwise the old socket can expire halfway through valid input.
+      this.options.metric?.('agent_lifetime_renewed_sessions');
       this.remove(entry, false); entry = undefined;
     }
     if (entry) {
@@ -533,7 +595,8 @@ export class SessionManager {
     }
     if (this.entries.size >= this.options.maxSessions) throw new SessionError('busy');
     const expiresAt = this.options.sessionContextExpiresAt?.(speaker);
-    entry = { speaker, abort: new AbortController(), waiting: false, playing: false,
+    entry = { speaker, request, abort: new AbortController(), waiting: false, playing: false,
+      lifetimeExpiresAt: performance.now() + this.options.maxSessionSeconds * 1000,
       ingressEnded: false, playbackDone: false, recovering: false, pendingTools: 0, acceptingAudio: false,
       responseIds: new Set(), completedResponseIds: new Set(),
       completionIds: new Set(),
@@ -596,6 +659,13 @@ export class SessionManager {
       onConversationText: (event) => this.conversationText(current, event),
       onToolActivity: (pending) => {
         if (!this.usable(current)) return;
+        if (current.turnReleased) {
+          this.options.metric?.('agent_unsolicited_tool_activity');
+          // An idle provider's autonomous/late tool cannot be inherited by a
+          // newer request. Closing this socket does not close Discord or replay input.
+          if (pending > 0) this.remove(current, false);
+          return;
+        }
         current.pendingTools = pending;
         if (current.completionReceived && pending === 0) this.seal(current);
         else this.progress(current);
@@ -642,6 +712,12 @@ export class SessionManager {
     this.turns++;
   }
 
+  private hasTurnLifetime(entry: Entry, request: TurnRequest): boolean {
+    const inputBudgetMs = request.pcm
+      ? request.pcm.length / (48_000 * 4) * 1000 + 800 + USER_RECOGNITION_TIMEOUT_MS : 0;
+    return entry.lifetimeExpiresAt - performance.now() > inputBudgetMs + RESPONSE_INACTIVITY_TIMEOUT_MS;
+  }
+
   private begin(entry: Entry, request: TurnRequest): void {
     if (!this.usable(entry)) throw new SessionError('consent');
     if (entry.waiting || entry.playing) throw new SessionError('busy');
@@ -683,6 +759,8 @@ export class SessionManager {
     entry.textReceived = false;
     entry.completionReceived = false;
     entry.failed = false;
+    entry.failureCode = undefined;
+    entry.failureStage = undefined;
     entry.incident = request.id;
     entry.turnStarted = request.receivedAt;
     entry.followupUntil = 0;
@@ -906,9 +984,9 @@ export class SessionManager {
     if (entry.turnReleased) return;
     entry.turnReleased = true;
     this.options.metric?.('agent_turn_logical_end_ms', Math.round(performance.now() - entry.turnStarted));
-    this.report(entry, 'jarvis_agent_turn_finished');
+    this.terminal(entry);
     this.delivered(entry);
-    if (!entry.completionReceived || entry.recovering) { this.remove(entry); return; }
+    if (entry.failed || !entry.completionReceived || entry.recovering || entry.pendingTools > 0) { this.remove(entry); return; }
     this.options.metric?.('agent_turns_completed');
     if (entry.providerClosed) { this.remove(entry); return; }
     entry.followupUntil = Date.now() + this.options.followupSeconds * 1000;
@@ -1001,7 +1079,8 @@ export class SessionManager {
   }
 
   private release(entry: Entry): void {
-    if (!this.active || (entry.request !== this.active && this.active.speaker.discordUserId !== entry.speaker.discordUserId)) return;
+    if (!this.active || entry.request !== this.active || this.active.released) return;
+    this.active.released = true;
     if (entry.drainedAt !== undefined) this.options.metric?.('next_question_ready_ms',
       Math.round(performance.now() - entry.drainedAt));
     if (entry.lastAudioAt !== undefined) this.options.metric?.('agent_last_audio_ms',
@@ -1047,7 +1126,7 @@ export class SessionManager {
         this.options.metric?.('agent_text_without_audio');
         this.fail(entry, 'AGENT_TEXT_WITHOUT_AUDIO');
       } else this.fail(entry, 'AGENT_RESPONSE_TIMEOUT');
-    }, 45_000);
+    }, RESPONSE_INACTIVITY_TIMEOUT_MS);
     entry.deadline.unref();
   }
 
@@ -1058,17 +1137,19 @@ export class SessionManager {
   }
 
   private report(entry: Entry, event: string, code?: ErrorCode, stageDurationMs?: number): void {
+    const stage: DiagnosticFields['stage'] = event === 'jarvis_agent_input_started' || event === 'jarvis_agent_input_sent'
+      || event === 'jarvis_agent_input_prepared' ? 'agent_audio_upload'
+      : event === 'jarvis_agent_session_ready' ? 'agent_connect'
+      : event === 'jarvis_agent_first_audio' ? 'agent_audio_wait'
+      : event === 'jarvis_agent_user_turn_recognized' ? 'agent_user_recognition'
+      : entry.voiceInput && !entry.userTurnRecognized ? 'agent_user_recognition'
+      : entry.playing ? 'playback' : entry.textReceived && !entry.audioBytes ? 'agent_audio_wait'
+      : entry.waiting ? 'agent_response_wait' : 'agent_connect';
+    if (event === 'jarvis_agent_turn_error' && entry.failureStage === undefined) entry.failureStage = stage;
     this.options.logger?.event(event, code ? 'error' : 'info', {
       ...(code === 'PLAYBACK_FAILED' ? entry.playbackFailure : {}),
       incident: entry.incident, operation: 'agent_turn',
-      stage: event === 'jarvis_agent_input_started' || event === 'jarvis_agent_input_sent'
-        || event === 'jarvis_agent_input_prepared' ? 'agent_audio_upload'
-        : event === 'jarvis_agent_session_ready' ? 'agent_connect'
-        : event === 'jarvis_agent_first_audio' ? 'agent_audio_wait'
-        : event === 'jarvis_agent_user_turn_recognized' ? 'agent_user_recognition'
-        : entry.voiceInput && !entry.userTurnRecognized ? 'agent_user_recognition'
-        : entry.playing ? 'playback' : entry.textReceived && !entry.audioBytes ? 'agent_audio_wait'
-        : entry.waiting ? 'agent_response_wait' : 'agent_connect',
+      stage: code ? entry.failureStage ?? stage : stage,
       ...(code ? { code, category: code === 'PLAYBACK_FAILED' ? 'playback' : 'agent' } : {}),
       ...(code === 'AGENT_USER_TURN_MISSING' ? { timeout_ms: USER_RECOGNITION_TIMEOUT_MS } : {}),
       duration_ms: Math.max(0, Math.round(performance.now() - entry.turnStarted)),
@@ -1087,8 +1168,8 @@ export class SessionManager {
       session_reused: entry.sessionReused, speaker_verified: true,
       consent_current: this.options.allowed(entry.speaker, entry.voiceInput),
       queue_depth: this.queue.length,
-      turn_outcome: entry.failed ? 'failed' : entry.turnReleased
-        ? entry.completionReceived && !entry.recovering ? 'completed' : 'unconfirmed' : undefined,
+      turn_outcome: entry.request?.terminalOutcome,
+      turn_delivery: this.delivery(entry),
       ...(entry.request?.dispatchAt === undefined ? {} : {
         question_wait_ms: Math.round(entry.request.dispatchAt - entry.request.receivedAt),
       }),
@@ -1123,7 +1204,64 @@ export class SessionManager {
   private primaryError(entry: Entry, code: ErrorCode): void {
     if (entry.failed) return;
     entry.failed = true;
-    this.report(entry, 'jarvis_agent_turn_failed', code);
+    entry.failureCode = code;
+    this.report(entry, 'jarvis_agent_turn_error', code);
+  }
+
+  private delivery(entry: Entry): TurnDelivery {
+    if (!entry.audioBytes) return 'none';
+    if (entry.firstPlaybackAt === undefined) return 'not_started';
+    if (entry.completionReceived && entry.playbackDone && !entry.failed && !entry.recovering) return 'confirmed';
+    return entry.localDrained && !entry.completionReceived ? 'unconfirmed' : 'partial';
+  }
+
+  /** One terminal result per accepted request, after recovery/drain has settled. */
+  private terminal(entry: Entry): void {
+    const request = entry.request;
+    if (!request || request.terminalOutcome) return;
+    request.terminalOutcome = entry.failed ? entry.failureCode === 'AGENT_SESSION_EXPIRED' ? 'expired'
+      : entry.firstPlaybackAt === undefined ? 'failed' : 'partial'
+      : entry.completionReceived && !entry.recovering ? 'completed' : 'unconfirmed';
+    this.report(entry, entry.failed ? 'jarvis_agent_turn_failed' : 'jarvis_agent_turn_finished', entry.failureCode);
+    if (entry.failed) {
+      this.options.metric?.('questions_failed');
+      this.notify(request, { type: 'failed', reason: 'provider', delivery: this.delivery(entry),
+        generationComplete: entry.completionReceived, localDrained: entry.localDrained });
+    } else request.terminalNotified = true;
+  }
+
+  /** Failed acquisition/context refresh has no provider input or playback to replay. */
+  private requestFailure(request: TurnRequest, code: ErrorCode, stage: 'agent_connect' | 'session_setup' | 'agent_audio_upload'): void {
+    if (request.terminalOutcome || request.cancelled || this.active !== request) return;
+    request.terminalOutcome = 'failed';
+    this.options.metric?.('questions_failed');
+    const fields: DiagnosticFields = { incident: request.id, operation: 'agent_turn', stage,
+      code, category: 'agent', input_kind: request.inputKind, turn_outcome: 'failed', turn_delivery: 'none',
+      duration_ms: Math.max(0, Math.round(performance.now() - request.receivedAt)), queue_depth: this.queue.length };
+    this.options.logger?.event('jarvis_agent_turn_failed', 'error', fields);
+    this.notify(request, { type: 'failed', reason: 'provider', delivery: 'none', generationComplete: false, localDrained: false });
+    this.releaseDetached(request);
+  }
+
+  private releaseDetached(request: TurnRequest): void {
+    if (this.active !== request || request.released) return;
+    request.released = true;
+    this.options.logger?.event('jarvis_agent_turn_released', 'info', {
+      incident: request.id, operation: 'agent_turn', stage: 'session_setup', input_kind: request.inputKind,
+      turn_outcome: request.terminalOutcome, turn_delivery: 'none', queue_depth: this.queue.length,
+      duration_ms: Math.max(0, Math.round(performance.now() - request.receivedAt)),
+    });
+    this.active = undefined;
+    queueMicrotask(() => this.pump());
+  }
+
+  private cancelDetached(request: TurnRequest, reason: NonNullable<TurnNotification['reason']>): void {
+    if (this.active !== request || request.cancelled || request.terminalOutcome) return;
+    request.cancelled = true;
+    this.options.metric?.('questions_cancelled');
+    this.notify(request, { type: 'cancelled', reason, delivery: 'none', generationComplete: false, localDrained: false });
+    this.eraseRequest(request);
+    this.releaseDetached(request);
   }
 
   private providerError(entry: Entry, code: string): void {
@@ -1139,6 +1277,17 @@ export class SessionManager {
     this.options.metric?.('agent_errors');
     if (code === 'agent_guardrail') this.options.metric?.('agent_guardrail_rejections');
     if (code === 'agent_concurrency_limit') this.options.metric?.('agent_concurrency_rejections');
+    const safeCode = this.providerCode(code);
+    if ((code === 'agent_transport_error' || code === 'agent_heartbeat_timeout') && entry.waiting) {
+      this.primaryError(entry, safeCode);
+      this.missing(entry);
+      entry.recovering = true;
+      if (entry.deadline) clearTimeout(entry.deadline);
+      // Adapter will finish delivering already validated audio, then onClose.
+    } else this.fail(entry, safeCode);
+  }
+
+  private providerCode(code: string): ErrorCode {
     const codes: Readonly<Record<string, ErrorCode>> = {
       agent_transport_error: 'AGENT_TRANSPORT_ERROR', invalid_agent_event: 'AGENT_INVALID_EVENT',
       invalid_output_audio: 'AGENT_INVALID_EVENT', unsupported_audio_format: 'AGENT_AUDIO_FORMAT_UNSUPPORTED',
@@ -1154,14 +1303,7 @@ export class SessionManager {
       agent_initiation_rejected: 'AGENT_INITIATION_REJECTED',
       agent_guardrail: 'AGENT_GUARDRAIL_REJECTED', agent_concurrency_limit: 'AGENT_CONCURRENCY_LIMIT',
     };
-    const safeCode = Object.hasOwn(codes, code) ? codes[code]! : 'AGENT_PROVIDER_ERROR';
-    if ((code === 'agent_transport_error' || code === 'agent_heartbeat_timeout') && entry.waiting) {
-      this.primaryError(entry, safeCode);
-      this.missing(entry);
-      entry.recovering = true;
-      if (entry.deadline) clearTimeout(entry.deadline);
-      // Adapter will finish delivering already validated audio, then onClose.
-    } else this.fail(entry, safeCode);
+    return Object.hasOwn(codes, code) ? codes[code]! : 'AGENT_PROVIDER_ERROR';
   }
 
   private providerClose(entry: Entry): void {
@@ -1179,7 +1321,7 @@ export class SessionManager {
       // A partial input must not become a completed conversational turn.
     }
     if (entry.completionReceived && entry.playing) { this.seal(entry); return; }
-    if (entry.waiting || entry.opening) {
+    if (entry.waiting || entry.opening || (entry.request !== undefined && entry.request === this.active)) {
       if (!entry.recovering) {
         this.options.metric?.('agent_premature_closes');
         this.options.metric?.('agent_errors');
@@ -1215,11 +1357,14 @@ export class SessionManager {
   private remove(entry: Entry, release = true, reason: NonNullable<TurnNotification['reason']> = 'closed'): void {
     if (this.entries.get(entry.speaker.discordUserId) !== entry) return;
     this.entries.delete(entry.speaker.discordUserId);
-    if (release && this.active?.speaker.discordUserId === entry.speaker.discordUserId) {
-      if (!this.active.cancelled && (!entry.turnReleased || entry.failed || entry.opening)) {
-        this.options.metric?.(entry.failed ? 'questions_failed' : 'questions_cancelled');
-        this.notify(this.active, { type: entry.failed ? 'failed' : 'cancelled',
-          reason: entry.failed ? 'provider' : reason });
+    if (release && this.active && this.active === entry.request) {
+      if (!this.active.cancelled && !this.active.terminalOutcome) {
+        if (entry.failed) this.terminal(entry);
+        else {
+          this.options.metric?.('questions_cancelled');
+          this.notify(this.active, { type: 'cancelled', reason, delivery: this.delivery(entry),
+            generationComplete: entry.completionReceived, localDrained: entry.localDrained });
+        }
       }
       this.active.cancelled = true;
       this.eraseRequest(this.active);
@@ -1247,14 +1392,7 @@ export class SessionManager {
     this.checking.delete(userId);
     const entry = this.entries.get(userId);
     if (entry) this.remove(entry, true, reason);
-    else if (this.active?.speaker.discordUserId === userId) {
-      this.active.cancelled = true;
-      this.eraseRequest(this.active);
-      this.options.metric?.('questions_cancelled');
-      this.notify(this.active, { type: 'cancelled', reason });
-      this.active = undefined;
-      queueMicrotask(() => this.pump());
-    }
+    if (this.active?.speaker.discordUserId === userId) this.cancelDetached(this.active, reason);
     this.options.playback.stopUser(userId);
   }
 
@@ -1263,18 +1401,12 @@ export class SessionManager {
     if (!speaker.isOwner || !this.active) return false;
     this.options.metric?.('owner_interruptions');
     this.rememberFollowup(speaker);
-    const current = this.active.speaker.discordUserId;
+    const active = this.active;
+    const current = active.speaker.discordUserId;
     // Owner barge-in cancels only the active turn, preserving waiting callers.
     const entry = this.entries.get(current);
     if (entry) this.remove(entry, true, 'interrupted');
-    else {
-      this.active.cancelled = true;
-      this.eraseRequest(this.active);
-      this.notify(this.active, { type: 'cancelled', reason: 'interrupted' });
-      this.options.metric?.('questions_cancelled');
-      this.active = undefined;
-      queueMicrotask(() => this.pump());
-    }
+    if (this.active === active) this.cancelDetached(active, 'interrupted');
     return true;
   }
 
@@ -1288,12 +1420,7 @@ export class SessionManager {
     for (const abort of this.checking.values()) abort.abort();
     this.checking.clear();
     for (const entry of [...this.entries.values()]) this.remove(entry);
-    if (this.active) {
-      this.active.cancelled = true;
-      this.eraseRequest(this.active);
-      this.notify(this.active, { type: 'cancelled', reason: 'closed' });
-      this.active = undefined;
-    }
+    if (this.active) this.cancelDetached(this.active, 'closed');
   }
 
   close(): void {
@@ -1304,12 +1431,7 @@ export class SessionManager {
     for (const abort of this.checking.values()) abort.abort();
     this.checking.clear();
     for (const entry of this.entries.values()) this.remove(entry);
-    if (this.active) {
-      this.eraseRequest(this.active);
-      this.notify(this.active, { type: 'cancelled', reason: 'closed' });
-      this.active.cancelled = true;
-      this.active = undefined;
-    }
+    if (this.active) this.cancelDetached(this.active, 'closed');
     this.options.playback.stop();
   }
 }

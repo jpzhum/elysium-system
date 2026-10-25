@@ -23,9 +23,10 @@ test('status separates unmeasured latency from zero and never truncates required
     'agent_initial_audio_discarded', 'agent_user_turn_missing', 'audio_stream_started',
     'agent_response_received', 'agent_response_complete_received', 'audio_bytes_received',
     'voice_capture_silent_rejected', 'voice_capture_too_short_rejected', 'voice_capture_limit_rejected',
-    'voice_wake_busy', 'voice_turn_rejected', 'wake_checks', 'wake_queued', 'wake_rate_limited',
+    'voice_wake_busy', 'voice_turn_rejected', 'wake_checks', 'wake_queued', 'wake_rate_limited', 'wake_speaker_backoff',
     'wake_queue_full', 'wake_queue_timeout', 'wake_provider_errors',
     'agent_guardrail_rejections', 'agent_concurrency_rejections',
+    'agent_lifetime_renewed_sessions', 'agent_idle_session_reacquired',
     'search_timeout', 'search_invalid_reply', 'search_no_sources', 'search_cancelled']) {
     expect(content).toContain(`${name}=0`);
   }

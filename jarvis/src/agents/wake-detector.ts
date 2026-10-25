@@ -21,13 +21,42 @@ const NOT_ACTIVATED: WakeInspection = Object.freeze({ activated: false, interrup
 const MAX_CAPTURE_BYTES = 4 * 48_000 * 4;
 const MAX_WAITING = 2;
 const MAX_WAIT_MS = 8_000;
+const BUDGET_WINDOW_MS = 60_000;
+const MAX_ADMISSION_SPEAKERS = 16;
+const NEGATIVE_WAKE_BASE_MS = 10_000;
+
+/** Only authenticated backend context may be supplied; never inferred from STT. */
+export interface WakeAdmissionContext {
+  readonly discordUserId: string;
+  readonly consentVersion: number;
+  readonly channelId: string;
+}
+
+interface AdmissionRecord {
+  readonly speaker: WakeAdmissionContext;
+  misses: number;
+  retryAt: number;
+  expiresAt: number;
+}
+
+export type WakeRateLimitSource = 'global_budget' | 'speaker_backoff';
 
 export class WakeError extends Error {
-  constructor(readonly code: 'wake_queue_full' | 'wake_queue_timeout' | 'wake_rate_limited' | 'wake_provider_failed') { super(code); }
+  readonly retryAfterMs?: number;
+  readonly rateLimitSource?: WakeRateLimitSource;
+  constructor(readonly code: 'wake_queue_full' | 'wake_queue_timeout' | 'wake_rate_limited' | 'wake_provider_failed',
+    retryAfterMs?: number, rateLimitSource: WakeRateLimitSource = 'global_budget') {
+    super(code);
+    if (code === 'wake_rate_limited') this.rateLimitSource = rateLimitSource;
+    if (typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs) && retryAfterMs >= 0 && retryAfterMs <= BUDGET_WINDOW_MS) {
+      this.retryAfterMs = Math.ceil(retryAfterMs);
+    }
+  }
 }
 
 interface InspectionRequest {
   pcm: Buffer;
+  admission?: AdmissionRecord;
   signal?: AbortSignal;
   interrupt: boolean;
   enqueuedAt: number;
@@ -39,30 +68,57 @@ interface InspectionRequest {
 
 /** Experimental, paid, external wake detection. Audio consent MUST disclose pre-wake upload. */
 export class ElevenWakeDetector {
-  private window = Date.now();
-  private checks = 0;
+  private readonly checkStarts: number[] = [];
+  private readonly admissions = new Map<string, AdmissionRecord>();
   private checking = false;
   private readonly waiting: InspectionRequest[] = [];
   constructor(private readonly apiKey: string, private readonly wakeWord: string,
     private readonly perMinute: number, private readonly metric: (name: string, value?: number) => void,
     private readonly request: typeof fetch = fetch) {}
 
-  async detect(pcm48kStereo: Buffer, signal?: AbortSignal): Promise<boolean> {
-    return (await this.inspect(pcm48kStereo, signal)).activated;
+  /** Shared paid-call capacity in a rolling minute; no identity or transcript is exposed. */
+  get operationalState(): Readonly<{ remaining: number; queued: number; active: boolean; retryAfterMs: number }> {
+    const now = performance.now();
+    while (this.checkStarts[0] !== undefined && this.checkStarts[0] <= now - BUDGET_WINDOW_MS) this.checkStarts.shift();
+    const remaining = Math.max(0, this.perMinute - this.checkStarts.length);
+    return Object.freeze({ remaining, queued: this.waiting.length, active: this.checking,
+      retryAfterMs: remaining > 0 ? 0 : Math.max(0, Math.ceil(this.checkStarts[0]! + BUDGET_WINDOW_MS - now)) });
+  }
+
+  get admissionState(): Readonly<{ tracked: number; backingOff: number }> {
+    this.expireAdmission();
+    const now = performance.now();
+    return Object.freeze({ tracked: this.admissions.size,
+      backingOff: [...this.admissions.values()].filter(record => record.retryAt > now).length });
+  }
+
+  /** Clear consent-scoped admission only; never reset the worker's paid-call ceiling. */
+  forget(userId: string): void { this.admissions.delete(userId); }
+  clearAdmission(): void { this.admissions.clear(); }
+
+  async detect(pcm48kStereo: Buffer, signal?: AbortSignal, speaker?: WakeAdmissionContext): Promise<boolean> {
+    return (await this.inspect(pcm48kStereo, signal, { speaker })).activated;
   }
 
   /** One bounded STT call for wake and stop intent; callers must authorize the Discord ID separately. */
   inspect(pcm48kStereo: Buffer, signal?: AbortSignal,
-    options: { allowInterruption?: boolean } = {}): Promise<WakeInspection> {
+    options: { allowInterruption?: boolean; speaker?: WakeAdmissionContext } = {}): Promise<WakeInspection> {
     if (signal?.aborted || pcm48kStereo.length < 19_200 || pcm48kStereo.length % 4 !== 0) {
       return Promise.resolve(NOT_ACTIVATED);
+    }
+    const admission = options.speaker ? this.admission(options.speaker) : undefined;
+    const backoff = admission ? this.backoff(admission) : undefined;
+    if (backoff) return Promise.reject(backoff);
+    const budget = this.operationalState;
+    if (!budget.remaining) {
+      this.metric('wake_rate_limited'); return Promise.reject(new WakeError('wake_rate_limited', budget.retryAfterMs));
     }
     if (this.checking && this.waiting.length >= MAX_WAITING) {
       this.metric('wake_queue_full'); return Promise.reject(new WakeError('wake_queue_full'));
     }
     return new Promise<WakeInspection>((resolve, reject) => {
       // Own only a bounded copy. Neither cancellation nor another speaker can mutate caller audio.
-      const entry: InspectionRequest = { pcm: Buffer.from(pcm48kStereo.subarray(0, MAX_CAPTURE_BYTES)),
+      const entry: InspectionRequest = { pcm: Buffer.from(pcm48kStereo.subarray(0, MAX_CAPTURE_BYTES)), admission,
         signal, interrupt: options.allowInterruption === true, enqueuedAt: performance.now(), resolve, reject };
       if (!this.checking) { this.start(entry); return; }
       const priority = entry.interrupt ? this.waiting.findIndex((other) => !other.interrupt) : -1;
@@ -75,6 +131,50 @@ export class ElevenWakeDetector {
       this.metric('wake_queued');
       if (signal?.aborted) this.drop(entry, false);
     });
+  }
+
+  private expireAdmission(): void {
+    const now = performance.now();
+    for (const [id, record] of this.admissions) {
+      if (record.expiresAt <= now) this.admissions.delete(id);
+    }
+  }
+
+  private admission(speaker: WakeAdmissionContext): AdmissionRecord {
+    this.expireAdmission();
+    const existing = this.admissions.get(speaker.discordUserId);
+    if (existing && existing.speaker.consentVersion === speaker.consentVersion &&
+      existing.speaker.channelId === speaker.channelId) return existing;
+    if (existing) this.admissions.delete(speaker.discordUserId);
+    if (this.admissions.size >= MAX_ADMISSION_SPEAKERS) {
+      const oldest = this.admissions.keys().next().value;
+      if (oldest !== undefined) this.admissions.delete(oldest);
+    }
+    const record = { speaker: { ...speaker }, misses: 0, retryAt: 0,
+      expiresAt: performance.now() + BUDGET_WINDOW_MS };
+    this.admissions.set(speaker.discordUserId, record);
+    return record;
+  }
+
+  private backoff(record: AdmissionRecord): WakeError | undefined {
+    const remaining = record.retryAt - performance.now();
+    if (remaining <= 0) return undefined;
+    this.metric('wake_speaker_backoff');
+    return new WakeError('wake_rate_limited', Math.ceil(remaining), 'speaker_backoff');
+  }
+
+  private currentAdmission(entry: InspectionRequest): boolean {
+    return !entry.admission || this.admissions.get(entry.admission.speaker.discordUserId) === entry.admission;
+  }
+
+  private recordInspection(entry: InspectionRequest, activated: boolean): void {
+    const record = entry.admission;
+    if (!record || !this.currentAdmission(entry)) return;
+    record.misses = activated ? 0 : Math.min(5, record.misses + 1);
+    const delay = record.misses < 2 ? 0
+      : Math.min(BUDGET_WINDOW_MS, NEGATIVE_WAKE_BASE_MS * 2 ** (record.misses - 2));
+    record.retryAt = activated ? 0 : performance.now() + delay;
+    record.expiresAt = performance.now() + BUDGET_WINDOW_MS;
   }
 
   private drop(entry: InspectionRequest, expired: boolean): void {
@@ -115,10 +215,13 @@ export class ElevenWakeDetector {
   }
 
   private async execute(entry: InspectionRequest): Promise<WakeInspection> {
-    if (entry.signal?.aborted) return NOT_ACTIVATED;
-    if (Date.now() - this.window >= 60_000) { this.window = Date.now(); this.checks = 0; }
-    if (this.checks >= this.perMinute) { this.metric('wake_rate_limited'); throw new WakeError('wake_rate_limited'); }
-    this.checks += 1;
+    if (entry.signal?.aborted || !this.currentAdmission(entry)) return NOT_ACTIVATED;
+    const backoff = entry.admission ? this.backoff(entry.admission) : undefined;
+    if (backoff) throw backoff;
+    const budget = this.operationalState;
+    if (!budget.remaining) { this.metric('wake_rate_limited'); throw new WakeError('wake_rate_limited', budget.retryAfterMs); }
+    this.checkStarts.push(performance.now());
+    if (entry.admission) entry.admission.expiresAt = performance.now() + BUDGET_WINDOW_MS;
     const started = performance.now();
     this.metric('wake_queue_wait_ms', Math.max(0, Math.round(started - entry.enqueuedAt)));
     // Only the leading four seconds are inspected. The complete bounded turn is sent to the agent after activation.
@@ -150,7 +253,9 @@ export class ElevenWakeDetector {
       if (combined.aborted) throw new WakeError('wake_provider_failed');
       const text = data && typeof data === 'object' && 'text' in data ? data.text : undefined;
       if (typeof text !== 'string') throw new WakeError('wake_provider_failed');
+      if (!this.currentAdmission(entry)) return NOT_ACTIVATED;
       const activated = containsWakeWord(text, this.wakeWord);
+      this.recordInspection(entry, activated);
       if (activated) this.metric('wake_activations');
       return { activated, interrupt: entry.interrupt && typeof text === 'string' &&
         isExplicitStopCommand(text, this.wakeWord) };

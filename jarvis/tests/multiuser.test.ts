@@ -4,6 +4,7 @@ import type { AgentCallbacks, AgentSession } from '../src/agents/elevenlabs-clie
 import { convertPcm } from '../src/audio/pcm-conversion.js';
 import { ConsentStore } from '../src/policy/consent.js';
 import { speakerContext } from '../src/policy/identity.js';
+import { Logger } from '../src/observability/metrics.js';
 
 const managers: SessionManager[] = [];
 async function settle(): Promise<void> { for (let i = 0; i < 240; i++) await Promise.resolve(); }
@@ -81,6 +82,189 @@ function harness(overrides: Partial<SessionOptions> = {}, inputSampleRate = 1600
 afterEach(() => { for (const manager of managers.splice(0)) manager.close(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('bounded conversational scheduling', () => {
+  test.each(['text', 'voice'])('a new %s turn renews an idle socket before its hard lifetime can expire during input or recognition', async kind => {
+    vi.useFakeTimers();
+    const h = harness({ idleSeconds: 300, maxTurnSeconds: 20,
+      pace: signal => new Promise<void>((resolve, reject) => {
+        const abort = (): void => {
+          clearTimeout(timer); signal.removeEventListener('abort', abort); reject(new Error('cancelled'));
+        };
+        const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, 20);
+        signal.addEventListener('abort', abort, { once: true });
+        if (signal.aborted) abort();
+      }) });
+    await h.ask('guest'); await h.finish('guest');
+    const old = h.sessions.get('guest')!;
+    await vi.advanceTimersByTimeAsync(kind === 'voice' ? 290_000 : 260_000);
+    if (kind === 'voice') await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(20 * 192_000, 1));
+    else await h.ask('guest');
+    await settle();
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(old.close).toHaveBeenCalledOnce();
+    const next = h.sessions.get('guest')!;
+    expect(next).not.toBe(old);
+    if (kind === 'voice') {
+      await vi.advanceTimersByTimeAsync(20_800); await settle();
+      h.callbacks.get('guest')!.onUserTranscript?.();
+      expect(next.sendAudio).toHaveBeenCalledTimes(1_040);
+      expect(old.sendAudio).not.toHaveBeenCalled();
+    }
+    await h.finish('guest');
+    expect(h.metric).toHaveBeenCalledWith('agent_lifetime_renewed_sessions');
+    expect(h.metric.mock.calls.some(([name]) => name === 'questions_failed')).toBe(false);
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    await h.ask('guest'); await h.finish('guest');
+    expect(h.connect).toHaveBeenCalledTimes(2);
+  });
+
+  test('context preparation that consumes an idle socket lifetime budget renews once before sending the new question', async () => {
+    vi.useFakeTimers();
+    let resume!: () => void;
+    const preparation = new Promise<void>(resolve => { resume = resolve; });
+    const h = harness({ idleSeconds: 300,
+      prepareSession: async (_speaker, _session, reused) => { if (reused) await preparation; } });
+    await h.ask('guest'); await h.finish('guest');
+    const old = h.sessions.get('guest')!;
+    await h.ask('guest', 'Pergunta nova');
+    await vi.advanceTimersByTimeAsync(260_000);
+    resume(); await settle();
+    expect(old.sendText).toHaveBeenCalledTimes(1);
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(h.sessions.get('guest')!.sendText).toHaveBeenCalledExactlyOnceWith('Pergunta nova');
+    await h.finish('guest');
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  });
+
+  test.each(['cancelled', 'expired'])('a queued %s request has one terminal and one release without touching the active speaker', async outcome => {
+    vi.useFakeTimers();
+    const logs: Record<string, unknown>[] = [];
+    const h = harness({ logger: new Logger('info', line => logs.push(JSON.parse(line))), queueTtlSeconds: 1 });
+    await h.ask('owner');
+    const queued = await h.ask('guest');
+    expect(queued.queued).toBe(true);
+    if (outcome === 'expired') await vi.advanceTimersByTimeAsync(1_001);
+    else { h.manager.cancelUser('guest'); h.manager.cancelUser('guest'); }
+    await settle();
+    expect(logs.filter(line => line.incident === queued.turnId && line.event === 'jarvis_agent_turn_cancelled')).toMatchObject([
+      { turn_outcome: outcome, turn_delivery: 'none' },
+    ]);
+    expect(logs.filter(line => line.incident === queued.turnId && line.event === 'jarvis_agent_turn_released')).toHaveLength(1);
+    expect(h.sessions.has('guest')).toBe(false);
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: true });
+    await h.finish('owner');
+    await h.ask('guest'); await h.finish('guest');
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  });
+
+  test('a second lost socket during context preparation ends explicitly without sending input or acquiring again', async () => {
+    const logs: Record<string, unknown>[] = [];
+    const resume: (() => void)[] = [];
+    let preparations = 0;
+    const h = harness({ logger: new Logger('info', line => logs.push(JSON.parse(line))),
+      prepareSession: async () => {
+        if (++preparations > 1) await new Promise<void>(resolve => { resume.push(resolve); });
+      } });
+    await h.ask('guest'); await h.finish('guest');
+    const receipt = await h.ask('guest');
+    h.callbacks.get('guest')!.onClose(); resume.shift()!(); await settle();
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    const replacement = h.sessions.get('guest')!;
+    h.callbacks.get('guest')!.onClose(); resume.shift()!(); await settle();
+    expect(replacement.sendText).not.toHaveBeenCalled();
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    expect(logs.filter(line => line.incident === receipt.turnId && line.event === 'jarvis_agent_turn_failed')).toMatchObject([
+      { code: 'AGENT_PREMATURE_CLOSE', turn_outcome: 'failed', turn_delivery: 'none' },
+    ]);
+    expect(logs.filter(line => line.incident === receipt.turnId && line.event === 'jarvis_agent_turn_cancelled')).toHaveLength(0);
+    expect(logs.filter(line => line.incident === receipt.turnId && line.event === 'jarvis_agent_turn_released')).toHaveLength(1);
+  });
+
+  test('cancelling a pending reacquisition immediately releases the next speaker and fences the late socket', async () => {
+    let resume!: () => void;
+    const prepare = new Promise<void>(resolve => { resume = resolve; });
+    const h = harness({ prepareSession: async (_speaker, _session, reused) => { if (reused) await prepare; } });
+    await h.ask('guest'); await h.finish('guest');
+    const originalConnect = h.connect.getMockImplementation()!;
+    let finishConnect!: () => void;
+    const opening = new Promise<void>(resolve => { finishConnect = resolve; });
+    h.connect.mockImplementationOnce(async (speaker, callbacks) => {
+      await opening; return originalConnect(speaker, callbacks);
+    });
+    const receipt = await h.ask('guest');
+    h.callbacks.get('guest')!.onClose(); resume(); await settle();
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    h.manager.cancelUser('guest'); await settle();
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    await h.ask('owner', 'Outro participante');
+    finishConnect(); await settle();
+    expect(h.sessions.get('guest')!.sendText).not.toHaveBeenCalled();
+    expect(h.sessions.get('guest')!.close).toHaveBeenCalledOnce();
+    expect(h.sessions.get('owner')!.sendText).toHaveBeenCalledExactlyOnceWith('Outro participante');
+    expect(h.notify.mock.calls.filter(([, event]) => event.turnId === receipt.turnId && event.type === 'cancelled')).toHaveLength(1);
+    await h.finish('owner');
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  });
+
+  test.each(['cancel', 'revoke', 'disconnect', 'shutdown'])('%s releases a new request awaiting idle-session context refresh immediately', async action => {
+    const logs: Record<string, unknown>[] = [];
+    let resume!: () => void;
+    const prepare = new Promise<void>(resolve => { resume = resolve; });
+    const h = harness({ logger: new Logger('info', line => logs.push(JSON.parse(line))),
+      prepareSession: async (_speaker, _session, reused) => { if (reused) await prepare; } });
+    await h.ask('guest'); await h.finish('guest');
+    const next = await h.ask('guest');
+    if (action === 'cancel') h.manager.cancelUser('guest');
+    if (action === 'revoke') { h.consent.revoke('guest'); h.manager.revoke('guest'); }
+    if (action === 'disconnect') h.manager.setAvailable(false);
+    if (action === 'shutdown') h.manager.close();
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    expect(logs.filter(line => line.incident === next.turnId && line.event === 'jarvis_agent_turn_cancelled')).toHaveLength(1);
+    expect(logs.filter(line => line.incident === next.turnId && line.event === 'jarvis_agent_turn_released')).toHaveLength(1);
+    resume(); await settle();
+    expect(logs.filter(line => line.incident === next.turnId && line.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
+  });
+  test('a tool marker after a released turn cannot poison the next question with stale pending work', async () => {
+    const h = harness();
+    await h.ask('guest', 'Primeira pergunta'); await h.finish('guest');
+    const old = h.callbacks.get('guest')!;
+    old.onToolActivity?.(1);
+    await h.ask('guest', 'Pergunta seguinte'); await h.finish('guest');
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(h.metric.mock.calls.filter(([name]) => name === 'agent_turns_completed')).toHaveLength(2);
+    old.onToolActivity?.(0); old.onClose();
+    await h.ask('guest', 'Terceira pergunta'); await h.finish('guest');
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  });
+  test.each(['close', 'error'])('an idle provider %s during reuse reacquires once before input and cannot consume a newer request', async failure => {
+    const logs: Record<string, unknown>[] = [];
+    let resume!: () => void;
+    const prepare = new Promise<void>(resolve => { resume = resolve; });
+    const h = harness({ logger: new Logger('info', line => logs.push(JSON.parse(line))),
+      prepareSession: async (_speaker, _session, reused) => { if (reused) await prepare; } });
+    await h.ask('guest', 'Primeira pergunta'); await h.finish('guest');
+    const old = h.callbacks.get('guest')!;
+    const next = await h.ask('guest', 'Pergunta seguinte');
+    if (failure === 'close') old.onClose(); else old.onError('agent_transport_error');
+    resume(); await settle();
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(h.sessions.get('guest')!.sendText).toHaveBeenCalledExactlyOnceWith('Pergunta seguinte');
+    old.onClose(); old.onError('agent_transport_error');
+    await h.finish('guest');
+    const terminal = logs.filter(line => line.incident === next.turnId
+      && ['jarvis_agent_turn_finished', 'jarvis_agent_turn_failed', 'jarvis_agent_turn_cancelled'].includes(String(line.event)));
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toMatchObject({ event: 'jarvis_agent_turn_finished', turn_outcome: 'completed' });
+    expect(h.notify.mock.calls.filter(([, event]) => event.turnId === next.turnId && event.type === 'failed')).toHaveLength(0);
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    await h.ask('guest', 'Terceira pergunta'); await h.finish('guest');
+    await h.ask('guest', 'Quarta pergunta'); await h.finish('guest');
+    expect(h.connect).toHaveBeenCalledTimes(2);
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    expect(logs.filter(line => line.incident === next.turnId && line.event === 'jarvis_agent_turn_released')).toHaveLength(1);
+  });
+
   test('client tools are authorized only for the currently active speaker and consent/channel generation', async () => {
     const h = harness();
     const guest = h.speaker('guest'); const owner = h.speaker('owner');
@@ -446,7 +630,8 @@ describe('bounded conversational scheduling', () => {
     await h.manager.ask(h.speaker('guest'), 'Private question', notifications); await settle();
     await h.ask('owner');
     h.callbacks.get('guest')!.onError('unknown-provider-detail'); await settle();
-    expect(notifications).toHaveBeenLastCalledWith({ type: 'failed', reason: 'provider', turnId: expect.any(String) });
+    expect(notifications).toHaveBeenLastCalledWith({ type: 'failed', reason: 'provider', turnId: expect.any(String),
+      delivery: 'none', generationComplete: false, localDrained: false });
     expect(JSON.stringify(notifications.mock.calls)).not.toContain('Private question');
     expect(JSON.stringify(notifications.mock.calls)).not.toContain('unknown-provider-detail');
     expect(h.sessions.get('owner')!.sendText).toHaveBeenCalled();

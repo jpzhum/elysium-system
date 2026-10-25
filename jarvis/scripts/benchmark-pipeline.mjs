@@ -1,5 +1,4 @@
 import { pathToFileURL } from 'node:url';
-import { SessionManager } from '../dist/agents/session-manager.js';
 import { summarize } from './benchmark-summary.mjs';
 
 async function settle() { for (let index = 0; index < 80; index++) await Promise.resolve(); }
@@ -39,12 +38,13 @@ class Clock {
   }
 }
 
-function harness(clock, mode) {
+function harness(clock, mode, SessionManager) {
   const counters = {};
   const durations = {};
   let sttCalls = 0;
   let sessions = 0;
-  let delivered = 0;
+  let confirmed = 0;
+  let unconfirmed = 0;
   let eventId = 0;
   let requestCount = 0;
   let responses = 0;
@@ -140,7 +140,10 @@ function harness(clock, mode) {
     pace: () => clock.sleep(20), metric,
     maxSessions: 2, maxTurnSeconds: 12, maxSessionSeconds: 300,
     idleSeconds: 45, followupSeconds: 18, maxTurnsPerHour: 100,
-    onTurnDelivered: () => { delivered++; },
+    onTurnDelivered: (_speaker, turn) => {
+      if (turn.generation === 'confirmed') confirmed++;
+      else unconfirmed++;
+    },
   });
   async function submit(kind, user = 'creator', spokenMs = 1_000) {
     requestCount++;
@@ -159,27 +162,32 @@ function harness(clock, mode) {
       .catch(() => { rejected++; });
   }
   return { submit, manager, counters, durations, firstPlayback,
-    summary: () => ({ interactions: requestCount, success: delivered, rejected, stt_calls: sttCalls,
+    summary: () => ({ interactions: requestCount, success: confirmed,
+      local_deliveries: confirmed + unconfirmed, unconfirmed_deliveries: unconfirmed, rejected, stt_calls: sttCalls,
       sessions_started: sessions, sessions_reused: counters.agent_session_reused ?? 0,
       timeouts: (counters.agent_user_turn_missing ?? 0) + (counters.agent_response_timeouts ?? 0),
-      lost_questions: Math.max(0, requestCount - delivered - rejected - (counters.questions_failed ?? 0)),
+      lost_questions: Math.max(0, requestCount - confirmed - unconfirmed - rejected - (counters.questions_failed ?? 0)),
     }),
   };
 }
 
-export async function runPipelineBenchmark() {
+export async function runPipelineBenchmark(sessionManagerClass) {
+  // The optional constructor lets tests exercise source on a clean checkout;
+  // normal benchmark execution always uses the production build.
+  const SessionManager = sessionManagerClass ?? (await import('../dist/agents/session-manager.js')).SessionManager;
   const scenarios = {};
   const repetitions = 5;
   for (const mode of ['short_voice', 'long_voice', 'text', 'consecutive', 'followup', 'two_speakers',
     'missing_completion', 'recognition_timeout', 'stt_failure', 'search_success', 'search_timeout']) {
-    const totals = { interactions: 0, success: 0, rejected: 0, stt_calls: 0, sessions_started: 0,
+    const totals = { interactions: 0, success: 0, local_deliveries: 0, unconfirmed_deliveries: 0,
+      rejected: 0, stt_calls: 0, sessions_started: 0,
       sessions_reused: 0, timeouts: 0, lost_questions: 0 };
     const stageSamples = {};
     const clock = new Clock();
     const restore = clock.install();
     try {
       for (let repeat = 0; repeat < repetitions; repeat++) {
-        const h = harness(clock, mode);
+        const h = harness(clock, mode, SessionManager);
         try {
           const voice = ['short_voice', 'long_voice', 'followup', 'recognition_timeout', 'stt_failure'].includes(mode);
           await h.submit(voice ? 'voice' : 'text', 'creator', mode === 'long_voice' ? 4_000 : 1_000);
@@ -199,11 +207,12 @@ export async function runPipelineBenchmark() {
       }
     } finally { restore(); }
     scenarios[mode] = { ...totals, success_rate: totals.success / totals.interactions,
+      unconfirmed_delivery_rate: totals.unconfirmed_deliveries / totals.interactions,
       timeout_rate: totals.timeouts / totals.interactions, stt_calls_per_interaction: totals.stt_calls / totals.interactions,
       stages: Object.fromEntries(Object.entries(stageSamples).map(([name, values]) => [name, summarize(values)])) };
   }
   return { kind: 'synthetic_virtual_pipeline', repetitions,
-    description: 'Production SessionManager with virtual monotonic timers, generated audio, mocked consent/provider/player; no live STT, network, Brave, recognition quality, or Discord audibility assertions.',
+    description: 'Production SessionManager with virtual monotonic timers, generated audio, mocked consent/provider/player. Success counts confirmed generation with local playback done; unconfirmed deliveries remain separate. No live STT, network, Brave, recognition quality, or Discord audibility assertions.',
     assumptions_ms: { vad_silence: 600, wake_stt: 560, connection: 486, upload_chunk_pacing: 20,
       recognition_after_last_input: 200, agent_after_recognition: 1_020, first_playback: 20,
       search_success: 150, search_timeout: 5_000 }, scenarios };

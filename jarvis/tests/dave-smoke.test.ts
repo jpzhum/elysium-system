@@ -173,10 +173,14 @@ test("synthetic Opus frames produce separate bounded PCM turns attributed to Dis
     state.consent.add(user);
     state.speaking.emit("start", user);
   }
-  for (let frame = 0; frame < 50; frame += 1) {
+  // Finish both utterances before the one-second safety ceiling. Hitting that
+  // ceiling deliberately rejects a partial question rather than delivering it.
+  for (let frame = 0; frame < 20; frame += 1) {
     state.streams.get("a")!.write(packetA);
     state.streams.get("b")!.write(packetB);
   }
+  state.streams.get("a")!.end();
+  state.streams.get("b")!.end();
   await setImmediate();
   assert.equal(state.turns.length, 2);
   assert.deepEqual(state.turns.map(({ userId }) => userId), ["a", "b"]);

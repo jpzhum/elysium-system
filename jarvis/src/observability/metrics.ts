@@ -177,7 +177,10 @@ export interface DiagnosticFields {
   pending_tools?: number;
   queue_position?: number;
   queue_depth?: number;
-  turn_outcome?: 'completed' | 'superseded' | 'unconfirmed' | 'cancelled' | 'failed';
+  turn_outcome?: 'completed' | 'superseded' | 'unconfirmed' | 'cancelled' | 'failed' | 'partial' | 'expired';
+  turn_delivery?: 'none' | 'not_started' | 'partial' | 'unconfirmed' | 'confirmed';
+  cancellation_reason?: 'expired' | 'revoked' | 'interrupted' | 'closed' | 'provider' | 'limit';
+  retry_after_ms?: number;
   question_wait_ms?: number;
   first_audio_ms?: number;
   last_audio_ms?: number;
@@ -235,11 +238,11 @@ export interface DiagnosticFields {
   recovery_attempt?: number;
   retry_delay_ms?: number;
   receiver_state?: 'ready' | 'suspended' | 'stopped';
-  capture_rejection?: 'too_short' | 'silent';
+  capture_rejection?: 'too_short' | 'silent' | 'duration_limit';
   rejection_reason?: 'consent' | 'busy' | 'limit' | 'closed' | 'unexpected'
     | 'queue_full' | 'user_queue_full' | 'voice_memory_limit' | 'turn_budget'
     | 'wake_check_busy' | 'wake_capacity' | 'voice_unavailable' | 'consent_invalid'
-    | 'wake_queue_full' | 'wake_queue_timeout' | 'wake_rate_limited' | 'wake_provider_failed';
+    | 'wake_queue_full' | 'wake_queue_timeout' | 'wake_rate_limited' | 'wake_speaker_backoff' | 'wake_provider_failed';
   voice_lifecycle_reason?: 'explicit_leave' | 'channel_changed' | 'channel_empty' | 'shutdown' | 'connection_destroyed' | 'room_replaced';
 }
 
@@ -267,6 +270,7 @@ const events = new Set([
   'jarvis_voice_receive_error', 'jarvis_playback_failed', 'jarvis_playback_state',
   'jarvis_agent_input_prepared', 'jarvis_agent_first_audio',
   'jarvis_agent_turn_released', 'jarvis_agent_turn_cancelled',
+  'jarvis_agent_turn_error',
 ]);
 
 export function newIncident(): string { return randomBytes(4).toString('hex').toUpperCase(); }
@@ -297,7 +301,9 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['playback_stage', playbackStages], ['player_status', playerStatuses], ['previous_player_status', playerStatuses],
     ['receive_stage', ['subscribe', 'decoder_setup', 'stream', 'decode']],
     ['rate_limit_source', ['worker_busy', 'worker_interval', 'provider_quota', 'provider_429']],
-    ['turn_outcome', ['completed', 'superseded', 'unconfirmed', 'cancelled', 'failed']],
+    ['turn_outcome', ['completed', 'superseded', 'unconfirmed', 'cancelled', 'failed', 'partial', 'expired']],
+    ['turn_delivery', ['none', 'not_started', 'partial', 'unconfirmed', 'confirmed']],
+    ['cancellation_reason', ['expired', 'revoked', 'interrupted', 'closed', 'provider', 'limit']],
     ['input_kind', ['voice', 'text']],
     ['connection_stage', ['signed_url', 'websocket_handshake', 'audio_negotiation']],
     ['identity_source', ['discord']],
@@ -305,11 +311,11 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['tool_name', ['search_game_info', 'get_voice_participants', 'unknown']],
     ['tool_stage', ['received', 'started', 'completed', 'failed']],
     ['receiver_state', ['ready', 'suspended', 'stopped']],
-    ['capture_rejection', ['too_short', 'silent']],
+    ['capture_rejection', ['too_short', 'silent', 'duration_limit']],
     ['rejection_reason', ['consent', 'busy', 'limit', 'closed', 'unexpected',
       'queue_full', 'user_queue_full', 'voice_memory_limit', 'turn_budget',
       'wake_check_busy', 'wake_capacity', 'voice_unavailable', 'consent_invalid',
-      'wake_queue_full', 'wake_queue_timeout', 'wake_rate_limited', 'wake_provider_failed']],
+      'wake_queue_full', 'wake_queue_timeout', 'wake_rate_limited', 'wake_speaker_backoff', 'wake_provider_failed']],
     ['voice_lifecycle_reason', ['explicit_leave', 'channel_changed', 'channel_empty', 'shutdown', 'connection_destroyed', 'room_replaced']],
     ['platform', ['win32', 'linux', 'darwin']], ['arch', ['x64', 'arm64']],
   ] as const) {
@@ -350,6 +356,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['source_count', 0, 5],
     ['context_items', 0, 10], ['context_chars', 0, 2400],
     ['recovery_attempt', 1, 3], ['retry_delay_ms', 0, 5_000],
+    ['retry_after_ms', 0, 60_000],
   ] as const) {
     const value = diagnosticValue(fields, key);
     if (integer(value, minimum, maximum)) result[key] = value;

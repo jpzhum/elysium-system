@@ -22,6 +22,7 @@ function harness(maxTurnSeconds = 12) {
   const delivered: { userId: string; pcm: Buffer; timing: VoiceTurnTiming }[] = [];
   const metric = vi.fn();
   const diagnostic = vi.fn();
+  const rejected = vi.fn();
   let playing = true;
   let enabled = true;
   const connection = Object.assign(new EventEmitter(), {
@@ -39,9 +40,10 @@ function harness(maxTurnSeconds = 12) {
     onTurn(userId, pcm, timing) { delivered.push({ userId, pcm: Buffer.from(pcm), timing }); },
     onMetric: metric,
     onDiagnostic: diagnostic,
+    onCaptureRejected: rejected,
   });
   receiver.start();
-  return { receiver, speaking, streams, consent, subscriptions, delivered, metric, diagnostic, connection,
+  return { receiver, speaking, streams, consent, subscriptions, delivered, metric, diagnostic, rejected, connection,
     setPlaying(value: boolean) { playing = value; }, setEnabled(value: boolean) { enabled = value; } };
 }
 
@@ -325,5 +327,106 @@ test('Opus packet failures stay separate from receive errors even if the diagnos
   expect(h.metric).not.toHaveBeenCalledWith('voice_receive_errors', 1);
   expect(h.delivered).toHaveLength(0);
   expect(stream.destroyed).toBe(true);
+  h.receiver.stop();
+});
+
+test.each([3, 8, 11.4, 12, 15, 20])('%s-second speech either finishes within the capture budget or is explicitly rejected without a partial question', async seconds => {
+  vi.useFakeTimers();
+  const h = harness(); h.setPlaying(false); h.consent.add('guest');
+  h.speaking.emit('start', 'guest');
+  const stream = h.streams.get('guest')!;
+  for (let milliseconds = 0; milliseconds < seconds * 1000; milliseconds += 20) {
+    if (!stream.destroyed) stream.write(packet());
+    await vi.advanceTimersByTimeAsync(20);
+  }
+  for (let milliseconds = 0; milliseconds < 600 && !stream.destroyed; milliseconds += 20) {
+    stream.write(Buffer.alloc(960 * 4));
+    await vi.advanceTimersByTimeAsync(20);
+  }
+  if (seconds < 12) {
+    expect(h.delivered).toHaveLength(1);
+    expect(h.delivered[0]!.pcm.length).toBe((seconds + 0.6) * 192_000);
+    expect(h.rejected).not.toHaveBeenCalled();
+  } else {
+    expect(h.delivered).toHaveLength(0);
+    expect(h.rejected).toHaveBeenCalledExactlyOnceWith('guest', 'duration_limit');
+    expect(h.metric).toHaveBeenCalledWith('voice_capture_duration_limit_rejected', 1);
+    expect(h.diagnostic).toHaveBeenCalledWith(expect.objectContaining({
+      stage: 'voice_capture', code: 'AGENT_INPUT_INVALID', capture_rejection: 'duration_limit',
+    }));
+  }
+  expect(stream.destroyed).toBe(true);
+  h.receiver.stop();
+});
+
+test.each([21, 30])('a configured %s-second capture budget preserves complete 12, 15 and 20-second questions on the same receiver', async maxSeconds => {
+  vi.useFakeTimers();
+  const h = harness(maxSeconds); h.setPlaying(false); h.consent.add('guest');
+  for (const seconds of [12, 15, 20]) {
+    h.speaking.emit('start', 'guest');
+    const stream = h.streams.get('guest')!;
+    for (let elapsed = 0; elapsed < seconds * 1000; elapsed += 20) {
+      stream.write(packet());
+      await vi.advanceTimersByTimeAsync(20);
+    }
+    for (let tail = 0; tail < 600; tail += 20) {
+      stream.write(Buffer.alloc(960 * 4));
+      await vi.advanceTimersByTimeAsync(20);
+    }
+    const delivered = h.delivered.at(-1)!;
+    expect(delivered.userId).toBe('guest');
+    expect(delivered.pcm.length).toBe(seconds * 192_000 + 115_200);
+    expect(delivered.pcm.subarray(0, seconds * 192_000).some(byte => byte !== 0)).toBe(true);
+    expect(delivered.pcm.subarray(seconds * 192_000).every(byte => byte === 0)).toBe(true);
+    expect(stream.destroyed).toBe(true);
+    expect(h.rejected).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  }
+  expect(h.delivered).toHaveLength(3);
+  expect(new Set(h.delivered.map(turn => turn.timing.captureId)).size).toBe(3);
+  h.receiver.stop();
+  expect(h.speaking.listenerCount('start')).toBe(0);
+  expect(h.connection.listenerCount('stateChange')).toBe(0);
+});
+
+test('byte limit rejects normal speech, cleans owned PCM, and leaves the next capture operational', async () => {
+  const h = harness(1); h.setPlaying(false); h.consent.add('guest');
+  h.speaking.emit('start', 'guest');
+  const old = h.streams.get('guest')!;
+  const firstDecoded = decode.mock.results.length;
+  for (let frame = 0; frame < 50; frame++) old.write(packet());
+  expect(h.delivered).toHaveLength(0);
+  expect(h.rejected).toHaveBeenCalledExactlyOnceWith('guest', 'duration_limit');
+  expect(old.destroyed).toBe(true);
+  const owned = decode.mock.results.slice(firstDecoded).map(result => result.value as Buffer);
+  expect(owned).toHaveLength(50);
+  expect(owned.every(pcm => pcm.every(byte => byte === 0))).toBe(true);
+  h.speaking.emit('start', 'guest');
+  const next = h.streams.get('guest')!;
+  old.emit('end'); old.emit('close');
+  expect(next.destroyed).toBe(false);
+  next.write(packet()); next.end();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(h.delivered).toHaveLength(1);
+  expect(h.delivered[0]!.pcm).toEqual(packet());
+  expect(h.rejected).toHaveBeenCalledTimes(1);
+  h.receiver.stop();
+});
+
+test('a failed capture-limit notification cannot retain PCM or block another participant', async () => {
+  const h = harness(1); h.setPlaying(false); h.consent.add('guest'); h.consent.add('owner');
+  h.rejected.mockImplementationOnce(() => { throw new Error('PRIVATE notification failure'); });
+  h.speaking.emit('start', 'guest');
+  const rejected = h.streams.get('guest')!;
+  expect(() => {
+    for (let frame = 0; frame < 50; frame++) rejected.write(packet());
+  }).not.toThrow();
+  expect(h.metric).toHaveBeenCalledWith('voice_capture_rejection_callback_failed', 1);
+  h.speaking.emit('start', 'owner');
+  const owner = h.streams.get('owner')!;
+  owner.write(packet()); owner.end();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(h.delivered.map(turn => turn.userId)).toEqual(['owner']);
+  expect(JSON.stringify(h.diagnostic.mock.calls)).not.toContain('PRIVATE');
   h.receiver.stop();
 });

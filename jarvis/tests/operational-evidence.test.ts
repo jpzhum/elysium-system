@@ -44,7 +44,7 @@ test('terminal rates separate confirmations, unconfirmed playback, failures and 
   logger.event('jarvis_agent_turn_finished', 'info', { incident: '00000001', turn_outcome: 'unconfirmed' });
   logger.event('jarvis_agent_turn_cancelled', 'info', { incident: '00000002', turn_outcome: 'cancelled', input_kind: 'voice' });
   logger.event('jarvis_agent_turn_failed', 'info', { incident: '00000003', turn_outcome: 'failed' });
-  expect(evidence.summary()).toContain('n=4; confirmados=1; não confirmados=1; falhos=1; cancelados=1; confirmação=25.0%');
+  expect(evidence.summary()).toContain('n=4; confirmados=1; não confirmados=1; falhos=1; cancelados=1; parciais=0; expirados=0; confirmação=25.0%');
   expect(evidence.summary()).toContain('ASR=turno cancelado');
   expect(evidence.summary().length).toBeLessThanOrEqual(1500);
   evidence.close();
@@ -61,6 +61,41 @@ test('recent denominator is bounded while process totals survive the window', ()
   evidence.close();
 });
 
+test('a causal error is not terminal, partial playback is separate and only confirmed drain advances last success', () => {
+  let now = 0;
+  const logger = new Logger('error', () => undefined);
+  const evidence = new OperationalEvidence(logger, () => now);
+  logger.event('jarvis_agent_turn_error', 'error', { incident: 'AABBCCDD', code: 'AGENT_TRANSPORT_ERROR', turn_delivery: 'partial' });
+  expect(evidence.summary()).toContain('desde o início: n=0');
+  logger.event('jarvis_agent_turn_failed', 'info', { incident: 'AABBCCDD', turn_outcome: 'partial', turn_delivery: 'partial' });
+  logger.event('jarvis_agent_turn_cancelled', 'info', { incident: 'AABBCCDE', turn_outcome: 'expired', cancellation_reason: 'expired' });
+  expect(evidence.summary()).toContain('parciais=1; expirados=1');
+  expect(evidence.summary()).toContain('Último turno confirmado e drenado: sem observação');
+  logger.event('jarvis_agent_turn_finished', 'info', { incident: 'AABBCCDF', turn_outcome: 'completed' });
+  now = 5000;
+  expect(evidence.summary()).toContain('Último turno confirmado e drenado: há 5 s');
+  expect(evidence.incidentDetails('AABBCCDD')).toContain('"turn_delivery":"partial"');
+  expect(evidence.incidentDetails('AABBCCDE')).toContain('"cancellation_reason":"expired"');
+  expect(evidence.incidentDetails('PRIVATE')).not.toContain('PRIVATE');
+  for (let index = 0; index < 64; index++) logger.event('jarvis_ready', 'info', {
+    incident: index.toString(16).toUpperCase().padStart(8, '0'),
+  });
+  expect(evidence.incidentDetails('AABBCCDD')).toContain('não encontrado');
+  evidence.close();
+});
+
+test('incident diagnostics keep causal stage separate from the last release stage', () => {
+  const logger = new Logger('error', () => undefined);
+  const evidence = new OperationalEvidence(logger);
+  logger.event('jarvis_agent_turn_error', 'error', { incident: 'AABBCCDD', code: 'PLAYBACK_FAILED', stage: 'playback' });
+  logger.event('jarvis_agent_turn_failed', 'error', { incident: 'AABBCCDD', code: 'PLAYBACK_FAILED', stage: 'agent_connect' });
+  logger.event('jarvis_agent_turn_released', 'info', { incident: 'AABBCCDD', stage: 'session_setup' });
+  expect(evidence.incidentDetails('AABBCCDD')).toContain('"failure_stage":"playback"');
+  expect(evidence.incidentDetails('AABBCCDD')).toContain('"stage":"session_setup"');
+  expect(evidence.summary()).toContain('PLAYBACK_FAILED / playback / incidente=AABBCCDD');
+  evidence.close();
+});
+
 test('a generic playback rollup preserves the specific failure for the same incident', () => {
   const logger = new Logger('error', () => undefined);
   const evidence = new OperationalEvidence(logger);
@@ -72,6 +107,28 @@ test('a generic playback rollup preserves the specific failure for the same inci
   logger.event('jarvis_agent_turn_failed', 'error', { incident: 'FFEEDDCC', category: 'agent', code: 'AGENT_REQUEST_TIMEOUT' });
   expect(evidence.summary()).toContain('AGENT_REQUEST_TIMEOUT');
   expect(evidence.summary()).not.toContain('PLAYBACK_ENCODER_FAILED');
+  evidence.close();
+});
+
+test('incident details preserve encoder cause and stage through interleaved generic turn rollups', () => {
+  const logger = new Logger('error', () => undefined);
+  const evidence = new OperationalEvidence(logger);
+  logger.event('jarvis_playback_failed', 'error', { incident: 'AABBCCDD', category: 'playback',
+    code: 'PLAYBACK_ENCODER_FAILED', cause_code: 'UNKNOWN', stage: 'playback', playback_stage: 'opus_encode' });
+  logger.event('jarvis_agent_turn_error', 'error', { incident: 'FFEEDDCC', category: 'agent',
+    code: 'AGENT_TRANSPORT_ERROR', stage: 'agent_response_wait' });
+  logger.event('jarvis_agent_turn_error', 'error', { incident: 'AABBCCDD', category: 'playback',
+    code: 'PLAYBACK_FAILED', cause_code: 'PLAYBACK_ENCODER_FAILED', stage: 'agent_response_wait' });
+  logger.event('jarvis_agent_turn_failed', 'error', { incident: 'AABBCCDD', category: 'playback',
+    code: 'PLAYBACK_FAILED', cause_code: 'UNKNOWN', stage: 'agent_response_wait', turn_outcome: 'partial' });
+  logger.event('jarvis_agent_turn_released', 'info', { incident: 'AABBCCDD', stage: 'session_setup' });
+  const details = evidence.incidentDetails('AABBCCDD');
+  expect(details).toContain('"code":"PLAYBACK_ENCODER_FAILED"');
+  expect(details).toContain('"failure_stage":"playback"');
+  expect(details).toContain('"stage":"session_setup"');
+  expect(details).toContain('"turn_outcome":"partial"');
+  expect(evidence.summary()).toContain('AGENT_TRANSPORT_ERROR / agent_response_wait / incidente=FFEEDDCC');
+  expect(evidence.summary()).toContain('parciais=1');
   evidence.close();
 });
 

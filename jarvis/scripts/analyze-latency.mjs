@@ -9,6 +9,7 @@ const events = new Set([
   'jarvis_agent_playback_completed', 'jarvis_agent_response_complete',
   'jarvis_agent_turn_finished', 'jarvis_agent_turn_failed', 'jarvis_agent_turn_superseded',
   'jarvis_agent_turn_released', 'jarvis_agent_turn_cancelled', 'jarvis_playback_state',
+  'jarvis_agent_turn_error',
 ]);
 const fields = ['question_wait_ms', 'upload_ms', 'first_audio_ms', 'first_playback_ms'];
 const pipelineFields = ['speech_end_to_first_packet_ms', 'wake_detection_ms', 'question_wait_ms',
@@ -16,10 +17,10 @@ const pipelineFields = ['speech_end_to_first_packet_ms', 'wake_detection_ms', 'q
 const timingFields = [...new Set([...fields, ...pipelineFields.filter(field => field !== 'opus_encode_ms')])];
 const terminal = new Set(['jarvis_agent_turn_finished', 'jarvis_agent_turn_failed', 'jarvis_agent_turn_superseded',
   'jarvis_agent_turn_released', 'jarvis_agent_turn_cancelled']);
-const outcomes = new Set(['completed', 'superseded', 'unconfirmed', 'cancelled', 'failed']);
+const outcomes = new Set(['completed', 'superseded', 'unconfirmed', 'cancelled', 'failed', 'partial', 'expired']);
 // Conservative if exported terminal summaries arrive out of order: a confirmed
 // delivery must never overwrite an observed failure or cancellation.
-const outcomePrecedence = ['unknown', 'completed', 'unconfirmed', 'superseded', 'cancelled', 'failed'];
+const outcomePrecedence = ['unknown', 'completed', 'unconfirmed', 'superseded', 'cancelled', 'expired', 'failed', 'partial'];
 // Log timings are rounded integers except the accumulated encoder CPU time.
 const measured = (value, field) => (field === 'opus_encode_ms' ? Number.isFinite(value) : Number.isSafeInteger(value))
   && value >= 0 && value <= 3_600_000;
@@ -35,7 +36,7 @@ function outcomeRates(rows, population) {
       .map(([outcome, count]) => [outcome, rows.length ? count / rows.length : null])) };
 }
 function outcomeCounts(rows) {
-  return Object.fromEntries(['completed', 'superseded', 'unconfirmed', 'cancelled', 'failed', 'unknown']
+  return Object.fromEntries(['completed', 'superseded', 'unconfirmed', 'cancelled', 'failed', 'partial', 'expired', 'unknown']
     .map(outcome => [outcome, rows.filter(row => row.outcome === outcome).length]));
 }
 
@@ -62,9 +63,10 @@ export function createLatencyAnalysis({ maxIncidents = 100_000 } = {}) {
       if (record.input_kind === 'voice' || record.input_kind === 'text') turn.input_kind = record.input_kind;
       if (terminal.has(record.event)) {
         turn.terminal = true;
-        const outcome = record.event === 'jarvis_agent_turn_failed' ? 'failed'
+        const outcome = record.event === 'jarvis_agent_turn_failed'
+          ? record.turn_outcome === 'partial' || record.turn_outcome === 'expired' ? record.turn_outcome : 'failed'
           : record.event === 'jarvis_agent_turn_superseded' ? 'superseded'
-          : record.event === 'jarvis_agent_turn_cancelled' ? 'cancelled'
+          : record.event === 'jarvis_agent_turn_cancelled' ? record.turn_outcome === 'expired' ? 'expired' : 'cancelled'
           : outcomes.has(record.turn_outcome) ? record.turn_outcome : 'unknown';
         if (outcomePrecedence.indexOf(outcome) >= outcomePrecedence.indexOf(turn.outcome)) turn.outcome = outcome;
       }

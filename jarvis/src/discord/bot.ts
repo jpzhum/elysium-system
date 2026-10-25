@@ -160,13 +160,23 @@ export class JarvisBot {
       }
       if (command === 'status') {
         const room = this.room;
+        const requestedIncident = interaction.options.getString?.('incidente');
+        if (requestedIncident) {
+          await reply(`Revisão Render: ${deploymentRevision(this.config.RENDER_GIT_COMMIT)}.\n`
+            + this.evidence.incidentDetails(requestedIncident.toUpperCase()));
+          return;
+        }
         let probe = '';
         if (room && this.config.daveSmoke && interaction.user.id === this.config.JARVIS_OWNER_USER_ID) {
-          // Ephemeral ID-labelled counters are for verifying gateway attribution, never production logs.
-          probe = '\nProva por falante consentido: ' + JSON.stringify(Object.fromEntries(room.probe));
+          // Mask personal IDs even in the creator's ephemeral transport diagnosis.
+          probe = '\nProva por falante consentido (IDs mascarados): ' + JSON.stringify(Object.fromEntries(
+            [...room.probe].map(([id, counts], index) => [`falante_${index + 1}_…${id.slice(-4)}`, counts]),
+          ));
         }
         const pages = operationalStatus(this.metrics.snapshot());
         const playback = room?.playback.diagnosticState;
+        const wake = this.wake.operationalState;
+        const admission = this.wake.admissionState;
         await reply(`${room ? 'Conectado' : 'Desconectado'}; modo: ${this.config.daveSmoke
           ? 'diagnóstico DAVE local' : this.config.JARVIS_VOICE_INPUT}; sessões: ${room?.sessions.activeCount ?? 0};`
           + ` voz Discord: ${this.voice.connection?.state.status ?? 'desconectada'}; receiver: ${room?.receiver.state ?? 'stopped'};`
@@ -175,9 +185,13 @@ export class JarvisBot {
           + ` playback local: ${playback?.available ? 'disponível' : 'indisponível'}; player: ${playback?.player_status ?? 'ausente'};`
           + ` assinatura: ${playback?.subscribed ? 'atual' : 'ausente'}; DAVE: ${playback?.dave_ready === undefined ? 'sem observação' : playback.dave_ready ? 'pronto' : 'não pronto'}.`
           + `\nRevisão Render: ${deploymentRevision(this.config.RENDER_GIT_COMMIT)}.`
+          + `\nWake STT: ${wake.remaining}/${this.config.JARVIS_MAX_WAKE_CHECKS_PER_MINUTE} verificações disponíveis em janela móvel de 60 s;`
+          + ` fila: ${wake.queued}; ativo: ${wake.active ? 'sim' : 'não'}; nova vaga em até ${Math.ceil(wake.retryAfterMs / 1000)} s;`
+          + ` participantes em pausa após falas sem wake: ${admission.backingOff}.`
           + `\nPesquisa Brave: ${this.config.JARVIS_SEARCH_API_KEY ? 'chave configurada; verificar execução' : 'sem chave configurada'}.`
           );
-        for (const content of [this.evidence.summary(), ...pages]) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+        const details = interaction.options.getBoolean?.('detalhes') === true ? pages : [];
+        for (const content of [this.evidence.summary(), ...details]) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
         if (probe) await interaction.followUp({ content: probe.slice(0, 1750), flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
         return;
       }
@@ -476,7 +490,7 @@ export class JarvisBot {
           }
         },
         allowed: (speaker, audio) => this.allowed(room, speaker, audio),
-        detectWake: (pcm, signal) => this.wake.detect(pcm, signal),
+        detectWake: (pcm, signal, speaker) => this.wake.detect(pcm, signal, speaker),
         playback, maxSessions: this.config.JARVIS_MAX_ACTIVE_SESSIONS,
         maxTurnSeconds: this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN,
         maxSessionSeconds: this.config.JARVIS_MAX_SESSION_SECONDS,
@@ -523,19 +537,31 @@ export class JarvisBot {
             this.logger.event('jarvis_voice_turn_rejected', 'warn', {
               stage: 'voice_capture', input_kind: 'voice',
               rejection_reason: error instanceof SessionError ? error.reason ?? error.code
-                : error instanceof WakeError ? error.code : 'unexpected',
+                : error instanceof WakeError ? error.rateLimitSource === 'speaker_backoff' ? 'wake_speaker_backoff' : error.code : 'unexpected',
+              ...(error instanceof WakeError && error.retryAfterMs !== undefined ? { retry_after_ms: error.retryAfterMs } : {}),
               voice_status: connection!.state.status, queue_depth: room.sessions.queuedCount,
               ...sanitizeError(error),
             });
-            if (this.room === room && consent.get(id)?.audio) {
+            // Ambient speech rejected by local admission is observable in status/logs;
+            // it must not generate a channel message on every utterance.
+            if (this.room === room && consent.get(id)?.audio
+              && !(error instanceof WakeError && error.rateLimitSource === 'speaker_backoff')) {
               const notice = error instanceof SessionError && error.code === 'limit' ? this.limitNotice(error)
+                : error instanceof WakeError && error.code === 'wake_rate_limited'
+                  ? `O limite de verificações de voz foi atingido. Aguarde ${Math.max(1, Math.ceil((error.retryAfterMs ?? 60_000) / 1000))} s ou use /jarvis ask.`
                 : 'Não foi possível aceitar a pergunta de voz. Confira /jarvis status ou use /jarvis ask.';
               await channel.send({ content: `<@${id}> ${notice}`,
                 allowedMentions: { parse: [] } }).catch(() => this.metrics.add('turn_notification_failed'));
             }
           }
+        },
+        onCaptureRejected: async (id) => {
+          const member = channel.members.get(id);
+          if (this.room !== room || !member || member.user.bot || !consent.get(id)?.audio) return;
+          await channel.send({ content: `<@${id}> A fala atingiu o limite de captura (${this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN} s) e foi descartada. Faça uma pergunta mais curta ou use /jarvis ask.`,
+            allowedMentions: { parse: [] } }).catch(() => this.metrics.add('turn_notification_failed'));
         }, onMetric: this.metrics.record,
-        onDiagnostic: (fields) => this.logger.event('jarvis_voice_receive_error', 'warn', fields),
+        onDiagnostic: (fields) => this.logger.event(fields.capture_rejection ? 'jarvis_voice_capture_rejected' : 'jarvis_voice_receive_error', 'warn', fields),
         onState: (state) => this.logger.event('jarvis_voice_receiver_state', 'info', {
           stage: 'receiver_setup', receiver_state: state, voice_status: connection!.state.status,
         }),
@@ -582,6 +608,7 @@ export class JarvisBot {
     room.consent.revoke(userId);
     room.receiver.stopUser(userId);
     room.sessions.revoke(userId);
+    this.wake.forget(userId);
     room.recent?.forget(userId);
     room.probe.delete(userId);
   }
@@ -598,6 +625,7 @@ export class JarvisBot {
       room.consent.clear();
       room.receiver.stop();
       room.sessions.close();
+      this.wake.clearAdmission();
       room.recent?.close();
       room.playback.stop();
       room.probe.clear();
@@ -614,7 +642,12 @@ export class JarvisBot {
   private turnNotice(event: TurnNotification): string | undefined {
     if (event.type === 'queued') return `Pergunta de voz enfileirada (posição ${event.position ?? 1}).`;
     if (event.type === 'started') return 'Sua pergunta saiu da fila e está sendo atendida.';
-    if (event.type === 'failed') return 'Não foi possível responder à sua pergunta. Tente novamente ou confira /jarvis status.';
+    if (event.type === 'failed') {
+      if (event.delivery === 'partial') return 'A reprodução foi interrompida antes da conclusão. Tente novamente ou confira /jarvis status.';
+      if (event.delivery === 'not_started') return 'O agente enviou áudio, mas a reprodução não começou. Confira /jarvis status.';
+      if (event.delivery === 'unconfirmed') return 'A sessão apresentou uma falha após a reprodução local; a resposta completa não foi confirmada. Confira /jarvis status.';
+      return 'Não foi possível responder à sua pergunta. Tente novamente ou confira /jarvis status.';
+    }
     if (event.reason === 'expired') return 'Sua pergunta foi cancelada porque o prazo na fila expirou.';
     if (event.type === 'cancelled') return 'Sua pergunta ou resposta pendente foi cancelada.';
     return undefined;
@@ -636,7 +669,7 @@ export class JarvisBot {
     const abort = new AbortController();
     room.interruptions.set(member.id, abort);
     try {
-      const result = await this.wake.inspect(pcm, abort.signal, { allowInterruption: true });
+      const result = await this.wake.inspect(pcm, abort.signal, { allowInterruption: true, speaker });
       if (!abort.signal.aborted && this.allowed(room, speaker, true) && result.interrupt
         && room.playback.currentStreamToken === playbackToken && room.playback.isAudible
         && this.voice.connection?.state.status === VoiceConnectionStatus.Ready) {
