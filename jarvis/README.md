@@ -6,6 +6,11 @@ resposta audível de `/ask` em produção. A revisão V4 de turnos consecutivos,
 fila e voz experimental ainda exige validação real. Consulte
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) antes de operar.
 
+Novas funcionalidades estão suspensas durante a
+[investigação de isolamento](docs/FAULT_ISOLATION.md). Texto e reprodução precisam
+passar repetidamente no Discord antes de retomar reconhecimento integrado.
+O ensaio local preserva a mesma instância; a aprovação real continua pendente.
+
 A revisão de estabilização V5.6, suas causas reproduzidas, métricas correlacionadas,
 gates reais e rollback estão em [Project Rebirth](docs/V56_PROJECT_REBIRTH.md).
 Validação local não comprova resolução dos incidentes históricos ou audição na

@@ -1,5 +1,19 @@
 # Estado da implementação — 25/10/2026
 
+## Investigação de isolamento — novas funcionalidades suspensas
+
+O [relatório de isolamento](docs/FAULT_ISOLATION.md) separa dez tons, dez perguntas
+escritas sem captura, entrada/wake independentes e vinte turnos integrados. Um
+único teste mantém bot, conexão nativa, player, manager e wake entre as fases;
+transportes externos são controlados. A suíte passou com 752 testes, 40 arquivos
+e um gate real ignorado; typecheck, lint e build aprovados.
+
+Nenhuma causa nova foi demonstrada para justificar alteração de produção.
+`4C09D8B0` e `B4C09469` continuam sem logs/SHA correlacionados. Não havia worker
+ou credenciais locais para teste real. **Texto e reprodução em chamada real
+precisam ser aprovados antes de reativar a complexidade de voz.** Sem refatoração,
+dependências novas, aumento de timeout, push ou deploy nesta investigação.
+
 ## P0: áudio recebido, reprodução não iniciada
 
 Commit local `7355ba9`: repara assinatura perdida/obsoleta no caminho de saída e
