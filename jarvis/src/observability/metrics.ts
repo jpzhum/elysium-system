@@ -242,7 +242,7 @@ export interface DiagnosticFields {
   rejection_reason?: 'consent' | 'busy' | 'limit' | 'closed' | 'unexpected'
     | 'queue_full' | 'user_queue_full' | 'voice_memory_limit' | 'turn_budget'
     | 'wake_check_busy' | 'wake_capacity' | 'voice_unavailable' | 'consent_invalid'
-    | 'wake_queue_full' | 'wake_queue_timeout' | 'wake_rate_limited' | 'wake_speaker_backoff' | 'wake_provider_failed';
+    | 'wake_queue_full' | 'wake_queue_timeout' | 'wake_rate_limited' | 'wake_speaker_backoff' | 'wake_speaker_rate_limited' | 'wake_provider_failed';
   voice_lifecycle_reason?: 'explicit_leave' | 'channel_changed' | 'channel_empty' | 'shutdown' | 'connection_destroyed' | 'room_replaced';
 }
 
@@ -315,7 +315,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     ['rejection_reason', ['consent', 'busy', 'limit', 'closed', 'unexpected',
       'queue_full', 'user_queue_full', 'voice_memory_limit', 'turn_budget',
       'wake_check_busy', 'wake_capacity', 'voice_unavailable', 'consent_invalid',
-      'wake_queue_full', 'wake_queue_timeout', 'wake_rate_limited', 'wake_speaker_backoff', 'wake_provider_failed']],
+      'wake_queue_full', 'wake_queue_timeout', 'wake_rate_limited', 'wake_speaker_backoff', 'wake_speaker_rate_limited', 'wake_provider_failed']],
     ['voice_lifecycle_reason', ['explicit_leave', 'channel_changed', 'channel_empty', 'shutdown', 'connection_destroyed', 'room_replaced']],
     ['platform', ['win32', 'linux', 'darwin']], ['arch', ['x64', 'arm64']],
   ] as const) {

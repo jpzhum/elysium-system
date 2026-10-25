@@ -13,6 +13,7 @@ import { ElevenWakeDetector } from '../src/agents/wake-detector.js';
 import { PlaybackQueue } from '../src/audio/playback.js';
 import { VoiceReceiver, type VoiceTurnTiming } from '../src/discord/voice-receiver.js';
 import { Logger } from '../src/observability/metrics.js';
+import { VoiceAdmissionEvidence } from '../src/observability/voice-admission-evidence.js';
 import { ConsentStore } from '../src/policy/consent.js';
 import { speakerContext, type SpeakerContext } from '../src/policy/identity.js';
 import { createGameSearch } from '../src/tools/game-search.js';
@@ -121,7 +122,7 @@ class ControlledVoice extends EventEmitter {
   }
 }
 
-interface Captured { userId: string; pcm: Buffer; timing: VoiceTurnTiming; zeroCrossings: number; receipt?: TurnReceipt; error?: unknown }
+interface Captured { userId: string; pcm: Buffer; timing: VoiceTurnTiming; zeroCrossings: number; settled?: boolean; receipt?: TurnReceipt; error?: unknown }
 interface Request { speaker: SpeakerContext; kind: 'text' | 'voice' }
 const cleanups: (() => Promise<void>)[] = [];
 async function microtasks(): Promise<void> { for (let index = 0; index < 80; index++) await Promise.resolve(); }
@@ -160,6 +161,8 @@ function endurance(maxTurnSeconds = 12) {
   });
   const wakeRequests = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ text: wakeText })));
   const wake = new ElevenWakeDetector('fixture_key', 'Jarvis', 6, metric, wakeRequests);
+  const evidence = new VoiceAdmissionEvidence('daa1bbd');
+  wake.setObserver((speaker, event) => evidence.record(speaker.discordUserId, event));
   const search = createGameSearch({ apiKey: 'fixture_search_key' });
   const manager = new SessionManager({
     connect: (speaker, callbacks, signal) => {
@@ -185,6 +188,7 @@ function endurance(maxTurnSeconds = 12) {
     playback, allowed: (speaker, audio) => connection.state.status === VoiceConnectionStatus.Ready
       && consent.isCurrent(speaker.discordUserId, speaker.consentVersion, audio),
     detectWake: (input, signal, speaker) => wake.detect(input, signal, speaker),
+    observe: (speaker, event, details) => evidence.record(speaker.discordUserId, event, details),
     maxSessions: 2, maxTurnSeconds, maxSessionSeconds: 300, idleSeconds: 45,
     followupSeconds: 18, maxTurnsPerHour: 120, metric, logger,
     notify: (_speaker, event) => { notifications.push(event); },
@@ -218,6 +222,7 @@ function endurance(maxTurnSeconds = 12) {
         capture.receipt = await manager.voiceTurn(speaker(userId), input, timing);
         if (capture.receipt) requests.set(capture.receipt.turnId, { speaker: speaker(userId), kind: 'voice' });
       } catch (error) { capture.error = error; }
+      finally { capture.settled = true; }
     },
   });
   receiver.start();
@@ -226,7 +231,8 @@ function endurance(maxTurnSeconds = 12) {
     return speakerContext({ discordUserId: id, displayName: name, guildId: 'guild', channelId: 'voice',
       consented: Boolean(grant), consentVersion: grant?.version ?? -1 }, 'owner');
   };
-  const grant = (id = 'owner'): SpeakerContext => { consent.grant(id, true); return speaker(id); };
+  const syncWake = (): void => wake.setParticipants(['owner', 'kel', 'visitor'].filter(id => consent.get(id)?.audio).map(id => speaker(id)));
+  const grant = (id = 'owner'): SpeakerContext => { consent.grant(id, true); syncWake(); return speaker(id); };
   const advance = async (milliseconds = 20): Promise<void> => { await microtasks(); await vi.advanceTimersByTimeAsync(milliseconds); await microtasks(); };
   const until = async (condition: () => boolean, maximumMs = 40_000): Promise<void> => {
     for (let elapsed = 0; !condition() && elapsed <= maximumMs; elapsed += 20) await advance();
@@ -251,7 +257,7 @@ function endurance(maxTurnSeconds = 12) {
     await microtasks();
     return receipt;
   };
-  const capture = async (id = 'owner', seconds = 0.2): Promise<TurnReceipt | undefined> => {
+  const capture = async (id = 'owner', seconds = 0.2, allowRejection = false): Promise<TurnReceipt | undefined> => {
     const before = captures.length;
     const streamCount = connection.streams.length;
     connection.speaking.emit('start', id);
@@ -275,7 +281,7 @@ function endurance(maxTurnSeconds = 12) {
     } finally { encoder.delete(); }
     await advance();
     const result = captures.slice(before).find(value => value.userId === id);
-    if (result) { await until(() => result.receipt !== undefined || result.error !== undefined); expect(result.error).toBeUndefined(); }
+    if (result) { await until(() => result.settled === true); if (!allowRejection) expect(result.error).toBeUndefined(); }
     return result?.receipt;
   };
   const answer = async (receipt: TurnReceipt, options: { complete?: boolean; seconds?: number; recognize?: boolean } = {}): Promise<void> => {
@@ -354,7 +360,7 @@ function endurance(maxTurnSeconds = 12) {
   const recover = async (): Promise<void> => {
     const receipt = await ask(); await answer(receipt); await checkpoint(receipt);
   };
-  const revoke = (id: string): void => { consent.revoke(id); receiver.stopUser(id); manager.revoke(id); memory.forget(id); };
+  const revoke = (id: string): void => { consent.revoke(id); receiver.stopUser(id); manager.revoke(id); memory.forget(id); wake.forget(id); syncWake(); evidence.forget(id); };
   const transition = (status: VoiceConnectionStatus): void => {
     connection.transition(status);
     manager.setAvailable(status === VoiceConnectionStatus.Ready);
@@ -374,7 +380,7 @@ function endurance(maxTurnSeconds = 12) {
     expect(vi.getTimerCount()).toBe(0);
     expect(unexpectedRequest).not.toHaveBeenCalled();
   });
-  return { connection, player, consent, memory, manager, receiver, playback, sockets, logs, metrics,
+  return { connection, player, consent, memory, manager, receiver, playback, sockets, logs, metrics, wake, evidence,
     deliveries, captures, requests, checkpoints, notifications, rejectedCaptures, wakeRequests, grant, speaker, ask, capture, answer,
     upload, socketFor, advance, until, checkpoint, resources, recover, revoke, transition,
     setWakeText: (text: string) => { wakeText = text; } };
@@ -386,6 +392,92 @@ afterEach(async () => {
 });
 
 describe('conversation endurance with real local components and controlled protocol boundaries', () => {
+  test.each([['owner', 'kel'], ['kel', 'owner']])('V58 C/D/I/L/T: ten background captures from %s leave wake capacity for %s', async (background, directed) => {
+    const h = endurance(); h.grant(); h.grant('kel');
+    h.setWakeText('Conversa ambiente sem ativação.');
+    for (let utterance = 0; utterance < 10; utterance++) {
+      expect(await h.capture(background, 0.2, true)).toBeUndefined();
+      expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+      await h.resources();
+    }
+    expect(h.wakeRequests).toHaveBeenCalledTimes(2);
+    h.setWakeText('Jarvis, pergunta dirigida.');
+    const receipt = (await h.capture(directed))!;
+    await h.answer(receipt); await h.checkpoint(receipt);
+    expect(h.wakeRequests).toHaveBeenCalledTimes(3);
+    expect(h.evidence.snapshot()).toMatchObject({
+      paid_starts_in_window: 3, recent: { capture: 11, question_accepted: 1, wake_cooldown_rejected: 8, turn_responded: 1 },
+    });
+    expect(JSON.stringify(h.evidence.snapshot())).not.toMatch(/owner|kel|fixture_key|Conversa ambiente/);
+  });
+
+  test.each([['owner', 'kel'], ['kel', 'owner']])('V58 E/G/H: long response for %s drains before the queued question from %s', async (firstId, secondId) => {
+    const h = endurance(); h.grant(); h.grant('kel');
+    const first = (await h.capture(firstId))!;
+    const second = (await h.capture(secondId))!;
+    expect(second.queued).toBe(true);
+    expect(h.notifications.filter(event => event.type === 'queued' && event.turnId === second.turnId)).toHaveLength(1);
+    await h.answer(first, { seconds: 20 });
+    await h.checkpoint(first, 'completed', true);
+    expect(h.deliveries.map(value => value.speaker.discordUserId)).toEqual([firstId]);
+    await h.answer(second); await h.checkpoint(second);
+    expect(h.deliveries.map(value => value.speaker.discordUserId)).toEqual([firstId, secondId]);
+    expect(h.metrics.playback_completed).toBe(2);
+  });
+
+  test('V58 A/J/N/P/Q: two speakers alternate twenty voice turns after a fourth-turn playback failure', async () => {
+    const h = endurance(); h.grant(); h.grant('kel');
+    for (let turn = 1; turn <= 20; turn++) {
+      const id = turn % 2 ? 'owner' : 'kel';
+      const receipt = (await h.capture(id))!;
+      expect(receipt).toBeDefined();
+      if (turn === 11) { h.revoke('kel'); expect(h.manager.queueStatus.active).toBe(true); }
+      if (turn === 4) h.player.hold();
+      await h.answer(receipt, { complete: turn !== 4 });
+      if (turn === 4) h.player.fail();
+      await h.checkpoint(receipt, turn === 4 ? 'partial' : 'completed');
+      if (turn === 11) h.grant('kel');
+    }
+    expect(h.checkpoints).toHaveLength(20);
+    expect(h.metrics.playback_failed).toBe(1);
+    expect(h.metrics.playback_completed).toBe(19);
+    expect(h.wakeRequests).toHaveBeenCalledTimes(4);
+    expect(h.evidence.snapshot().process).toMatchObject({
+      question_accepted: 20, turn_responded: 19, turn_partial: 1, playback_failed: 1, wake_accepted: 4,
+    });
+    expect(h.evidence.snapshot().recent.turn_partial).toBe(1);
+    expect(h.notifications.filter(event => event.type === 'failed')).toHaveLength(1);
+  });
+
+  test('V58 M: a consumed creator follow-up does not admit more fragments or transfer to Kel', async () => {
+    const h = endurance(); h.grant(); h.grant('kel');
+    const first = (await h.capture())!; await h.answer(first); await h.checkpoint(first);
+    h.setWakeText('Fala paralela sem ativação.');
+    expect(await h.capture('kel')).toBeUndefined();
+    const calls = h.wakeRequests.mock.calls.length;
+    const followup = (await h.capture())!;
+    expect(followup).toBeDefined();
+    expect(h.wakeRequests).toHaveBeenCalledTimes(calls);
+    expect(await h.capture()).toBeUndefined();
+    expect(h.manager.queuedCount).toBe(0);
+    expect(h.wakeRequests).toHaveBeenCalledTimes(calls + 1);
+    await h.answer(followup); await h.checkpoint(followup);
+    expect(h.evidence.snapshot().recent.followup).toBe(1);
+    expect(h.deliveries.map(value => value.speaker.discordUserId)).toEqual(['owner', 'owner']);
+  });
+
+  test('V58 O: STT failure frees the same runtime for another participant and a later retry', async () => {
+    const h = endurance(); h.grant(); h.grant('kel');
+    h.wakeRequests.mockRejectedValueOnce(new Error('Controlled private STT failure.'));
+    expect(await h.capture('owner', 0.2, true)).toBeUndefined();
+    expect(h.captures.at(-1)!.error).toMatchObject({ code: 'wake_provider_failed' });
+    await h.resources();
+    const kel = (await h.capture('kel'))!; await h.answer(kel); await h.checkpoint(kel);
+    const owner = (await h.capture('owner'))!; await h.answer(owner); await h.checkpoint(owner);
+    expect(h.wakeRequests).toHaveBeenCalledTimes(3);
+    expect(h.metrics.wake_provider_errors).toBe(1);
+  });
+
   test('01: twenty text turns share one runtime and release every response exactly once', async () => {
     const h = endurance(); h.grant();
     for (let turn = 0; turn < 20; turn++) {

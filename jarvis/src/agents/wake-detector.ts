@@ -39,7 +39,9 @@ interface AdmissionRecord {
   expiresAt: number;
 }
 
-export type WakeRateLimitSource = 'global_budget' | 'speaker_backoff';
+export type WakeRateLimitSource = 'global_budget' | 'speaker_backoff' | 'speaker_budget';
+export type WakeObservationEvent = 'wake_requested' | 'wake_accepted' | 'wake_cooldown_rejected'
+  | 'wake_global_rejected' | 'wake_fair_share_rejected' | 'wake_valid';
 
 export class WakeError extends Error {
   readonly retryAfterMs?: number;
@@ -68,8 +70,10 @@ interface InspectionRequest {
 
 /** Experimental, paid, external wake detection. Audio consent MUST disclose pre-wake upload. */
 export class ElevenWakeDetector {
-  private readonly checkStarts: number[] = [];
+  private readonly checkStarts: { at: number; userId?: string }[] = [];
   private readonly admissions = new Map<string, AdmissionRecord>();
+  private participants?: Map<string, WakeAdmissionContext>;
+  private observer?: (speaker: WakeAdmissionContext, event: WakeObservationEvent) => void;
   private checking = false;
   private readonly waiting: InspectionRequest[] = [];
   constructor(private readonly apiKey: string, private readonly wakeWord: string,
@@ -79,10 +83,33 @@ export class ElevenWakeDetector {
   /** Shared paid-call capacity in a rolling minute; no identity or transcript is exposed. */
   get operationalState(): Readonly<{ remaining: number; queued: number; active: boolean; retryAfterMs: number }> {
     const now = performance.now();
-    while (this.checkStarts[0] !== undefined && this.checkStarts[0] <= now - BUDGET_WINDOW_MS) this.checkStarts.shift();
+    while (this.checkStarts[0] !== undefined && this.checkStarts[0].at <= now - BUDGET_WINDOW_MS) this.checkStarts.shift();
     const remaining = Math.max(0, this.perMinute - this.checkStarts.length);
     return Object.freeze({ remaining, queued: this.waiting.length, active: this.checking,
-      retryAfterMs: remaining > 0 ? 0 : Math.max(0, Math.ceil(this.checkStarts[0]! + BUDGET_WINDOW_MS - now)) });
+      retryAfterMs: remaining > 0 ? 0 : Math.max(0, Math.ceil(this.checkStarts[0]!.at + BUDGET_WINDOW_MS - now)) });
+  }
+
+  get fairnessState(): Readonly<{ participants: number; perSpeaker: number }> {
+    const participants = this.participants?.size ?? 0;
+    return Object.freeze({ participants, perSpeaker: Math.max(1, Math.ceil(this.perMinute / Math.max(1, participants))) });
+  }
+
+  /** The caller supplies current audio-consented members; this never grants consent. */
+  setParticipants(speakers: readonly WakeAdmissionContext[]): void {
+    const participants = new Map<string, WakeAdmissionContext>();
+    for (const speaker of speakers) {
+      participants.set(speaker.discordUserId, { discordUserId: speaker.discordUserId,
+        consentVersion: speaker.consentVersion, channelId: speaker.channelId });
+    }
+    this.participants = participants;
+    for (const [id, record] of this.admissions) {
+      if (!this.registered(record.speaker)) this.admissions.delete(id);
+    }
+  }
+
+  /** Technical events remain in process; consumers must mask identities before rendering. */
+  setObserver(observer?: (speaker: WakeAdmissionContext, event: WakeObservationEvent) => void): void {
+    this.observer = observer;
   }
 
   get admissionState(): Readonly<{ tracked: number; backingOff: number }> {
@@ -93,8 +120,8 @@ export class ElevenWakeDetector {
   }
 
   /** Clear consent-scoped admission only; never reset the worker's paid-call ceiling. */
-  forget(userId: string): void { this.admissions.delete(userId); }
-  clearAdmission(): void { this.admissions.clear(); }
+  forget(userId: string): void { this.admissions.delete(userId); this.participants?.delete(userId); }
+  clearAdmission(): void { this.admissions.clear(); this.participants = undefined; }
 
   async detect(pcm48kStereo: Buffer, signal?: AbortSignal, speaker?: WakeAdmissionContext): Promise<boolean> {
     return (await this.inspect(pcm48kStereo, signal, { speaker })).activated;
@@ -106,13 +133,18 @@ export class ElevenWakeDetector {
     if (signal?.aborted || pcm48kStereo.length < 19_200 || pcm48kStereo.length % 4 !== 0) {
       return Promise.resolve(NOT_ACTIVATED);
     }
+    this.observe(options.speaker, 'wake_requested');
+    if (options.speaker && !this.registered(options.speaker)) return Promise.resolve(NOT_ACTIVATED);
     const admission = options.speaker ? this.admission(options.speaker) : undefined;
     const backoff = admission ? this.backoff(admission) : undefined;
     if (backoff) return Promise.reject(backoff);
     const budget = this.operationalState;
     if (!budget.remaining) {
+      this.observe(options.speaker, 'wake_global_rejected');
       this.metric('wake_rate_limited'); return Promise.reject(new WakeError('wake_rate_limited', budget.retryAfterMs));
     }
+    const fairShare = options.speaker ? this.fairShare(options.speaker) : undefined;
+    if (fairShare) return Promise.reject(fairShare);
     if (this.checking && this.waiting.length >= MAX_WAITING) {
       this.metric('wake_queue_full'); return Promise.reject(new WakeError('wake_queue_full'));
     }
@@ -150,7 +182,8 @@ export class ElevenWakeDetector {
       const oldest = this.admissions.keys().next().value;
       if (oldest !== undefined) this.admissions.delete(oldest);
     }
-    const record = { speaker: { ...speaker }, misses: 0, retryAt: 0,
+    const record = { speaker: { discordUserId: speaker.discordUserId, consentVersion: speaker.consentVersion,
+      channelId: speaker.channelId }, misses: 0, retryAt: 0,
       expiresAt: performance.now() + BUDGET_WINDOW_MS };
     this.admissions.set(speaker.discordUserId, record);
     return record;
@@ -159,8 +192,32 @@ export class ElevenWakeDetector {
   private backoff(record: AdmissionRecord): WakeError | undefined {
     const remaining = record.retryAt - performance.now();
     if (remaining <= 0) return undefined;
+    this.observe(record.speaker, 'wake_cooldown_rejected');
     this.metric('wake_speaker_backoff');
     return new WakeError('wake_rate_limited', Math.ceil(remaining), 'speaker_backoff');
+  }
+
+  private registered(speaker: WakeAdmissionContext): boolean {
+    if (!this.participants) return true; // Trusted standalone callers without a room roster.
+    const registered = this.participants.get(speaker.discordUserId);
+    return registered?.consentVersion === speaker.consentVersion && registered.channelId === speaker.channelId;
+  }
+
+  private fairShare(speaker: WakeAdmissionContext): WakeError | undefined {
+    if ((this.participants?.size ?? 0) < 2) return;
+    const starts = this.checkStarts.filter(start => start.userId === speaker.discordUserId);
+    const limit = this.fairnessState.perSpeaker;
+    if (starts.length < limit) return;
+    // Cost is charged to the Discord ID, independently of room/consent refresh.
+    const retryAfterMs = Math.max(0, Math.ceil(starts[starts.length - limit]!.at + BUDGET_WINDOW_MS - performance.now()));
+    this.metric('wake_speaker_rate_limited');
+    this.observe(speaker, 'wake_fair_share_rejected');
+    return new WakeError('wake_rate_limited', retryAfterMs, 'speaker_budget');
+  }
+
+  private observe(speaker: WakeAdmissionContext | undefined, event: WakeObservationEvent): void {
+    if (!speaker) return;
+    try { this.observer?.(speaker, event); } catch { /* Diagnosis cannot buy, cancel or block a call. */ }
   }
 
   private currentAdmission(entry: InspectionRequest): boolean {
@@ -219,8 +276,14 @@ export class ElevenWakeDetector {
     const backoff = entry.admission ? this.backoff(entry.admission) : undefined;
     if (backoff) throw backoff;
     const budget = this.operationalState;
-    if (!budget.remaining) { this.metric('wake_rate_limited'); throw new WakeError('wake_rate_limited', budget.retryAfterMs); }
-    this.checkStarts.push(performance.now());
+    if (!budget.remaining) {
+      this.observe(entry.admission?.speaker, 'wake_global_rejected');
+      this.metric('wake_rate_limited'); throw new WakeError('wake_rate_limited', budget.retryAfterMs);
+    }
+    const fairShare = entry.admission ? this.fairShare(entry.admission.speaker) : undefined;
+    if (fairShare) throw fairShare;
+    this.checkStarts.push({ at: performance.now(), userId: entry.admission?.speaker.discordUserId });
+    this.observe(entry.admission?.speaker, 'wake_accepted');
     if (entry.admission) entry.admission.expiresAt = performance.now() + BUDGET_WINDOW_MS;
     const started = performance.now();
     this.metric('wake_queue_wait_ms', Math.max(0, Math.round(started - entry.enqueuedAt)));
@@ -256,7 +319,7 @@ export class ElevenWakeDetector {
       if (!this.currentAdmission(entry)) return NOT_ACTIVATED;
       const activated = containsWakeWord(text, this.wakeWord);
       this.recordInspection(entry, activated);
-      if (activated) this.metric('wake_activations');
+      if (activated) { this.metric('wake_activations'); this.observe(entry.admission?.speaker, 'wake_valid'); }
       return { activated, interrupt: entry.interrupt && typeof text === 'string' &&
         isExplicitStopCommand(text, this.wakeWord) };
     } catch {

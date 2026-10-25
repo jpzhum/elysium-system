@@ -245,6 +245,164 @@ test('spent quota rejects before a new capture is copied or queued behind active
 });
 
 const ambientSpeaker = { discordUserId: 'guest', consentVersion: 1, channelId: 'voice' };
+const creator = { discordUserId: 'owner', consentVersion: 1, channelId: 'voice' };
+
+test('a registered pair has separate paid-call shares even when one speaker always activates wake', async () => {
+  vi.useFakeTimers();
+  try {
+    const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'Jarvis' }));
+    const metric = vi.fn();
+    const observed = vi.fn();
+    const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, metric, request);
+    detector.setParticipants([creator, ambientSpeaker]);
+    detector.setObserver(observed);
+    const pcm = Buffer.alloc(48_000, 1);
+    for (let call = 0; call < 3; call++) expect(await detector.detect(pcm, undefined, creator)).toBe(true);
+    await expect(detector.detect(pcm, undefined, creator)).rejects.toMatchObject({
+      code: 'wake_rate_limited', rateLimitSource: 'speaker_budget', retryAfterMs: 60_000,
+    });
+    expect(detector.operationalState.remaining).toBe(3);
+    expect(detector.fairnessState).toEqual({ participants: 2, perSpeaker: 3 });
+    for (let call = 0; call < 3; call++) expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(true);
+    await expect(detector.detect(pcm, undefined, ambientSpeaker)).rejects.toMatchObject({ rateLimitSource: 'global_budget' });
+    expect(request).toHaveBeenCalledTimes(6);
+    expect(metric).toHaveBeenCalledWith('wake_speaker_rate_limited');
+    expect(JSON.stringify(metric.mock.calls)).not.toMatch(/owner|guest/);
+    expect(observed.mock.calls.filter(([, event]) => event === 'wake_accepted')).toHaveLength(6);
+    expect(observed.mock.calls.filter(([, event]) => event === 'wake_requested')).toHaveLength(8);
+    expect(observed.mock.calls.filter(([, event]) => event === 'wake_valid')).toHaveLength(6);
+    expect(observed).toHaveBeenCalledWith(creator, 'wake_fair_share_rejected');
+    expect(observed).toHaveBeenCalledWith(ambientSpeaker, 'wake_global_rejected');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(await detector.detect(pcm, undefined, creator)).toBe(true);
+  } finally { vi.useRealTimers(); }
+});
+
+test('a lone consenting speaker retains the complete existing wake budget', async () => {
+  const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'Jarvis' }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  detector.setParticipants([creator]);
+  const pcm = Buffer.alloc(48_000, 1);
+  for (let call = 0; call < 6; call++) expect(await detector.detect(pcm, undefined, creator)).toBe(true);
+  await expect(detector.detect(pcm, undefined, creator)).rejects.toMatchObject({ rateLimitSource: 'global_budget' });
+  expect(detector.fairnessState).toEqual({ participants: 1, perSpeaker: 6 });
+  expect(request).toHaveBeenCalledTimes(6);
+});
+
+test('registered membership is not capped by the sixteen concurrent capture/history slots', async () => {
+  const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'Jarvis' }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  const participants = Array.from({ length: 20 }, (_, index) => ({ ...creator, discordUserId: `member-${index}` }));
+  detector.setParticipants(participants);
+  expect(detector.fairnessState).toEqual({ participants: 20, perSpeaker: 1 });
+  expect(await detector.detect(Buffer.alloc(48_000, 1), undefined, participants[19]!)).toBe(true);
+  expect(request).toHaveBeenCalledOnce();
+});
+
+test('fair-share cost survives consent refresh, room cleanup and roster updates', async () => {
+  const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'Jarvis' }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  detector.setParticipants([creator, ambientSpeaker]);
+  const pcm = Buffer.alloc(48_000, 1);
+  for (let call = 0; call < 3; call++) await detector.detect(pcm, undefined, creator);
+  detector.forget(creator.discordUserId);
+  const renewed = { ...creator, consentVersion: 2 };
+  detector.setParticipants([renewed, ambientSpeaker]);
+  await expect(detector.detect(pcm, undefined, renewed)).rejects.toMatchObject({ rateLimitSource: 'speaker_budget' });
+  detector.clearAdmission();
+  const nextRoom = { ...renewed, channelId: 'other' };
+  detector.setParticipants([nextRoom, { ...ambientSpeaker, channelId: 'other' }]);
+  await expect(detector.detect(pcm, undefined, nextRoom)).rejects.toMatchObject({ rateLimitSource: 'speaker_budget' });
+  expect(request).toHaveBeenCalledTimes(3);
+});
+
+test('speaker reservation rejects an extra inspection while two speakers keep paid calls serialized', async () => {
+  let release!: (response: Response) => void;
+  const request = vi.fn<typeof fetch>(() => new Promise<Response>(resolve => { release = resolve; }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 2, vi.fn(), request);
+  detector.setParticipants([creator, ambientSpeaker]);
+  const pcm = Buffer.alloc(48_000, 1);
+  const first = detector.detect(pcm, undefined, creator);
+  const same = expect(detector.detect(pcm, undefined, creator)).rejects.toMatchObject({ rateLimitSource: 'speaker_budget' });
+  const second = detector.detect(pcm, undefined, ambientSpeaker);
+  expect(request).toHaveBeenCalledOnce();
+  release(Response.json({ text: 'Jarvis' }));
+  expect(await first).toBe(true);
+  await same;
+  await Promise.resolve();
+  expect(request).toHaveBeenCalledTimes(2);
+  detector.setParticipants([creator]);
+  release(Response.json({ text: 'Jarvis, resultado revogado' }));
+  expect(await second).toBe(false);
+  expect(detector.operationalState).toMatchObject({ remaining: 0, queued: 0, active: false });
+});
+
+test('a waiting inspection rechecks its smaller share when another participant joins', async () => {
+  let release!: (response: Response) => void;
+  const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'Jarvis' }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  detector.setParticipants([creator]);
+  const pcm = Buffer.alloc(48_000, 1);
+  for (let call = 0; call < 3; call++) await detector.detect(pcm, undefined, creator);
+  request.mockImplementation(() => new Promise<Response>(resolve => { release = resolve; }));
+  const active = detector.detect(pcm, undefined, creator);
+  const queued = expect(detector.detect(pcm, undefined, creator)).rejects.toMatchObject({ rateLimitSource: 'speaker_budget' });
+  expect(detector.operationalState.queued).toBe(1);
+  detector.setParticipants([creator, ambientSpeaker]);
+  release(Response.json({ text: 'Jarvis' }));
+  expect(await active).toBe(true);
+  await queued;
+  expect(request).toHaveBeenCalledTimes(4);
+  expect(detector.operationalState).toMatchObject({ remaining: 2, active: false, queued: 0 });
+});
+
+test('roster changes fence queued and late results without refunding spent capacity', async () => {
+  let release!: (response: Response) => void;
+  const request = vi.fn<typeof fetch>(() => new Promise<Response>(resolve => { release = resolve; }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  detector.setParticipants([creator, ambientSpeaker]);
+  const pcm = Buffer.alloc(48_000, 1);
+  const first = detector.detect(pcm, undefined, creator);
+  const queued = detector.detect(pcm, undefined, ambientSpeaker);
+  detector.setParticipants([{ ...creator, consentVersion: 2 }]);
+  release(Response.json({ text: 'Jarvis' }));
+  expect(await first).toBe(false);
+  expect(await queued).toBe(false);
+  expect(await detector.detect(pcm, undefined, ambientSpeaker)).toBe(false);
+  expect(request).toHaveBeenCalledOnce();
+  expect(detector.operationalState.remaining).toBe(5);
+});
+
+test('fair share expiry waits until enough older calls expire when another participant joins late', async () => {
+  vi.useFakeTimers();
+  try {
+    const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(),
+      vi.fn<typeof fetch>(async () => Response.json({ text: 'Jarvis' })));
+    detector.setParticipants([creator]);
+    const pcm = Buffer.alloc(48_000, 1);
+    for (let call = 0; call < 4; call++) {
+      await detector.detect(pcm, undefined, creator);
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    detector.setParticipants([creator, ambientSpeaker]);
+    await expect(detector.detect(pcm, undefined, creator)).rejects.toMatchObject({
+      rateLimitSource: 'speaker_budget', retryAfterMs: 57_000,
+    });
+    await vi.advanceTimersByTimeAsync(56_000);
+    await expect(detector.detect(pcm, undefined, creator)).rejects.toMatchObject({ rateLimitSource: 'speaker_budget', retryAfterMs: 1000 });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(await detector.detect(pcm, undefined, creator)).toBe(true);
+  } finally { vi.useRealTimers(); }
+});
+
+test('observer failures cannot block or duplicate a paid inspection', async () => {
+  const request = vi.fn<typeof fetch>(async () => Response.json({ text: 'Jarvis' }));
+  const detector = new ElevenWakeDetector('fictional-key', 'Jarvis', 6, vi.fn(), request);
+  detector.setParticipants([creator]);
+  detector.setObserver(() => { throw new Error('fixture_diagnostic_failed'); });
+  expect(await detector.detect(Buffer.alloc(48_000, 1), undefined, creator)).toBe(true);
+  expect(request).toHaveBeenCalledOnce();
+});
 
 test('two negative wakes back off only that speaker and leave shared capacity for the creator', async () => {
   vi.useFakeTimers();

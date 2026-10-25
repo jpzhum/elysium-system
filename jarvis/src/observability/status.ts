@@ -7,6 +7,7 @@ const counters = [
   'voice_capture_duration_limit_rejected',
   'voice_wake_busy', 'voice_turn_rejected', 'voice_receive_errors', 'voice_decode_errors',
   'wake_checks', 'wake_queued', 'wake_rate_limited', 'wake_speaker_backoff', 'wake_queue_full', 'wake_queue_timeout', 'wake_provider_errors',
+  'wake_speaker_rate_limited',
   'questions_cancelled', 'turn_queue_depth', 'agent_sessions_started', 'agent_session_reused',
   'agent_user_turns_recognized', 'agent_responses_after_recognition', 'audio_chunks_received',
   'agent_input_audio_chunks', 'agent_initial_audio_discarded', 'agent_user_turn_missing',

@@ -7,6 +7,7 @@ import type { Config } from '../config.js';
 import { diagnosticCommands, Logger, Metrics, newIncident, type DiagnosticFields, type DiagnosticStage } from '../observability/metrics.js';
 import { operationalStatus } from '../observability/status.js';
 import { OperationalEvidence, deploymentRevision } from '../observability/operational-evidence.js';
+import { VoiceAdmissionEvidence } from '../observability/voice-admission-evidence.js';
 import { DiagnosticError, JoinDiagnostics, sanitizeError } from '../observability/diagnostics.js';
 import { inspectVoiceRuntime } from '../observability/voice-runtime.js';
 import { authorize, AuthorizationError } from '../policy/authorization.js';
@@ -25,6 +26,7 @@ import { PlaybackEchoGuard } from '../audio/echo-guard.js';
 import { VoiceConnectionManager } from './voice-connection.js';
 import { VoiceReceiver } from './voice-receiver.js';
 import { jarvisCommand, privacyNotice } from './commands.js';
+import { VoiceFeedback, type VoiceNoticeCategory } from './voice-feedback.js';
 
 type Interaction = ChatInputCommandInteraction<'cached'>;
 interface Room {
@@ -44,6 +46,8 @@ export class JarvisBot {
   private readonly voice = new VoiceConnectionManager();
   private readonly metrics = new Metrics();
   private readonly evidence: OperationalEvidence;
+  private readonly voiceEvidence: VoiceAdmissionEvidence;
+  private readonly voiceFeedback = new VoiceFeedback();
   private room?: Room;
   private joining = false;
   private closed = false;
@@ -53,8 +57,15 @@ export class JarvisBot {
 
   constructor(private readonly config: Config, private readonly logger: Logger) {
     this.evidence = new OperationalEvidence(logger);
+    this.voiceEvidence = new VoiceAdmissionEvidence(config.RENDER_GIT_COMMIT);
     this.wake = new ElevenWakeDetector(config.ELEVENLABS_API_KEY ?? '', config.JARVIS_WAKE_WORD,
       config.JARVIS_MAX_WAKE_CHECKS_PER_MINUTE, this.metrics.record);
+    this.wake.setObserver((speaker, event) => {
+      const room = this.room;
+      if (room && this.allowed(room, speaker, true)) {
+        this.voiceEvidence.record(speaker.discordUserId, event);
+      }
+    });
     this.search = createGameSearch({ apiKey: config.JARVIS_SEARCH_API_KEY,
       timeoutMs: config.JARVIS_SEARCH_TIMEOUT_MS, onDiagnostic: (event) => {
       this.metrics.add(`search_${event.status}`);
@@ -108,9 +119,9 @@ export class JarvisBot {
       consentVersion: consent?.version ?? -1 }, this.config.JARVIS_OWNER_USER_ID);
   }
 
-  private allowed(room: Room, speaker: SpeakerContext, audio = false): boolean {
+  private allowed(room: Room, speaker: Pick<SpeakerContext, 'discordUserId' | 'consentVersion' | 'channelId'>, audio = false): boolean {
     const member = room.channel.members.get(speaker.discordUserId);
-    return this.room === room && Boolean(member && !member.user.bot)
+    return this.room === room && speaker.channelId === room.channel.id && Boolean(member && !member.user.bot)
       && room.consent.isCurrent(speaker.discordUserId, speaker.consentVersion, audio);
   }
 
@@ -177,6 +188,7 @@ export class JarvisBot {
         const playback = room?.playback.diagnosticState;
         const wake = this.wake.operationalState;
         const admission = this.wake.admissionState;
+        const fairness = this.wake.fairnessState;
         await reply(`${room ? 'Conectado' : 'Desconectado'}; modo: ${this.config.daveSmoke
           ? 'diagnóstico DAVE local' : this.config.JARVIS_VOICE_INPUT}; sessões: ${room?.sessions.activeCount ?? 0};`
           + ` voz Discord: ${this.voice.connection?.state.status ?? 'desconectada'}; receiver: ${room?.receiver.state ?? 'stopped'};`
@@ -188,10 +200,14 @@ export class JarvisBot {
           + `\nWake STT: ${wake.remaining}/${this.config.JARVIS_MAX_WAKE_CHECKS_PER_MINUTE} verificações disponíveis em janela móvel de 60 s;`
           + ` fila: ${wake.queued}; ativo: ${wake.active ? 'sim' : 'não'}; nova vaga em até ${Math.ceil(wake.retryAfterMs / 1000)} s;`
           + ` participantes em pausa após falas sem wake: ${admission.backingOff}.`
+          + ` Cota por participante consentido: ${fairness.perSpeaker}/min entre ${fairness.participants} participantes.`
           + `\nPesquisa Brave: ${this.config.JARVIS_SEARCH_API_KEY ? 'chave configurada; verificar execução' : 'sem chave configurada'}.`
           );
         const details = interaction.options.getBoolean?.('detalhes') === true ? pages : [];
         for (const content of [this.evidence.summary(), ...details]) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+        if (interaction.options.getBoolean?.('detalhes') === true && interaction.user.id === this.config.JARVIS_OWNER_USER_ID) {
+          for (const content of this.voiceEvidence.pages()) await interaction.followUp({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+        }
         if (probe) await interaction.followUp({ content: probe.slice(0, 1750), flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
         return;
       }
@@ -218,7 +234,7 @@ export class JarvisBot {
         stage = 'authorize';
         authorize(interaction.user.id, 'leave', this.config.JARVIS_OWNER_USER_ID);
         stage = 'previous_room_cleanup';
-        this.reset();
+        this.reset('explicit_leave', incident);
         await reply('Jarvis desconectado; consentimentos e buffers apagados.'); return;
       }
       stage = 'channel_lookup';
@@ -255,6 +271,7 @@ export class JarvisBot {
         }
         this.revoke(room, interaction.user.id);
         room.consent.grant(interaction.user.id, audio);
+        this.syncWakeParticipants(room);
         await reply((audio ? 'Aceite de áudio registrado. ' : 'Aceite de perguntas escritas registrado. ')
           + privacyNotice(this.config.JARVIS_VOICE_INPUT, this.config.daveSmoke,
             this.config.JARVIS_FOLLOWUP_SECONDS, this.config.JARVIS_BARGE_IN_ENABLED, this.config.JARVIS_SHORT_MEMORY_TTL_SECONDS)); return;
@@ -490,6 +507,9 @@ export class JarvisBot {
           }
         },
         allowed: (speaker, audio) => this.allowed(room, speaker, audio),
+        observe: (speaker, event, details) => {
+          if (this.allowed(room, speaker, true)) this.voiceEvidence.record(speaker.discordUserId, event, details);
+        },
         detectWake: (pcm, signal, speaker) => this.wake.detect(pcm, signal, speaker),
         playback, maxSessions: this.config.JARVIS_MAX_ACTIVE_SESSIONS,
         maxTurnSeconds: this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN,
@@ -501,9 +521,10 @@ export class JarvisBot {
         queueTtlSeconds: this.config.JARVIS_QUESTION_QUEUE_TTL_SECONDS,
         notify: async (speaker, event) => {
           if (event.type === 'started') return;
-          if ((this.room !== room || this.closed) && event.type !== 'cancelled' && event.type !== 'failed') return;
+          if (this.room !== room || this.closed || !this.allowed(room, speaker, true)) return;
           const content = this.turnNotice(event);
-          if (content) await channel.send({ content: `<@${speaker.discordUserId}> ${content}`, allowedMentions: { parse: [] } });
+          if (content) await this.voiceFeedback.turn(speaker.discordUserId, event.turnId, event.type,
+            `${content} Incidente ${event.turnId}.`, this.feedbackDelivery(room, speaker));
         },
       });
       diagnostic?.stage('receiver_setup');
@@ -537,29 +558,37 @@ export class JarvisBot {
             this.logger.event('jarvis_voice_turn_rejected', 'warn', {
               stage: 'voice_capture', input_kind: 'voice',
               rejection_reason: error instanceof SessionError ? error.reason ?? error.code
-                : error instanceof WakeError ? error.rateLimitSource === 'speaker_backoff' ? 'wake_speaker_backoff' : error.code : 'unexpected',
+                : error instanceof WakeError ? error.rateLimitSource === 'speaker_backoff' ? 'wake_speaker_backoff'
+                  : error.rateLimitSource === 'speaker_budget' ? 'wake_speaker_rate_limited' : error.code : 'unexpected',
               ...(error instanceof WakeError && error.retryAfterMs !== undefined ? { retry_after_ms: error.retryAfterMs } : {}),
               voice_status: connection!.state.status, queue_depth: room.sessions.queuedCount,
               ...sanitizeError(error),
             });
-            // Ambient speech rejected by local admission is observable in status/logs;
-            // it must not generate a channel message on every utterance.
-            if (this.room === room && consent.get(id)?.audio
-              && !(error instanceof WakeError && error.rateLimitSource === 'speaker_backoff')) {
+            if (this.room === room && consent.get(id)?.audio) {
               const notice = error instanceof SessionError && error.code === 'limit' ? this.limitNotice(error)
                 : error instanceof WakeError && error.code === 'wake_rate_limited'
-                  ? `O limite de verificações de voz foi atingido. Aguarde ${Math.max(1, Math.ceil((error.retryAfterMs ?? 60_000) / 1000))} s ou use /jarvis ask.`
+                  ? `${error.rateLimitSource === 'speaker_backoff' ? 'A ativação por voz está em pausa após falas sem Jarvis.'
+                    : error.rateLimitSource === 'speaker_budget' ? 'Sua cota de verificações de voz foi atingida; há capacidade reservada aos outros participantes.'
+                      : 'O limite compartilhado de verificações de voz foi atingido.'} Aguarde ${Math.max(1, Math.ceil((error.retryAfterMs ?? 60_000) / 1000))} s ou use /jarvis ask.`
                 : 'Não foi possível aceitar a pergunta de voz. Confira /jarvis status ou use /jarvis ask.';
-              await channel.send({ content: `<@${id}> ${notice}`,
-                allowedMentions: { parse: [] } }).catch(() => this.metrics.add('turn_notification_failed'));
+              const category: VoiceNoticeCategory = error instanceof WakeError
+                ? error.rateLimitSource === 'speaker_backoff' ? 'wake_individual'
+                  : error.rateLimitSource === 'speaker_budget' ? 'wake_share'
+                    : error.code === 'wake_rate_limited' ? 'wake_global' : 'voice_rejected'
+                : error instanceof SessionError && error.code === 'limit' ? 'voice_queue' : 'voice_rejected';
+              // Releasing captured PCM must not wait for Discord REST feedback.
+              void this.voiceFeedback.rejected(id, category, notice,
+                this.feedbackDelivery(room, this.context(room, member)), error instanceof WakeError ? error.retryAfterMs : undefined)
+                .catch(() => this.metrics.add('turn_notification_failed'));
             }
           }
         },
         onCaptureRejected: async (id) => {
           const member = channel.members.get(id);
           if (this.room !== room || !member || member.user.bot || !consent.get(id)?.audio) return;
-          await channel.send({ content: `<@${id}> A fala atingiu o limite de captura (${this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN} s) e foi descartada. Faça uma pergunta mais curta ou use /jarvis ask.`,
-            allowedMentions: { parse: [] } }).catch(() => this.metrics.add('turn_notification_failed'));
+          await this.voiceFeedback.rejected(id, 'capture_limit',
+            `A fala atingiu o limite de captura (${this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN} s) e foi descartada. Faça uma pergunta mais curta ou use /jarvis ask.`,
+            this.feedbackDelivery(room, this.context(room, member)));
         }, onMetric: this.metrics.record,
         onDiagnostic: (fields) => this.logger.event(fields.capture_rejection ? 'jarvis_voice_capture_rejected' : 'jarvis_voice_receive_error', 'warn', fields),
         onState: (state) => this.logger.event('jarvis_voice_receiver_state', 'info', {
@@ -609,17 +638,27 @@ export class JarvisBot {
     room.receiver.stopUser(userId);
     room.sessions.revoke(userId);
     this.wake.forget(userId);
+    this.voiceFeedback.forget(userId);
+    this.voiceEvidence.forget(userId);
+    this.syncWakeParticipants(room);
     room.recent?.forget(userId);
     room.probe.delete(userId);
   }
-  private reset(reason: DiagnosticFields['voice_lifecycle_reason'] = 'explicit_leave'): void {
+  private reset(reason: DiagnosticFields['voice_lifecycle_reason'] = 'explicit_leave', incident?: string): void {
     this.epoch++;
     const room = this.room;
     this.room = undefined;
-    if (room) {
+    this.voiceFeedback.clear();
+    this.wake.setParticipants([]);
+    this.voiceEvidence.clearParticipants();
+    if (room || reason === 'explicit_leave' || reason === 'shutdown') {
+      this.voiceEvidence.disconnect(reason ?? 'explicit_leave');
       this.logger.event('jarvis_voice_state', 'info', {
+        incident, command: reason === 'explicit_leave' ? 'leave' : undefined,
         voice_lifecycle_reason: reason, voice_status: this.voice.connection?.state.status,
       });
+    }
+    if (room) {
       for (const abort of room.interruptions.values()) abort.abort();
       room.interruptions.clear();
       room.consent.clear();
@@ -637,6 +676,27 @@ export class JarvisBot {
       }
     }
     this.voice.leave();
+  }
+
+  private syncWakeParticipants(room: Room): void {
+    if (this.room !== room) return;
+    this.wake.setParticipants([...room.channel.members.values()]
+      .filter(member => !member.user.bot && room.consent.get(member.id)?.audio)
+      .map(member => this.context(room, member)));
+  }
+
+  private feedbackDelivery(room: Room, speaker: SpeakerContext) {
+    return {
+      valid: () => !this.closed && this.allowed(room, speaker, true),
+      privateSend: async (payload: { content: string; allowedMentions: { parse: [] } }) => {
+        try { return await room.channel.members.get(speaker.discordUserId)!.send(payload); }
+        catch { this.metrics.add('turn_notification_failed'); throw new Error('voice_notice_private_failed'); }
+      },
+      publicSummary: () => room.channel.send({
+        content: 'Há atualizações das perguntas de voz. Consulte /jarvis status; habilite mensagens diretas de Jarvis para receber avisos privados.',
+        allowedMentions: { parse: [] },
+      }),
+    };
   }
 
   private turnNotice(event: TurnNotification): string | undefined {

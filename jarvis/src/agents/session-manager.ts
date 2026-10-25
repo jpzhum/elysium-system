@@ -6,6 +6,7 @@ import { CaptureWindows, type CaptureTiming } from '../audio/capture-window.js';
 import { playbackFailureFields, type PlaybackStream, type PlaybackStreamOptions } from '../audio/playback.js';
 import type { SpeakerContext } from '../policy/identity.js';
 import { Logger, newIncident, sanitizeDiagnosticFields, type DiagnosticFields, type ErrorCode } from '../observability/metrics.js';
+import type { VoiceAdmissionDetails, VoiceAdmissionEvent } from '../observability/voice-admission-evidence.js';
 
 export interface Playback {
   readonly isPlaying: boolean;
@@ -40,6 +41,8 @@ export interface SessionOptions {
   onTurnDelivered?: (speaker: SpeakerContext, event: DeliveredTurn) => void | Promise<void>;
   /** Monotonic upper bound for context already supplied to a provider socket. */
   sessionContextExpiresAt?: (speaker: SpeakerContext) => number | undefined;
+  /** Bounded technical evidence only; never conversational content or identity logs. */
+  observe?: (speaker: SpeakerContext, event: VoiceAdmissionEvent, details?: VoiceAdmissionDetails) => void;
 }
 export interface DeliveredTurn {
   turnId: string;
@@ -101,7 +104,8 @@ interface Entry {
   acceptingAudio: boolean;
   responseIds: Set<string>;
   completedResponseIds: Set<string>;
-  followupUntil: number;
+  followupConsumed: boolean;
+  followupOffered: boolean;
   turnStarted: number;
   incident: string;
   audioChunks: number;
@@ -189,8 +193,9 @@ export class SessionManager {
   private readonly checking = new Map<string, AbortController>();
   private readonly captures = new CaptureWindows();
   private readonly queue: TurnRequest[] = [];
-  private readonly followups = new Map<string, { consentVersion: number; channelId: string; until: number }>();
+  private readonly followups = new Map<string, { consentVersion: number; channelId: string; until: number; turnId: string }>();
   private active?: TurnRequest;
+  private lastDispatchedUserId?: string;
   private readonly maxQueuedTurns: number;
   private readonly maxQueuedPerUser: number;
   private readonly queueTtlSeconds: number;
@@ -239,6 +244,7 @@ export class SessionManager {
 
   async voiceTurn(speaker: SpeakerContext, pcm: Buffer, timing?: CaptureTiming): Promise<TurnReceipt | undefined> {
     this.assertAllowed(speaker, true);
+    this.observe(speaker, 'capture');
     if (!pcm.length || pcm.length % 4 || pcm.length > Math.min(this.options.maxTurnSeconds, 30) * 48_000 * 4) {
       this.options.metric?.('voice_capture_limit_rejected'); throw new SessionError('limit');
     }
@@ -255,8 +261,12 @@ export class SessionManager {
     // Claim before asynchronous wake detection, so a duplicate delivery cannot
     // purchase another STT check or occupy a second queue position. No PCM hashes.
     if (this.captures.duplicate(speaker.discordUserId, speaker.consentVersion, speaker.channelId, timing)) {
-      this.options.metric?.('voice_capture_duplicates'); return;
+      this.options.metric?.('voice_capture_duplicates'); this.observe(speaker, 'duplicate'); return;
     }
+    // No paid wake inspection can make a known-full question queue usable.
+    // Recheck during enqueue as other speakers can be accepted while STT awaits.
+    try { this.assertQueueCapacity(speaker, pcm.length, incident); }
+    catch (error) { this.options.metric?.('voice_queue_rejected'); throw error; }
     if (this.checking.has(speaker.discordUserId)) {
       this.options.metric?.('voice_wake_busy'); throw new SessionError('busy', 'wake_check_busy');
     }
@@ -275,10 +285,8 @@ export class SessionManager {
     this.checking.set(speaker.discordUserId, abort);
     try {
       const prior = this.followups.get(speaker.discordUserId);
-      const followup = (existing && existing.speaker.consentVersion === speaker.consentVersion
-        && existing.speaker.channelId === speaker.channelId
-        && existing.followupUntil > Date.now()) || (prior && prior.consentVersion === speaker.consentVersion
-          && prior.channelId === speaker.channelId && prior.until > Date.now());
+      const followup = prior && prior.consentVersion === speaker.consentVersion
+        && prior.channelId === speaker.channelId && prior.until > performance.now();
       const wakeStart = performance.now();
       let wakeMs: number | undefined;
       if (!followup) {
@@ -288,7 +296,8 @@ export class SessionManager {
           if (!abort.signal.aborted) this.options.logger?.event('jarvis_wake_failed', 'warn', {
             incident, operation: 'agent_turn', stage: 'wake_detection', input_kind: 'voice',
             rejection_reason: error instanceof WakeError
-              ? error.rateLimitSource === 'speaker_backoff' ? 'wake_speaker_backoff' : error.code : 'unexpected',
+              ? error.rateLimitSource === 'speaker_backoff' ? 'wake_speaker_backoff'
+                : error.rateLimitSource === 'speaker_budget' ? 'wake_speaker_rate_limited' : error.code : 'unexpected',
             retry_after_ms: error instanceof WakeError ? error.retryAfterMs : undefined,
             duration_ms: Math.max(0, Math.round(performance.now() - wakeStart)),
           });
@@ -327,6 +336,11 @@ export class SessionManager {
         throw error;
       }
       owned = undefined;
+      if (followup) {
+        if (this.followups.get(speaker.discordUserId) === prior) this.followups.delete(speaker.discordUserId);
+        if (existing?.incident === prior.turnId) existing.followupConsumed = true;
+        this.observe(speaker, 'followup', { turnId: receipt.turnId });
+      }
       return receipt;
     } finally {
       owned?.fill(0);
@@ -336,16 +350,14 @@ export class SessionManager {
 
   private enqueue(request: TurnRequest): TurnReceipt {
     const waiting = !!this.active || this.queue.length > 0;
-    const perUser = this.queue.filter(item => item.speaker.discordUserId === request.speaker.discordUserId).length;
-    const queuedBytes = this.queue.reduce((total, item) => total + (item.pcm?.length ?? 0), 0);
-    if (waiting && this.queue.length >= this.maxQueuedTurns) throw new SessionError('limit', 'queue_full');
-    if (waiting && perUser >= this.maxQueuedPerUser) throw new SessionError('limit', 'user_queue_full');
-    if (waiting && queuedBytes + (request.pcm?.length ?? 0) > 16 * 1024 * 1024)
-      throw new SessionError('limit', 'voice_memory_limit');
+    this.assertQueueCapacity(request.speaker, request.pcm?.length ?? 0, request.id);
     this.claimTurn();
     this.options.metric?.('questions_received');
-    // Owners move ahead of waiting guests; the active request is never displaced.
-    const firstGuest = request.speaker.isOwner ? this.queue.findIndex(item => !item.speaker.isOwner) : -1;
+    this.observe(request.speaker, 'question_accepted', { turnId: request.id });
+    // Preserve creator priority between speakers, without repeatedly bypassing
+    // a guest already waiting behind that creator's own previous response.
+    const firstGuest = request.speaker.isOwner && request.speaker.discordUserId !== this.lastDispatchedUserId
+      ? this.queue.findIndex(item => !item.speaker.isOwner) : -1;
     if (firstGuest < 0) this.queue.push(request); else this.queue.splice(firstGuest, 0, request);
     this.options.metric?.('turn_queue_depth', 1);
     const position = waiting ? this.queue.indexOf(request) + 1 : 0;
@@ -365,6 +377,24 @@ export class SessionManager {
     return { queued: waiting, position, turnId: request.id };
   }
 
+  private assertQueueCapacity(speaker: SpeakerContext, bytes: number, turnId: string): void {
+    if (!this.active && !this.queue.length) return;
+    const perUser = this.queue.filter(item => item.speaker.discordUserId === speaker.discordUserId).length;
+    const queuedBytes = this.queue.reduce((total, item) => total + (item.pcm?.length ?? 0), 0);
+    const reason = this.queue.length >= this.maxQueuedTurns ? 'queue_full'
+      : perUser >= this.maxQueuedPerUser ? 'user_queue_full'
+      : queuedBytes + bytes > 16 * 1024 * 1024 ? 'voice_memory_limit' : undefined;
+    if (reason) {
+      this.observe(speaker, 'queue_rejected', { turnId });
+      throw new SessionError('limit', reason);
+    }
+  }
+
+  private observe(speaker: SpeakerContext, event: VoiceAdmissionEvent, details?: VoiceAdmissionDetails): void {
+    try { this.options.observe?.(speaker, event, details); }
+    catch { this.options.metric?.('voice_evidence_callback_failed'); }
+  }
+
   private pump(): void {
     if (this.closed || !this.available || this.active) return;
     const request = this.queue.shift();
@@ -372,6 +402,7 @@ export class SessionManager {
     this.options.metric?.('turn_queue_depth', -1);
     if (request.timer) clearTimeout(request.timer);
     this.active = request;
+    this.lastDispatchedUserId = request.speaker.discordUserId;
     void this.dispatch(request).finally(() => this.pump());
   }
 
@@ -510,6 +541,7 @@ export class SessionManager {
       request.terminalNotified = true;
       if (event.type === 'cancelled') {
         request.terminalOutcome = event.reason === 'expired' ? 'expired' : 'cancelled';
+        if (event.delivery === 'partial') this.observe(request.speaker, 'turn_partial', { turnId: request.id });
         this.options.logger?.event('jarvis_agent_turn_cancelled', 'info', {
           incident: request.id, operation: 'agent_turn',
           stage: request.dispatchAt === undefined ? 'turn_enqueue' : 'agent_response_wait',
@@ -549,6 +581,7 @@ export class SessionManager {
     this.queueReport(request, 0);
     request.released = true;
     this.notify(request, { type: 'cancelled', reason });
+    this.observe(request.speaker, 'turn_released', { turnId: request.id });
     this.options.logger?.event('jarvis_agent_turn_released', 'info', {
       incident: request.id, operation: 'agent_turn', stage: 'turn_enqueue', input_kind: request.inputKind,
       turn_outcome: request.terminalOutcome, turn_delivery: 'none', queue_depth: this.queue.length,
@@ -600,7 +633,7 @@ export class SessionManager {
       ingressEnded: false, playbackDone: false, recovering: false, pendingTools: 0, acceptingAudio: false,
       responseIds: new Set(), completedResponseIds: new Set(),
       completionIds: new Set(),
-      followupUntil: 0, turnStarted: request.receivedAt, incident: request.id,
+      followupConsumed: false, followupOffered: false, turnStarted: request.receivedAt, incident: request.id,
       audioChunks: 0, audioBytes: 0, textReceived: false, completionReceived: false,
       providerClosed: false, failed: false, localDrained: false, turnReleased: true,
       voiceInput: request.pcm !== undefined, userTurnRecognized: false, userTextPending: false, inputAudioChunks: 0, inputAudioBytes: 0,
@@ -763,7 +796,9 @@ export class SessionManager {
     entry.failureStage = undefined;
     entry.incident = request.id;
     entry.turnStarted = request.receivedAt;
-    entry.followupUntil = 0;
+    this.followups.delete(entry.speaker.discordUserId);
+    entry.followupConsumed = false;
+    entry.followupOffered = false;
     if (entry.idle) clearTimeout(entry.idle);
     this.progress(entry);
     this.options.metric?.('agent_turns');
@@ -888,10 +923,13 @@ export class SessionManager {
     entry.audioBytes += pcm.length;
     // New ingress invalidates a previous local drain before any asynchronous
     // write or playback observer can race with a waiting request.
+    this.revokeFollowup(entry);
     entry.localDrained = false;
     entry.lastAudioAt = performance.now();
     if (entry.firstAudioAt === undefined) {
       entry.firstAudioAt = entry.lastAudioAt;
+      this.observe(entry.speaker, 'first_audio', { turnId: entry.incident,
+        durationMs: Math.max(0, entry.firstAudioAt - entry.turnStarted) });
       this.options.metric?.('agent_first_audio_ms', Math.round(entry.firstAudioAt - entry.turnStarted));
       if (entry.recognizedAt !== undefined) this.options.metric?.('agent_recognition_to_first_audio_ms',
         Math.max(0, entry.firstAudioAt - entry.recognizedAt));
@@ -906,11 +944,12 @@ export class SessionManager {
     try {
       if (!entry.stream) {
         entry.playing = true;
+        const originatingTurn = entry.incident;
         const stream = this.options.playback.startStream(entry.speaker.discordUserId,
           entry.session.outputSampleRate, entry.speaker.isOwner, {
             isAllowed: () => this.usable(entry),
-            onProgress: (event) => this.playbackProgress(entry, event),
-            onDiagnostic: (fields) => this.playbackDiagnostic(entry, fields),
+            onProgress: (event) => { if (entry.incident === originatingTurn) this.playbackProgress(entry, event); },
+            onDiagnostic: (fields) => { if (entry.incident === originatingTurn) this.playbackDiagnostic(entry, fields); },
           });
         entry.stream = stream;
         void stream.done.then(() => {
@@ -988,9 +1027,8 @@ export class SessionManager {
     this.delivered(entry);
     if (entry.failed || !entry.completionReceived || entry.recovering || entry.pendingTools > 0) { this.remove(entry); return; }
     this.options.metric?.('agent_turns_completed');
+    this.offerFollowup(entry);
     if (entry.providerClosed) { this.remove(entry); return; }
-    entry.followupUntil = Date.now() + this.options.followupSeconds * 1000;
-    this.rememberFollowup(entry.speaker);
     this.idle(entry);
     this.release(entry);
   }
@@ -1027,6 +1065,7 @@ export class SessionManager {
         Math.max(0, Math.round(now - entry.request.speechEndedAt)));
     }
     if (event === 'drained') {
+      const alreadyDrained = entry.localDrained;
       entry.localDrained = true;
       entry.drainedAt = now;
       this.options.metric?.('agent_playback_drained_ms', Math.round(now - entry.turnStarted));
@@ -1034,9 +1073,8 @@ export class SessionManager {
         Math.max(0, Math.round(now - entry.firstPlaybackAt)));
       // A perceptual follow-up window is authorization to hear this speaker's
       // next utterance, not proof that the provider has completed generation.
-      entry.followupUntil = Date.now() + this.options.followupSeconds * 1000;
-      this.rememberFollowup(entry.speaker);
-    } else if (event === 'resumed') entry.localDrained = false;
+      if (!alreadyDrained) this.offerFollowup(entry);
+    } else if (event === 'resumed') { this.revokeFollowup(entry); entry.localDrained = false; }
     this.report(entry, 'jarvis_agent_audio_progress', undefined,
       event === 'first_packet' && entry.firstAudioAt !== undefined ? Math.max(0, now - entry.firstAudioAt) : undefined);
     this.retireForQueued(entry);
@@ -1086,19 +1124,35 @@ export class SessionManager {
     if (entry.lastAudioAt !== undefined) this.options.metric?.('agent_last_audio_ms',
       Math.round(entry.lastAudioAt - entry.turnStarted));
     this.report(entry, 'jarvis_agent_turn_released');
+    this.observe(this.active.speaker, 'turn_released', { turnId: this.active.id,
+      ...(this.active.dispatchAt === undefined ? {} : { durationMs: Math.max(0, performance.now() - this.active.dispatchAt) }) });
     this.active = undefined;
     entry.request = undefined;
     queueMicrotask(() => this.pump());
   }
 
-  private rememberFollowup(speaker: SpeakerContext): void {
-    for (const [id, value] of this.followups) if (value.until <= Date.now()) this.followups.delete(id);
+  private offerFollowup(entry: Entry): void {
+    if (entry.failed || entry.followupConsumed || entry.followupOffered) return;
+    entry.followupOffered = true;
+    this.rememberFollowup(entry.speaker, entry.incident);
+  }
+
+  private revokeFollowup(entry: Entry): void {
+    if (this.followups.get(entry.speaker.discordUserId)?.turnId === entry.incident) {
+      this.followups.delete(entry.speaker.discordUserId);
+    }
+    entry.followupOffered = false;
+  }
+
+  private rememberFollowup(speaker: SpeakerContext, turnId: string): void {
+    if (this.options.followupSeconds <= 0) return;
+    for (const [id, value] of this.followups) if (value.until <= performance.now()) this.followups.delete(id);
     if (!this.followups.has(speaker.discordUserId) && this.followups.size >= 16) {
       const oldest = this.followups.keys().next().value;
       if (oldest !== undefined) this.followups.delete(oldest);
     }
     this.followups.set(speaker.discordUserId, { consentVersion: speaker.consentVersion,
-      channelId: speaker.channelId, until: Date.now() + this.options.followupSeconds * 1000 });
+      channelId: speaker.channelId, until: performance.now() + this.options.followupSeconds * 1000, turnId });
   }
 
   /** Silence is only a resource-recovery trigger, never proof of completed generation. */
@@ -1205,6 +1259,7 @@ export class SessionManager {
     if (entry.failed) return;
     entry.failed = true;
     entry.failureCode = code;
+    this.revokeFollowup(entry);
     this.report(entry, 'jarvis_agent_turn_error', code);
   }
 
@@ -1223,6 +1278,10 @@ export class SessionManager {
       : entry.firstPlaybackAt === undefined ? 'failed' : 'partial'
       : entry.completionReceived && !entry.recovering ? 'completed' : 'unconfirmed';
     this.report(entry, entry.failed ? 'jarvis_agent_turn_failed' : 'jarvis_agent_turn_finished', entry.failureCode);
+    if (request.terminalOutcome === 'completed') this.observe(request.speaker, 'turn_responded', { turnId: request.id });
+    else if (request.terminalOutcome === 'unconfirmed') this.observe(request.speaker, 'turn_unconfirmed', { turnId: request.id });
+    else if (request.terminalOutcome === 'partial') this.observe(request.speaker, 'turn_partial', { turnId: request.id });
+    if (entry.failureCode === 'PLAYBACK_FAILED') this.observe(request.speaker, 'playback_failed', { turnId: request.id });
     if (entry.failed) {
       this.options.metric?.('questions_failed');
       this.notify(request, { type: 'failed', reason: 'provider', delivery: this.delivery(entry),
@@ -1234,6 +1293,7 @@ export class SessionManager {
   private requestFailure(request: TurnRequest, code: ErrorCode, stage: 'agent_connect' | 'session_setup' | 'agent_audio_upload'): void {
     if (request.terminalOutcome || request.cancelled || this.active !== request) return;
     request.terminalOutcome = 'failed';
+    this.followups.delete(request.speaker.discordUserId);
     this.options.metric?.('questions_failed');
     const fields: DiagnosticFields = { incident: request.id, operation: 'agent_turn', stage,
       code, category: 'agent', input_kind: request.inputKind, turn_outcome: 'failed', turn_delivery: 'none',
@@ -1246,6 +1306,8 @@ export class SessionManager {
   private releaseDetached(request: TurnRequest): void {
     if (this.active !== request || request.released) return;
     request.released = true;
+    this.observe(request.speaker, 'turn_released', { turnId: request.id,
+      ...(request.dispatchAt === undefined ? {} : { durationMs: Math.max(0, performance.now() - request.dispatchAt) }) });
     this.options.logger?.event('jarvis_agent_turn_released', 'info', {
       incident: request.id, operation: 'agent_turn', stage: 'session_setup', input_kind: request.inputKind,
       turn_outcome: request.terminalOutcome, turn_delivery: 'none', queue_depth: this.queue.length,
@@ -1361,6 +1423,7 @@ export class SessionManager {
       if (!this.active.cancelled && !this.active.terminalOutcome) {
         if (entry.failed) this.terminal(entry);
         else {
+          this.revokeFollowup(entry);
           this.options.metric?.('questions_cancelled');
           this.notify(this.active, { type: 'cancelled', reason, delivery: this.delivery(entry),
             generationComplete: entry.completionReceived, localDrained: entry.localDrained });
@@ -1400,13 +1463,13 @@ export class SessionManager {
     this.assertAllowed(speaker, true);
     if (!speaker.isOwner || !this.active) return false;
     this.options.metric?.('owner_interruptions');
-    this.rememberFollowup(speaker);
     const active = this.active;
     const current = active.speaker.discordUserId;
     // Owner barge-in cancels only the active turn, preserving waiting callers.
     const entry = this.entries.get(current);
     if (entry) this.remove(entry, true, 'interrupted');
     if (this.active === active) this.cancelDetached(active, 'interrupted');
+    this.rememberFollowup(speaker, newIncident());
     return true;
   }
 

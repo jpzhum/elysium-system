@@ -111,12 +111,19 @@ async function setup(daveSmoke = false) {
   vi.spyOn(access.voice, 'connection', 'get').mockReturnValue(connection);
   vi.spyOn(access.wake, 'detect').mockResolvedValue(true);
   const members = new Collection<string, GuildMember>();
+  const directMessages: { userId: string; content: string }[] = [];
   const guild = { id: GUILD, name: 'Servidor privado', members: { me: { id: BOT } } };
   const channel = { id: CHANNEL, name: 'Canal privado', guild, type: ChannelType.GuildVoice, full: false, members,
     send: vi.fn(async (_payload: { content: string }) => undefined), permissionsFor: () => ({ has: (permission: bigint) =>
       [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak].includes(permission) }) };
   const addMember = (id: string, name = 'Mesmo nome', isBot = false): GuildMember => {
-    const member = { id, displayName: name, guild, user: { bot: isBot }, voice: { channel, channelId: CHANNEL } } as unknown as GuildMember;
+    const member = { id, displayName: name, guild, user: { bot: isBot }, voice: { channel, channelId: CHANNEL },
+      send: vi.fn(async (payload: { content: string }) => {
+        const message = { userId: id, content: payload.content };
+        directMessages.push(message);
+        return { edit: vi.fn(async (next: { content: string }) => { message.content = next.content; }) };
+      }),
+    } as unknown as GuildMember;
     members.set(id, member); return member;
   };
   addMember(OWNER); addMember(GUEST); addMember(BOT, 'Jarvis', true);
@@ -153,7 +160,7 @@ async function setup(daveSmoke = false) {
   };
   const participants = async (provider = hooks.providers.at(-1)!): Promise<VoiceParticipantsResult> =>
     await provider.options.tools!('get_voice_participants', {}, new AbortController().signal) as VoiceParticipantsResult;
-  return { bot, access, logs, room, members, channel, connection, addMember, interaction, voice, ask, complete, participants };
+  return { bot, access, logs, room, members, channel, connection, addMember, interaction, voice, ask, complete, participants, directMessages };
 }
 
 beforeEach(() => {
@@ -168,6 +175,77 @@ afterEach(async () => {
 });
 
 describe('V5 Discord integration with the real per-speaker session manager', () => {
+  test('ten automatic quota rejections yield one private notice per speaker and no channel spam', async () => {
+    const h = await setup();
+    await h.interaction('consent', OWNER, true).run();
+    await h.interaction('consent', GUEST, true).run();
+    h.channel.send.mockClear();
+    vi.spyOn(h.access.wake, 'detect').mockRejectedValue(new WakeError('wake_rate_limited', 60_000));
+    for (let attempt = 0; attempt < 10; attempt++) await h.voice(attempt % 2 ? OWNER : GUEST);
+    expect(h.directMessages).toHaveLength(2);
+    expect(new Set(h.directMessages.map(message => message.userId))).toEqual(new Set([OWNER, GUEST]));
+    expect(h.channel.send).not.toHaveBeenCalled();
+    expect(h.logs.filter(log => log.event === 'jarvis_voice_turn_rejected')).toHaveLength(10);
+  });
+
+  test('a stalled Discord notice cannot keep a rejected capture pending', async () => {
+    const h = await setup(); await h.interaction('consent', OWNER, true).run();
+    let release!: () => void;
+    const response = new Promise<never>((_resolve, reject) => { release = () => reject(new Error('controlled late DM failure')); });
+    vi.mocked(h.members.get(OWNER)!.send).mockReturnValueOnce(response);
+    vi.spyOn(h.access.wake, 'detect').mockRejectedValueOnce(new WakeError('wake_rate_limited', 60_000));
+    let settled = false;
+    const capture = Promise.resolve(hooks.receiver!.onTurn(OWNER, Buffer.alloc(19_200, 12),
+      { duringPlayback: false, captureMs: 100, endDetectionMs: 600, captureId: 'slow-feedback' })).then(() => { settled = true; });
+    try { await settle(); expect(settled).toBe(true); }
+    finally { release(); await capture; await settle(); }
+  });
+
+  test('blocked DMs produce one anonymous room summary for repeated automatic rejection categories', async () => {
+    const h = await setup(); await h.interaction('consent', OWNER, true).run(); await h.interaction('consent', GUEST, true).run();
+    for (const id of [OWNER, GUEST]) vi.mocked(h.members.get(id)!.send).mockRejectedValue(new Error('controlled DM disabled'));
+    h.channel.send.mockClear();
+    vi.spyOn(h.access.wake, 'detect').mockRejectedValue(new WakeError('wake_rate_limited', 60_000));
+    for (let attempt = 0; attempt < 10; attempt++) await h.voice(attempt % 2 ? OWNER : GUEST);
+    await hooks.receiver!.onCaptureRejected?.(OWNER, 'duration_limit'); await settle();
+    expect(h.channel.send).toHaveBeenCalledTimes(1);
+    expect(h.channel.send.mock.calls[0]![0]).toMatchObject({ allowedMentions: { parse: [] } });
+    expect(h.channel.send.mock.calls[0]![0].content).not.toMatch(/100000000000000|<@|posição|captura/);
+    expect(h.members.get(OWNER)!.send).toHaveBeenCalledTimes(2); // One quota category, one capture category.
+    expect(h.members.get(GUEST)!.send).toHaveBeenCalledTimes(1);
+  });
+
+  test('a queued question has one private message that is updated with its terminal failure', async () => {
+    const h = await setup(); await h.interaction('consent', OWNER).run(); await h.interaction('consent', GUEST, true).run();
+    h.channel.send.mockClear();
+    await h.ask(OWNER); await h.voice(GUEST);
+    expect(h.directMessages).toHaveLength(1);
+    expect(h.directMessages[0]!.content).toContain('enfileirada');
+    const incident = h.directMessages[0]!.content.match(/[A-F0-9]{8}/)![0];
+    await h.complete();
+    hooks.providers.at(-1)!.options.callbacks.onError('agent_rate_limited'); await settle();
+    expect(h.directMessages).toHaveLength(1);
+    expect(h.directMessages[0]!.content).toContain('Não foi possível responder');
+    expect(h.directMessages[0]!.content).toContain(incident);
+    expect(h.channel.send).not.toHaveBeenCalled();
+  });
+
+  test('per-speaker recent metrics are private to the creator and explicit leave records its command incident', async () => {
+    const h = await setup(); await h.interaction('consent', OWNER, true).run(); await h.voice(OWNER); await h.complete();
+    const owner = h.interaction('status', OWNER, false, undefined, { details: true }); await owner.run();
+    const own = owner.followUp.mock.calls.map(([payload]) => payload.content).join('\n');
+    expect(own).toContain('falante_1'); expect(own).toContain('question_accepted=1');
+    expect(own).not.toContain(OWNER); expect(own).not.toContain(GUEST);
+    const guest = h.interaction('status', GUEST, false, undefined, { details: true }); await guest.run();
+    expect(guest.followUp.mock.calls.map(([payload]) => payload.content).join('\n')).not.toContain('falante_1');
+    await h.interaction('leave').run();
+    const leave = h.logs.filter(log => log.voice_lifecycle_reason === 'explicit_leave');
+    expect(leave).toHaveLength(1);
+    expect(leave[0]).toMatchObject({ command: 'leave', incident: expect.stringMatching(/^[A-F0-9]{8}$/) });
+    const after = h.interaction('status', OWNER, false, undefined, { details: true }); await after.run();
+    const summary = after.followUp.mock.calls.map(([payload]) => payload.content).join('\n');
+    expect(summary).toContain('Última desconexão: explicit_leave'); expect(summary).not.toContain('falante_1');
+  });
   test('DAVE probe status masks personal IDs and remains restricted to the creator', async () => {
     const h = await setup(true);
     await h.interaction('consent', OWNER, true).run();
@@ -218,15 +296,17 @@ describe('V5 Discord integration with the real per-speaker session manager', () 
     await h.interaction('consent', OWNER, true).run();
     h.channel.send.mockClear();
     await hooks.receiver!.onCaptureRejected?.(OWNER, 'duration_limit');
-    expect(h.channel.send).toHaveBeenCalledWith(expect.objectContaining({
+    expect(h.members.get(OWNER)!.send).toHaveBeenCalledWith(expect.objectContaining({
       content: expect.stringContaining('limite de captura (12 s)'), allowedMentions: { parse: [] },
     }));
     expect(hooks.connect).not.toHaveBeenCalled();
     expect(h.access.wake.detect).not.toHaveBeenCalled();
     await h.interaction('revoke', OWNER).run();
     h.channel.send.mockClear();
+    vi.mocked(h.members.get(OWNER)!.send).mockClear();
     await hooks.receiver!.onCaptureRejected?.(OWNER, 'duration_limit');
     expect(h.channel.send).not.toHaveBeenCalled();
+    expect(h.members.get(OWNER)!.send).not.toHaveBeenCalled();
   });
 
   test('wake quota gives an actionable wait without describing it as a broken agent session', async () => {
@@ -234,7 +314,7 @@ describe('V5 Discord integration with the real per-speaker session manager', () 
     await h.interaction('consent', OWNER, true).run();
     vi.spyOn(h.access.wake, 'detect').mockRejectedValueOnce(new WakeError('wake_rate_limited', 12_345));
     await h.voice(OWNER);
-    expect(h.channel.send).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Aguarde 13 s ou use /jarvis ask') }));
+    expect(h.members.get(OWNER)!.send).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Aguarde 13 s ou use /jarvis ask') }));
     expect(hooks.connect).not.toHaveBeenCalled();
     expect(h.logs.find(log => log.event === 'jarvis_voice_turn_rejected')).toMatchObject({
       rejection_reason: 'wake_rate_limited', retry_after_ms: 12_345,
@@ -410,7 +490,8 @@ describe('V5 Discord integration with the real per-speaker session manager', () 
     const pcm = Buffer.alloc(19_200, 12);
     await hooks.receiver!.onTurn(GUEST, pcm, timing); await hooks.receiver!.onTurn(GUEST, pcm, timing); await settle();
     expect(h.room.sessions.queuedCount).toBe(1);
-    expect(h.channel.send.mock.calls.filter(([payload]) => String(payload.content).includes('enfileirada'))).toHaveLength(1);
+    expect(h.directMessages.filter(message => message.userId === GUEST && message.content.includes('enfileirada'))).toHaveLength(1);
+    expect(h.channel.send.mock.calls.filter(([payload]) => String(payload.content).includes('enfileirada'))).toHaveLength(0);
     await h.complete();
     expect(hooks.providers).toHaveLength(2);
   });

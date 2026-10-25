@@ -369,7 +369,7 @@ describe('bounded conversational scheduling', () => {
     await expect(h.manager.voiceTurn(h.speaker('other'), Buffer.alloc(3_840, 1), timing))
       .rejects.toMatchObject({ code: 'limit', reason: 'queue_full' });
     expect(await h.manager.voiceTurn(h.speaker('other'), Buffer.alloc(3_840, 1), timing)).toBeUndefined();
-    expect(detectWake).toHaveBeenCalledOnce();
+    expect(detectWake).not.toHaveBeenCalled(); // Known capacity rejection now precedes paid recognition.
     expect(h.metric.mock.calls.filter(([name]) => name === 'voice_queue_rejected')).toHaveLength(1);
     expect(h.manager.queuedCount).toBe(1);
   });
@@ -548,6 +548,19 @@ describe('bounded conversational scheduling', () => {
     expect(h.connect).toHaveBeenCalledTimes(2);
     expect(h.metric).toHaveBeenCalledWith('agent_turns_recovered');
     expect(h.metric.mock.calls.filter(([name]) => name === 'agent_turns_completed')).toHaveLength(0);
+  });
+
+  test('creator continuations cannot repeatedly jump a guest already waiting behind the creator', async () => {
+    const h = harness();
+    await h.ask('owner', 'Primeira');
+    expect(await h.ask('guest', 'Pedido do convidado')).toMatchObject({ queued: true, position: 1 });
+    expect(await h.ask('owner', 'Continuação')).toMatchObject({ queued: true, position: 2 });
+    expect(await h.ask('owner', 'Outra continuação')).toMatchObject({ queued: true, position: 3 });
+    await h.finish('owner');
+    expect(h.sessions.get('guest')!.sendText).toHaveBeenCalledWith('Pedido do convidado');
+    await h.finish('guest'); await h.finish('owner'); await h.finish('owner');
+    expect(h.streams.map(stream => stream.userId)).toEqual(['owner', 'guest', 'owner', 'owner']);
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
   });
 
   test('owners move before queued guests while the active guest finishes normally', async () => {
@@ -807,6 +820,120 @@ describe('speaker authorization and cancellation', () => {
     await vi.advanceTimersByTimeAsync(19_000);
     await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1));
     expect(detect).toHaveBeenCalledOnce();
+  });
+
+  test('one drained response admits one follow-up while another participant is active, without admitting ambient fragments behind it', async () => {
+    const detectWake = vi.fn(async () => false);
+    const h = harness({ detectWake, pace: async () => undefined });
+    await h.ask('guest'); await h.finish('guest');
+    await h.ask('owner');
+    const first = await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1));
+    expect(first).toMatchObject({ queued: true });
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 2))).toBeUndefined();
+    expect(detectWake).toHaveBeenCalledOnce();
+    expect(h.manager.queueStatus).toEqual({ waiting: 1, active: true });
+    expect(h.notify.mock.calls.filter(([, event]) => event.type === 'queued' && event.turnId === first!.turnId)).toHaveLength(1);
+    await h.finish('owner'); await settle();
+    expect(h.sessions.get('guest')!.sendAudio).toHaveBeenCalled();
+  });
+
+  test('a playback failure revokes the follow-up granted by an earlier temporary drain', async () => {
+    const detectWake = vi.fn(async () => false);
+    const h = harness({ detectWake, pace: async () => undefined });
+    await h.ask('guest');
+    await h.callbacks.get('guest')!.onAudio(Buffer.alloc(480, 1), 1);
+    h.streams[0]!.progress('drained');
+    h.streams[0]!.cancel(); await settle();
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1))).toBeUndefined();
+    expect(detectWake).toHaveBeenCalledOnce();
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  });
+
+  test('new output revokes temporary drain admission until output drains again', async () => {
+    const detectWake = vi.fn(async () => false);
+    const h = harness({ detectWake, pace: async () => undefined });
+    await h.ask('guest');
+    const callbacks = h.callbacks.get('guest')!;
+    await callbacks.onAudio(Buffer.alloc(480, 1), 1);
+    h.streams[0]!.progress('drained');
+    await callbacks.onAudio(Buffer.alloc(480, 2), 2);
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1))).toBeUndefined();
+    expect(detectWake).toHaveBeenCalledOnce();
+    h.streams[0]!.progress('drained');
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1))).toMatchObject({ queued: true });
+    expect(detectWake).toHaveBeenCalledOnce();
+  });
+
+  test('late completion and playback progress cannot rearm a consumed follow-up on the same response', async () => {
+    const detectWake = vi.fn(async () => false);
+    const h = harness({ detectWake, pace: async () => undefined });
+    await h.ask('guest');
+    const callbacks = h.callbacks.get('guest')!;
+    callbacks.onToolActivity?.(1);
+    await callbacks.onAudio(Buffer.alloc(480, 1), 1);
+    const old = h.streams[0]!;
+    old.progress('drained');
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1))).toMatchObject({ queued: true });
+    callbacks.onResponseComplete(1); callbacks.onToolActivity?.(0); await settle();
+    old.progress('drained');
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 2))).toBeUndefined();
+    expect(detectWake).toHaveBeenCalledOnce();
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: true });
+  });
+
+  test.each(['user', 'global'] as const)('a known full %s queue rejects before buying wake STT', async limit => {
+    const detectWake = vi.fn(async () => true);
+    const h = harness({ detectWake, maxQueuedTurns: limit === 'global' ? 1 : 8 });
+    await h.ask('owner'); await h.ask('guest');
+    if (limit === 'user') await h.ask('guest');
+    await expect(h.manager.voiceTurn(h.speaker(limit === 'user' ? 'guest' : 'kel'), Buffer.alloc(3_840, 1)))
+      .rejects.toMatchObject({ code: 'limit', reason: limit === 'user' ? 'user_queue_full' : 'queue_full' });
+    expect(detectWake).not.toHaveBeenCalled();
+    expect(h.manager.queueStatus).toEqual({ waiting: limit === 'user' ? 2 : 1, active: true });
+  });
+
+  test('follow-up expiry uses monotonic time and a wall-clock correction cannot revive admission', async () => {
+    vi.useFakeTimers();
+    const detectWake = vi.fn(async () => false);
+    const h = harness({ detectWake, pace: async () => undefined });
+    await h.ask('guest'); await h.finish('guest');
+    await vi.advanceTimersByTimeAsync(19_000);
+    vi.setSystemTime(Date.now() - 600_000);
+    expect(await h.manager.voiceTurn(h.speaker('guest'), Buffer.alloc(3_840, 1))).toBeUndefined();
+    expect(detectWake).toHaveBeenCalledOnce();
+  });
+
+  test('technical evidence is emitted once per actual outcome and measures occupancy separately from queued time', async () => {
+    vi.useFakeTimers();
+    const observe = vi.fn<NonNullable<SessionOptions['observe']>>();
+    const h = harness({ observe });
+    const guest = await h.ask('guest', 'Pergunta privada sintética');
+    const owner = await h.ask('owner', 'Outra pergunta privada sintética');
+    await vi.advanceTimersByTimeAsync(50);
+    await h.callbacks.get('guest')!.onAudio(Buffer.alloc(480, 1), 1);
+    await vi.advanceTimersByTimeAsync(50);
+    h.callbacks.get('guest')!.onResponseComplete(1); await settle();
+    await vi.advanceTimersByTimeAsync(50);
+    await h.callbacks.get('owner')!.onAudio(Buffer.alloc(480, 1), 2);
+    await vi.advanceTimersByTimeAsync(50);
+    h.callbacks.get('owner')!.onResponseComplete(2); await settle();
+    for (const receipt of [guest, owner]) {
+      expect(observe.mock.calls.filter(([, event, details]) => event === 'question_accepted' && details?.turnId === receipt.turnId)).toHaveLength(1);
+      expect(observe.mock.calls.filter(([, event, details]) => event === 'turn_responded' && details?.turnId === receipt.turnId)).toHaveLength(1);
+      expect(observe.mock.calls.filter(([, event, details]) => event === 'turn_released' && details?.turnId === receipt.turnId)).toHaveLength(1);
+    }
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ discordUserId: 'owner' }), 'first_audio',
+      { turnId: owner.turnId, durationMs: 150 });
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({ discordUserId: 'owner' }), 'turn_released',
+      { turnId: owner.turnId, durationMs: 100 });
+    expect(JSON.stringify(observe.mock.calls)).not.toContain('privada sintética');
+  });
+
+  test('a throwing evidence sink cannot prevent either participant from completing another turn', async () => {
+    const h = harness({ observe: () => { throw new Error('private sink detail'); } });
+    for (const id of ['guest', 'owner', 'guest']) { await h.ask(id); await h.finish(id); }
+    expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+    expect(h.metric).toHaveBeenCalledWith('voice_evidence_callback_failed');
   });
 
   test('an existing session follow-up cannot bypass wake recognition in a different channel', async () => {
