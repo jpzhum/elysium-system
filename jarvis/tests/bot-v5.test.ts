@@ -176,6 +176,17 @@ afterEach(async () => {
 });
 
 describe('V5 Discord integration with the real per-speaker session manager', () => {
+  test('a failed private fallback notice keeps its sanitized cause and capture incident', async () => {
+    const h = await setup(); await h.interaction('consent', OWNER, true).run();
+    vi.spyOn(h.access.wake, 'detect').mockRejectedValue(new WakeError('wake_provider_failed'));
+    vi.mocked(h.members.get(OWNER)!.send).mockRejectedValue(Object.assign(new TypeError('PRIVATE Discord REST'), { code: 'ECONNRESET' }));
+    await h.voice(OWNER); await settle();
+    const capture = h.logs.find(log => log.event === 'jarvis_wake_failed')!;
+    expect(h.logs).toContainEqual(expect.objectContaining({ event: 'interaction_response_failed', incident: capture.incident,
+      failure_scope: 'notification', cause_name: 'TypeError', cause_code: 'ECONNRESET', code: 'ECONNRESET' }));
+    expect(h.channel.send).toHaveBeenCalledOnce();
+    expect(JSON.stringify(h.logs)).not.toContain('PRIVATE Discord');
+  });
   test('a generic Discord failure still retains its original sanitized technical exception', async () => {
     const h = await setup();
     vi.spyOn(Reflect.get(h.room, 'playback') as PlaybackQueue, 'play').mockRejectedValueOnce(

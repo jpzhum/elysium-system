@@ -535,7 +535,7 @@ export class JarvisBot {
           if (this.room !== room || this.closed || !this.allowed(room, speaker, true)) return;
           const content = this.turnNotice(event);
           if (content) await this.voiceFeedback.turn(speaker.discordUserId, event.turnId, event.type,
-            `${content} Incidente ${event.turnId}.`, this.feedbackDelivery(room, speaker));
+            `${content} Incidente ${event.turnId}.`, this.feedbackDelivery(room, speaker, event.turnId));
         },
       });
       diagnostic?.stage('receiver_setup');
@@ -592,7 +592,9 @@ export class JarvisBot {
                 : error instanceof SessionError && error.code === 'limit' ? 'voice_queue' : 'voice_rejected';
               // Releasing captured PCM must not wait for Discord REST feedback.
               void this.voiceFeedback.rejected(id, category, notice,
-                this.feedbackDelivery(room, this.context(room, member)), error instanceof WakeError ? error.retryAfterMs : undefined)
+                this.feedbackDelivery(room, this.context(room, member),
+                  error instanceof WakeError || error instanceof SessionError ? error.incident ?? timing.incident : timing.incident),
+                error instanceof WakeError ? error.retryAfterMs : undefined)
                 .catch(() => this.metrics.add('turn_notification_failed'));
             }
           }
@@ -701,17 +703,23 @@ export class JarvisBot {
       .map(member => this.context(room, member)));
   }
 
-  private feedbackDelivery(room: Room, speaker: SpeakerContext) {
+  private feedbackDelivery(room: Room, speaker: SpeakerContext, incident?: string) {
+    const failed = (error: unknown): void => {
+      this.metrics.add('turn_notification_failed');
+      this.logger.event('interaction_response_failed', 'warn', { ...room.playback.diagnosticState,
+        ...sanitizeError(error), ...exceptionDetails(error), incident, operation: 'agent_turn',
+        stage: 'command_reply', failure_scope: 'notification', queue_depth: room.sessions.queuedCount });
+    };
     return {
       valid: () => !this.closed && this.allowed(room, speaker, true),
       privateSend: async (payload: { content: string; allowedMentions: { parse: [] } }) => {
         try { return await room.channel.members.get(speaker.discordUserId)!.send(payload); }
-        catch { this.metrics.add('turn_notification_failed'); throw new Error('voice_notice_private_failed'); }
+        catch (error) { failed(error); throw new Error('voice_notice_private_failed', { cause: error }); }
       },
-      publicSummary: () => room.channel.send({
+      publicSummary: async () => { try { await room.channel.send({
         content: 'Há atualizações das perguntas de voz. Consulte /jarvis status; habilite mensagens diretas de Jarvis para receber avisos privados.',
         allowedMentions: { parse: [] },
-      }),
+      }); } catch (error) { failed(error); throw new Error('voice_notice_public_failed', { cause: error }); } },
     };
   }
 
