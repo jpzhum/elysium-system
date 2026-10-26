@@ -73,6 +73,22 @@ test('tone plays one second of synthetic PCM without ElevenLabs or consent audio
   expect(h.input.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('Tom reproduzido') }));
 });
 
+test('a secondary tone cleanup failure cannot replace the original encoder exception', async () => {
+  const h = setup();
+  h.play.mockImplementationOnce(async (_id, _pcm, _rate, _owner, options) => {
+    options?.onDiagnostic?.({ code: 'PLAYBACK_ENCODER_FAILED', category: 'playback', cause_name: 'RangeError',
+      cause_code: 'UNKNOWN', playback_stage: 'opus_encode', player_status: 'buffering' });
+    options?.onDiagnostic?.({ code: 'RESOURCE_CLEANUP_FAILED', category: 'playback', cause_name: 'TypeError',
+      failure_scope: 'cleanup', cleanup_step: 'player_stop', cleanup_ok: false });
+    throw new Error(PRIVATE);
+  });
+  await h.run();
+  expect(h.logs.find(log => log.event === 'jarvis_command_failed')).toMatchObject({
+    code: 'PLAYBACK_ENCODER_FAILED', cause_name: 'RangeError', playback_stage: 'opus_encode',
+  });
+  expect(h.logs.find(log => log.event === 'jarvis_cleanup_failed')).toMatchObject({ code: 'RESOURCE_CLEANUP_FAILED', cleanup_ok: false });
+});
+
 test.each([
   ['playback', 'PLAYBACK_RESOURCE_ENDED'], ['playback', 'PLAYBACK_ENCODER_FAILED'],
   ['playback', 'PLAYBACK_PLAYER_ERROR'], ['voice', 'VOICE_DISCONNECTED'],
@@ -172,5 +188,5 @@ test('logger accepts reviewed playback metadata and drops unreviewed values', ()
   logger.event('jarvis_playback_failed', 'error', { command: PRIVATE, code: PRIVATE,
     cause_code: PRIVATE, cause_name: PRIVATE, playback_stage: PRIVATE, player_status: PRIVATE,
     opus_error_code: -100, subscribed: PRIVATE, message: PRIVATE, stack: PRIVATE } as unknown as DiagnosticFields);
-  expect(Object.keys(records[1]!)).toEqual(['time', 'level', 'event', 'incident']);
+  expect(Object.keys(records[1]!)).toEqual(['time', 'level', 'event', 'incident', 'incident_id']);
 });

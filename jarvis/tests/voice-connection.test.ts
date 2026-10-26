@@ -205,7 +205,9 @@ test("an asynchronous pre-Ready connection error preserves its safe network code
   assert.equal(error.message, "ECONNRESET");
   state.diagnostics.failure(error);
   assert.equal(state.records().at(-1)!.code, "ECONNRESET");
-  assert.doesNotMatch(state.lines.join(""), /PRIVATE|https:|credential|stack|cause/);
+  assert.doesNotMatch(state.lines.join(""), /PRIVATE|https:|credential|stack|"cause":/);
+  assert.equal(state.records().at(-1)!.cause_code, "ECONNRESET");
+  assert.equal(state.records().find(record => record.event === "voice_connection_error")!.cause_name, "Error");
   assertClean(state.connection);
 });
 

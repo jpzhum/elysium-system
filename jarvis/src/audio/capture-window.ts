@@ -1,5 +1,7 @@
 /** Capture metadata contains no PCM, transcript, question, or provider identity. */
 export interface CaptureTiming {
+  /** Opaque diagnostic correlation, unrelated to user/provider IDs. */
+  readonly incident?: string;
   readonly captureMs: number;
   readonly endDetectionMs: number;
   /** Monotonic delays from the local Discord speaking.start callback, when observed. */

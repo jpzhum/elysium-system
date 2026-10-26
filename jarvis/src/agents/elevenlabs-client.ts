@@ -1,6 +1,9 @@
 import WebSocket, { type RawData } from 'ws';
+import { exceptionDetails } from '../observability/diagnostics.js';
+import { sanitizeDiagnosticFields, type DiagnosticFields } from '../observability/metrics.js';
 
 export interface AgentSession {
+  readonly diagnosticState?: Readonly<DiagnosticFields>;
   readonly inputSampleRate: number;
   readonly outputSampleRate: number;
   sendText(text: string): void;
@@ -41,7 +44,11 @@ export interface AgentCallbacks {
   onProtocolEvent?(event: 'audio' | 'agent_response' | 'agent_response_complete' | 'client_error'): void;
   onInterruption(): void;
   onClose(): void;
-  onError(code: string): void;
+  onError(code: string, details?: DiagnosticFields): void;
+  /** Sanitized technical metadata only, never content or upstream exception objects. */
+  onDiagnostic?(fields: DiagnosticFields): void;
+  /** Backend turn correlation only; sampled before asynchronous callbacks. */
+  diagnosticContext?(): Pick<DiagnosticFields, 'turn_id'>;
 }
 
 export interface ConnectAgentOptions {
@@ -74,9 +81,11 @@ export interface AgentToolDiagnostic {
 }
 
 export class AgentError extends Error {
-  constructor(readonly code: string) {
+  readonly details: Readonly<DiagnosticFields>;
+  constructor(readonly code: string, details: DiagnosticFields = {}) {
     super(code);
     this.name = 'AgentError';
+    this.details = Object.freeze(sanitizeDiagnosticFields(details));
   }
 }
 
@@ -239,8 +248,8 @@ async function getSignedUrl(options: ConnectAgentOptions, deps: AgentDependencie
         signal,
         redirect: 'error',
       });
-    } catch {
-      throw new AgentError(options.signal?.aborted ? 'agent_aborted' : 'agent_unavailable');
+    } catch (error) {
+      throw new AgentError(options.signal?.aborted ? 'agent_aborted' : 'agent_unavailable', exceptionDetails(error));
     }
     if (!response.ok) {
       // Never parse, propagate or log an upstream error body or signed URL.
@@ -328,11 +337,12 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
     let socketOpenedAt: number | undefined;
     let ws: AgentSocket;
     try { ws = deps.createSocket(signedUrl); }
-    catch { throw new AgentError('agent_unavailable'); }
+    catch (error) { throw new AgentError('agent_unavailable', exceptionDetails(error)); }
 
     return new Promise<AgentSession>((resolve, reject) => {
       let negotiated = false;
       let closed = false;
+      let cleanupFailed = false;
       let finalized = false;
       let draining = false;
       let pumping = false;
@@ -358,7 +368,20 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         | { kind: 'correction'; content: AgentConversationText }
         | { kind: 'tool'; start(): void; cancel(): void };
       const deliveries: Delivery[] = [];
-      const notify = (callback: () => void): void => { try { callback(); } catch { /* Do not expose callback data. */ } };
+      const context = (): DiagnosticFields => {
+        try { return sanitizeDiagnosticFields(options.callbacks.diagnosticContext?.()); }
+        catch { return {}; /* Diagnostics cannot change provider connectivity. */ }
+      };
+      const diagnose = (fields: DiagnosticFields, origin = context()): void => {
+        try { options.callbacks.onDiagnostic?.(sanitizeDiagnosticFields({ ...origin, websocket_state: ws.readyState, ...fields })); }
+        catch { /* A failed diagnostic sink cannot recursively notify itself. */ }
+      };
+      const notify = (callback: () => unknown): void => {
+        const origin = context();
+        const failed = (error: unknown): void => diagnose({ ...exceptionDetails(error), failure_scope: 'adapter_callback' }, origin);
+        try { const result = callback(); if (result) void Promise.resolve(result).catch(failed); }
+        catch (error) { failed(error); }
+      };
       const cleanup = (removeAbort: boolean): void => {
         clearTimeout(metadataTimer);
         clearInterval(heartbeatTimer);
@@ -374,7 +397,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         // A local TCP pause hides provider pings. Restart their liveness window
         // when we can receive again; independent session/playback limits bound it.
         lastMessageAt = Date.now();
-        try { ws.resume?.(); } catch { /* Transport closure is handled separately. */ }
+        try { ws.resume?.(); } catch (error) { end('agent_transport_error', true, error); }
       };
       const finishClose = (): void => {
         if (finalized) return;
@@ -402,7 +425,7 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
           total + (item.kind === 'user_transcript' && item.content ? Buffer.byteLength(item.content.text) : 0), 0);
         resumeIngress();
       };
-      const end = (code?: string, drainAudio = false): void => {
+      const end = (code?: string, drainAudio = false, cause?: unknown): void => {
         if (finalized) return;
         if (closed) {
           // Revocation can cancel a graceful transport drain that is still pending.
@@ -412,24 +435,44 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         closed = true;
         draining = drainAudio && negotiated;
         cleanup(!draining);
+        if (cause !== undefined) diagnose(exceptionDetails(cause));
         if (code) notify(() => options.callbacks.onError(code));
-        if (!negotiated) reject(new AgentError(code ?? 'agent_closed'));
+        if (!negotiated) reject(new AgentError(code ?? 'agent_closed', cause === undefined ? {} : exceptionDetails(cause)));
         if (!draining) discardDeliveries();
-        // terminate bounds shutdown even when the remote peer never acknowledges CLOSE.
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.close(1000);
-          if (Number(ws.readyState) !== WebSocket.CLOSED) {
-            closeTimer = setTimeout(() => ws.terminate(), 1000);
-            closeTimer.unref();
+        const terminate = (): void => {
+          try { ws.terminate(); }
+          catch (error) {
+            cleanupFailed = true;
+            diagnose({ ...exceptionDetails(error), failure_scope: 'cleanup', cleanup_step: 'socket_terminate', cleanup_ok: false });
           }
-        } else if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
+        };
+        // terminate bounds shutdown even when the remote peer never acknowledges CLOSE.
+        try {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.close(1000);
+            if (Number(ws.readyState) !== WebSocket.CLOSED) {
+              closeTimer = setTimeout(terminate, 1000);
+              closeTimer.unref();
+            }
+          } else if (ws.readyState !== WebSocket.CLOSED) terminate();
+        } catch (error) {
+          diagnose({ ...exceptionDetails(error), failure_scope: 'cleanup', cleanup_step: 'session_close', cleanup_ok: false });
+          terminate();
+        }
         if (!draining || (!pumping && deliveries.length === 0)) finishClose();
       };
       // A local close/revocation after negotiation is not a provider failure.
       const onAbort = (): void => end(negotiated ? undefined : 'agent_aborted');
-      const dispatch = (callback: () => void): void => {
-        try { callback(); }
-        catch { end('agent_callback_error'); }
+      const callbackFailure = (error: unknown, epoch: number, origin: DiagnosticFields): void => {
+        const activeTurn = context().turn_id;
+        const current = !origin.turn_id || !activeTurn || origin.turn_id === activeTurn;
+        if (current && epoch === deliveryEpoch && !finalized && !closed) end('agent_callback_error', false, error);
+        else diagnose({ ...exceptionDetails(error), failure_scope: 'adapter_callback' }, origin);
+      };
+      const dispatch = (callback: () => unknown): void => {
+        const origin = context(); const epoch = deliveryEpoch;
+        try { const result = callback(); if (result) void Promise.resolve(result).catch(error => callbackFailure(error, epoch, origin)); }
+        catch (error) { end('agent_callback_error', false, error); }
       };
       const updateToolActivity = (id: string, pending: boolean): void => {
         if (pending) {
@@ -444,22 +487,23 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
         const epoch = deliveryEpoch;
         while (deliveries.length > 0 && epoch === deliveryEpoch && !finalized) {
           const item = deliveries.shift()!;
+          const origin = context();
           try {
             if ('content' in item && item.content) ingressTextBytes -= Buffer.byteLength(item.content.text);
             if (item.kind === 'user_transcript') {
               // Preserve wire order with PCM so greeting audio queued before ASR
               // cannot be reclassified as an answer when a slow write resumes.
-              options.callbacks.onUserTranscript?.(item.identity);
-              if (item.content && !finalized && epoch === deliveryEpoch) options.callbacks.onConversationText?.(item.content);
+              dispatch(() => options.callbacks.onUserTranscript?.(item.identity));
+              if (item.content && !finalized && epoch === deliveryEpoch) dispatch(() => options.callbacks.onConversationText?.(item.content!));
               continue;
             }
             if (item.kind === 'text') {
-              options.callbacks.onTextResponse?.(item.identity);
-              if (item.content && !finalized && epoch === deliveryEpoch) options.callbacks.onConversationText?.(item.content);
+              dispatch(() => options.callbacks.onTextResponse?.(item.identity));
+              if (item.content && !finalized && epoch === deliveryEpoch) dispatch(() => options.callbacks.onConversationText?.(item.content!));
               continue;
             }
             if (item.kind === 'correction') {
-              options.callbacks.onConversationText?.(item.content);
+              dispatch(() => options.callbacks.onConversationText?.(item.content));
               continue;
             }
             if (item.kind === 'tool') {
@@ -472,8 +516,8 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
               // A completion waits for prior writes to be accepted, not for playback
               // to finish. Its own callback cannot block later protocol progress.
               const result = options.callbacks.onResponseComplete(item.eventId);
-              if (result) void Promise.resolve(result).catch(() => {
-                if (epoch === deliveryEpoch && !finalized) end('agent_callback_error');
+              if (result) void Promise.resolve(result).catch(error => {
+                callbackFailure(error, epoch, origin);
               });
               continue;
             }
@@ -489,12 +533,12 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
                 resumeIngress();
                 pumping = false;
                 pump();
-              }, () => {
+              }, (error: unknown) => {
                 item.pcm.fill(0);
                 inFlightPcm = undefined;
                 pumping = false;
-                if (epoch === deliveryEpoch && !finalized) end('agent_callback_error');
-                else pump();
+                callbackFailure(error, epoch, origin);
+                pump();
               });
               return;
             }
@@ -502,11 +546,11 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
             inFlightPcm = undefined;
             if (epoch === deliveryEpoch) ingressBytes -= item.pcm.length;
             resumeIngress();
-          } catch {
+          } catch (error) {
             inFlightPcm?.fill(0);
             inFlightPcm = undefined;
             pumping = false;
-            end('agent_callback_error');
+            end('agent_callback_error', false, error);
             return;
           }
         }
@@ -544,10 +588,12 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
           throw new AgentError('agent_backpressure');
         }
         try {
-          ws.send(data, error => { if (error) end('agent_transport_error', true); });
-        } catch { end('agent_transport_error', true); throw new AgentError('agent_transport_error'); }
+          ws.send(data, error => { if (error) end('agent_transport_error', true, error); });
+        } catch (error) { end('agent_transport_error', true, error); throw new AgentError('agent_transport_error', exceptionDetails(error)); }
       };
       const session: AgentSession = {
+        get diagnosticState() { return sanitizeDiagnosticFields({ websocket_state: ws.readyState,
+          ...(cleanupFailed ? { cleanup_ok: ws.readyState === WebSocket.CLOSED } : {}) }); },
         get inputSampleRate() { return inputSampleRate; },
         get outputSampleRate() { return outputSampleRate; },
         sendText: text => send({ type: 'user_message', text: boundedString(text, 8192) }),
@@ -801,10 +847,10 @@ export function createAgentConnector(deps: AgentDependencies): (options: Connect
             default: break; // Forward-compatible metadata is ignored without logging payloads.
           }
         } catch (error) {
-          end(error instanceof AgentError ? error.code : 'invalid_agent_event');
+          end(error instanceof AgentError ? error.code : 'invalid_agent_event', false, error);
         }
       });
-      ws.on('error', () => end('agent_transport_error', true));
+      ws.on('error', (error: unknown) => end('agent_transport_error', true, error));
       ws.on('unexpected-response', (_request, response) => {
         response.resume();
         end(statusCode(response.statusCode ?? 0));

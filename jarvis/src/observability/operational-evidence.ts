@@ -6,6 +6,7 @@ interface Observation { at: number; description: string; }
 interface IncidentRecord extends DiagnosticFields {
   failureStage?: DiagnosticFields['stage'];
   originalPlaybackFailure?: DiagnosticFields;
+  originalFailure?: DiagnosticFields;
   playbackTrail?: string[];
 }
 
@@ -39,6 +40,12 @@ export class OperationalEvidence {
       && previous.code !== 'UNKNOWN' && previous.code !== 'PLAYBACK_FAILED'
       && (!event.cause_code || event.cause_code === 'UNKNOWN' || event.cause_code === previous.code);
     const record: IncidentRecord = { ...previous, ...event };
+    if (code && code !== 'UNKNOWN' && event.category !== 'cancelled' && !previous?.originalFailure) {
+      const keys: (keyof DiagnosticFields)[] = ['stage', 'category', 'code', 'cause_code', 'cause_name', 'opus_error_code',
+        'playback_stage', 'voice_status', 'player_status', 'websocket_state', 'queue_depth', 'failure_scope',
+        'cleanup_step', 'cleanup_ok', 'duration_ms', 'http_status'];
+      record.originalFailure = Object.fromEntries(keys.flatMap(key => event[key] === undefined ? [] : [[key, event[key]]]));
+    }
     if (name === 'jarvis_playback_failed' && !previous?.originalPlaybackFailure) {
       const originalKeys: (keyof DiagnosticFields)[] = ['code', 'cause_code', 'cause_name', 'opus_error_code',
         'playback_stage', 'player_status', 'voice_status', 'subscribed', 'dave_ready', 'dave_protocol_version',
@@ -125,10 +132,13 @@ export class OperationalEvidence {
       'playback_token', 'playback_event', 'subscribed', 'dave_ready', 'dave_protocol_version',
       'resource_started', 'resource_ended', 'resource_current', 'stream_destroyed',
       'audio_bytes', 'audio_chunks', 'encoded_packets', 'consumed_packets', 'resource_playback_ms'];
+    keys.push('failure_scope', 'cleanup_step', 'cleanup_ok', 'websocket_state', 'active_sessions', 'http_status');
     const values = { ...Object.fromEntries(keys.flatMap(key => record[key] === undefined ? [] : [[key, record[key]]])),
       ...(record.failureStage ? { failure_stage: record.failureStage } : {}) };
     return `Incidente ${incident}, deste processo. Últimos campos técnicos observados:\n${JSON.stringify(values)}`
       + (record.originalPlaybackFailure ? `\nExceção original sanitizada:\n${JSON.stringify(record.originalPlaybackFailure)}` : '')
+      + (record.originalFailure && record.originalFailure.code !== record.originalPlaybackFailure?.code
+        ? `\nPrimeiro erro técnico sanitizado:\n${JSON.stringify(record.originalFailure)}` : '')
       + (record.playbackTrail?.length ? `\nEtapas de saída (primeiras/últimas; pacotes locais, sem prova de audição):\n${record.playbackTrail.join('\n')}` : '');
   }
 

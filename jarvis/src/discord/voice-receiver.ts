@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { OpusDecoder } from "../audio/opus-decoder.js";
 import { rms } from "../audio/voice-activity.js";
 import type { CaptureTiming } from '../audio/capture-window.js';
-import { sanitizeError } from '../observability/diagnostics.js';
+import { exceptionDetails, sanitizeError } from '../observability/diagnostics.js';
 import { diagnosticValue, newIncident, type DiagnosticFields } from '../observability/metrics.js';
 
 export type VoiceReceiverState = 'ready' | 'suspended' | 'stopped';
@@ -27,6 +27,7 @@ export interface VoiceReceiverOptions {
 }
 
 export interface VoiceTurnTiming extends CaptureTiming {
+  readonly incident?: string;
   readonly duringPlayback: boolean;
   readonly captureMs: number;
   readonly endDetectionMs: number;
@@ -34,6 +35,7 @@ export interface VoiceTurnTiming extends CaptureTiming {
 }
 
 interface IncomingTurn {
+  incident: string;
   stream: AudioReceiveStream;
   decoder: OpusDecoder;
   chunks: Buffer[];
@@ -143,7 +145,7 @@ export class VoiceReceiver {
     this.options.onMetric?.(name, value);
   }
 
-  private receiveError(error: unknown, stage: ReceiveStage, state?: IncomingTurn): void {
+  private receiveError(error: unknown, stage: ReceiveStage, state?: IncomingTurn, incident?: string): void {
     const active = state !== undefined && [...this.turns.values()].includes(state);
     const failure = receiveFailure(error, stage);
     this.metric(stage === 'decode' ? 'voice_decode_errors' : 'voice_receive_errors');
@@ -155,11 +157,18 @@ export class VoiceReceiver {
       : stage === 'decode' || stage === 'decoder_setup' ? 'voice_receive_opus_errors' : 'voice_receive_other_errors');
     if (stage === 'stream' && !active) this.metric('voice_receive_after_cleanup_errors');
     try {
-      this.options.onDiagnostic?.({ ...failure, incident: newIncident(), stage: 'voice_capture',
+      this.options.onDiagnostic?.({ ...exceptionDetails(error), ...failure, incident: state?.incident ?? incident ?? newIncident(),
+        input_kind: 'voice', stage: 'voice_capture',
         receive_stage: stage, receiver_state: this.state, voice_status: this.connection.state.status,
         capture_active: active, capture_has_pcm: (state?.bytes ?? 0) > 0, capture_has_voice: state?.voiced ?? false,
       });
     } catch { /* Diagnostics cannot interrupt capture cleanup. */ }
+  }
+
+  private captureEvent(incident: string, capture_event: DiagnosticFields['capture_event'], fields: DiagnosticFields = {}): void {
+    try { this.options.onDiagnostic?.({ ...fields, incident, input_kind: 'voice', stage: 'voice_capture', capture_event,
+      receiver_state: this.state, voice_status: this.connection.state.status }); }
+    catch { /* A failed diagnostic sink cannot retain captured audio. */ }
   }
 
   private subscribe(userId: string, speakingStartedAt: number): void {
@@ -177,6 +186,8 @@ export class VoiceReceiver {
     let decoder: OpusDecoder | undefined;
     let state: IncomingTurn | undefined;
     let stage: ReceiveStage = 'subscribe';
+    const incident = newIncident();
+    this.captureEvent(incident, 'started');
     try {
       // Gate is checked before subscribing and before constructing any decoder.
       stream = this.connection.receiver.subscribe(userId, {
@@ -185,7 +196,7 @@ export class VoiceReceiver {
       // Subscribe may synchronously start a stream that later fails DAVE decryption.
       // Always retain an error listener, including after cleanup/destroy.
       stream.on("error", (error: unknown) => {
-        this.receiveError(error, 'stream', state);
+        this.receiveError(error, 'stream', state, incident);
         if (state && this.turns.get(userId) === state) this.finish(userId, false);
       });
       if (!this.allowed(userId)) { stream.destroy(); return; }
@@ -198,7 +209,7 @@ export class VoiceReceiver {
       }, maxSeconds * 1_000);
       timeout.unref();
       const now = performance.now();
-      state = { stream, decoder, chunks: [], bytes: 0, voiced: false, silentBytes: 0, timeout,
+      state = { incident, stream, decoder, chunks: [], bytes: 0, voiced: false, silentBytes: 0, timeout,
         duringPlayback, playbackToken, startedAt: now, lastVoicedAt: now,
         speakingStartedAt,
         captureId: `${this.captureEpoch}:${++this.captureSequence}`,
@@ -212,7 +223,8 @@ export class VoiceReceiver {
     } catch (error) {
       stream?.destroy();
       decoder?.delete();
-      this.receiveError(error, stage, state);
+      this.receiveError(error, stage, state, incident);
+      this.captureEvent(incident, 'released', { cleanup_ok: true });
     }
   }
 
@@ -271,7 +283,7 @@ export class VoiceReceiver {
     if (!notify) return;
     this.metric('voice_capture_duration_limit_rejected');
     try {
-      this.options.onDiagnostic?.({ incident: newIncident(), stage: 'voice_capture',
+      this.options.onDiagnostic?.({ incident: state.incident, input_kind: 'voice', stage: 'voice_capture',
         category: 'voice', code: 'AGENT_INPUT_INVALID', capture_rejection: 'duration_limit',
         capture_bytes: state.bytes, capture_ms: Math.max(0, Math.round(performance.now() - state.startedAt)),
         receiver_state: this.state, voice_status: this.connection.state.status });
@@ -299,7 +311,7 @@ export class VoiceReceiver {
     state.chunks.length = 0;
     if (result) {
       const now = performance.now();
-      const timing: VoiceTurnTiming = { duringPlayback: state.duringPlayback,
+      const timing: VoiceTurnTiming = { incident: state.incident, duringPlayback: state.duringPlayback,
         captureMs: Math.max(0, Math.round(now - state.startedAt)),
         endDetectionMs: Math.max(0, Math.round(now - state.lastVoicedAt)),
         firstPcmMs: state.firstPcmMs, voiceStartMs: state.voiceStartMs,
@@ -311,14 +323,17 @@ export class VoiceReceiver {
       // Wall time through the last voiced frame, separate from the VAD tail.
       this.metric('voice_capture_active_ms', Math.max(0, timing.captureMs - timing.endDetectionMs));
       this.metric('voice_end_detection_ms', timing.endDetectionMs);
-      try {
-        Promise.resolve(this.options.onTurn(userId, result, timing))
-          .catch(() => this.metric("voice_turn_errors"))
-          .finally(() => result.fill(0));
-      } catch {
-        result.fill(0);
-        this.metric("voice_turn_errors");
-      }
-    }
+      this.captureEvent(state.incident, 'completed', { capture_bytes: result.length, capture_ms: timing.captureMs });
+      const release = (): void => { result.fill(0); this.captureEvent(state.incident, 'released', { cleanup_ok: true }); };
+      const failure = (error: unknown): void => {
+        this.metric('voice_turn_errors');
+        try { this.options.onDiagnostic?.({ ...exceptionDetails(error), code: 'VOICE_TURN_CALLBACK_FAILED', category: 'runtime',
+          incident: state.incident, input_kind: 'voice', stage: 'voice_capture', cleanup_ok: true, capture_active: false,
+          voice_status: this.connection.state.status, receiver_state: this.state }); }
+        catch { /* Preserve audio erasure even when diagnostics fail. */ }
+      };
+      try { void Promise.resolve(this.options.onTurn(userId, result, timing)).then(release, error => { release(); failure(error); }); }
+      catch (error) { release(); failure(error); }
+    } else this.captureEvent(state.incident, 'released', { cleanup_ok: true });
   }
 }

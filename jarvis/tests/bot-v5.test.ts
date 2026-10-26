@@ -14,6 +14,7 @@ import { WakeError, type ElevenWakeDetector } from '../src/agents/wake-detector.
 import type { VoiceReceiverOptions } from '../src/discord/voice-receiver.js';
 import type { VoiceConnectionManager } from '../src/discord/voice-connection.js';
 import type { VoiceParticipantsResult } from '../src/tools/voice-participants.js';
+import type { PlaybackQueue } from '../src/audio/playback.js';
 
 interface Provider { options: ConnectAgentOptions; session: AgentSession; audio: Buffer[]; }
 const hooks = vi.hoisted(() => ({
@@ -175,6 +176,17 @@ afterEach(async () => {
 });
 
 describe('V5 Discord integration with the real per-speaker session manager', () => {
+  test('a generic Discord failure still retains its original sanitized technical exception', async () => {
+    const h = await setup();
+    vi.spyOn(Reflect.get(h.room, 'playback') as PlaybackQueue, 'play').mockRejectedValueOnce(
+      Object.assign(new TypeError('PRIVATE playback command details'), { code: 'ECONNRESET' }));
+    const tone = h.interaction('tone'); await tone.run();
+    const message = tone.editReply.mock.calls.at(-1)![0].content;
+    const incident = message.match(/Incidente ([A-F0-9]{8})/)![1]!;
+    expect(h.logs).toContainEqual(expect.objectContaining({ event: 'jarvis_command_failed', incident,
+      incident_id: incident, code: 'ECONNRESET', cause_name: 'TypeError', cause_code: 'ECONNRESET', stage: 'playback' }));
+    expect(JSON.stringify(h.logs)).not.toContain('PRIVATE playback');
+  });
   test('text-only failure reports its stable incident and paged output evidence stays private', async () => {
     const h = await setup(); await h.interaction('consent', OWNER).run();
     const ask = await h.ask(OWNER);

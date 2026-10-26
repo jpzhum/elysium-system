@@ -6,9 +6,11 @@ import { CaptureWindows, type CaptureTiming } from '../audio/capture-window.js';
 import { playbackFailureFields, type PlaybackStream, type PlaybackStreamOptions } from '../audio/playback.js';
 import type { SpeakerContext } from '../policy/identity.js';
 import { Logger, newIncident, sanitizeDiagnosticFields, type DiagnosticFields, type ErrorCode } from '../observability/metrics.js';
+import { exceptionDetails } from '../observability/diagnostics.js';
 import type { VoiceAdmissionDetails, VoiceAdmissionEvent } from '../observability/voice-admission-evidence.js';
 
 export interface Playback {
+  readonly diagnosticState?: Readonly<DiagnosticFields>;
   readonly isPlaying: boolean;
   startStream(userId: string, sampleRate: number, owner: boolean,
     options?: PlaybackStreamOptions): PlaybackStream;
@@ -156,8 +158,10 @@ interface Entry {
   conversationTextIds: Set<string>;
   contextExpiresAt?: number;
   playbackFailure?: DiagnosticFields;
+  failureDetails?: DiagnosticFields;
 }
 export class SessionError extends Error {
+  incident?: string;
   constructor(readonly code: 'consent' | 'busy' | 'limit' | 'closed',
     readonly reason?: 'queue_full' | 'user_queue_full' | 'voice_memory_limit' | 'turn_budget'
       | 'wake_check_busy' | 'wake_capacity' | 'voice_unavailable' | 'consent_invalid') { super(code); }
@@ -248,7 +252,7 @@ export class SessionManager {
     if (!pcm.length || pcm.length % 4 || pcm.length > Math.min(this.options.maxTurnSeconds, 30) * 48_000 * 4) {
       this.options.metric?.('voice_capture_limit_rejected'); throw new SessionError('limit');
     }
-    const incident = newIncident();
+    const incident = typeof timing?.incident === 'string' && /^[A-F0-9]{8}$/.test(timing.incident) ? timing.incident : newIncident();
     const rejection = pcm.length < MIN_CAPTURE_BYTES ? 'too_short' : !hasMonoSignal(pcm) ? 'silent' : undefined;
     if (rejection) {
       this.options.metric?.(`voice_capture_${rejection}_rejected`);
@@ -266,7 +270,10 @@ export class SessionManager {
     // No paid wake inspection can make a known-full question queue usable.
     // Recheck during enqueue as other speakers can be accepted while STT awaits.
     try { this.assertQueueCapacity(speaker, pcm.length, incident); }
-    catch (error) { this.options.metric?.('voice_queue_rejected'); throw error; }
+    catch (error) {
+      if (error instanceof SessionError) error.incident = incident;
+      this.options.metric?.('voice_queue_rejected'); throw error;
+    }
     if (this.checking.has(speaker.discordUserId)) {
       this.options.metric?.('voice_wake_busy'); throw new SessionError('busy', 'wake_check_busy');
     }
@@ -294,6 +301,8 @@ export class SessionManager {
         try { activated = await this.options.detectWake(owned, abort.signal, speaker); }
         catch (error) {
           if (!abort.signal.aborted) this.options.logger?.event('jarvis_wake_failed', 'warn', {
+            ...(error instanceof WakeError ? error.details : exceptionDetails(error)),
+            ...(error instanceof WakeError && error.code === 'wake_provider_failed' ? { code: 'WAKE_PROVIDER_FAILED', category: 'agent' } as const : {}),
             incident, operation: 'agent_turn', stage: 'wake_detection', input_kind: 'voice',
             rejection_reason: error instanceof WakeError
               ? error.rateLimitSource === 'speaker_backoff' ? 'wake_speaker_backoff'
@@ -342,6 +351,9 @@ export class SessionManager {
         this.observe(speaker, 'followup', { turnId: receipt.turnId });
       }
       return receipt;
+    } catch (error) {
+      if (error instanceof WakeError || error instanceof SessionError) error.incident = incident;
+      throw error;
     } finally {
       owned?.fill(0);
       if (this.checking.get(speaker.discordUserId) === abort) this.checking.delete(speaker.discordUserId);
@@ -352,6 +364,8 @@ export class SessionManager {
     const waiting = !!this.active || this.queue.length > 0;
     this.assertQueueCapacity(request.speaker, request.pcm?.length ?? 0, request.id);
     this.claimTurn();
+    this.options.logger?.event('jarvis_turn_created', 'info', { incident: request.id, operation: 'agent_turn',
+      stage: 'turn_enqueue', input_kind: request.inputKind, queue_depth: this.queue.length });
     this.options.metric?.('questions_received');
     this.observe(request.speaker, 'question_accepted', { turnId: request.id });
     // Preserve creator priority between speakers, without repeatedly bypassing
@@ -461,12 +475,13 @@ export class SessionManager {
     } catch (error) {
       if (!request.cancelled && this.active === request) {
         const code = error instanceof AgentError ? error.code : stage === 'agent_connect' ? 'agent_connect_failed' : 'agent_send_failed';
-        if (entry?.request === request && this.entries.get(request.speaker.discordUserId) === entry) this.providerError(entry, code);
+        const details = error instanceof AgentError ? error.details : exceptionDetails(error);
+        if (entry?.request === request && this.entries.get(request.speaker.discordUserId) === entry) this.providerError(entry, code, details);
         else {
           // A reused idle socket may disappear while trusted context refresh is
           // awaiting. It does not own this newer request and cannot consume it.
           if (entry && this.entries.get(request.speaker.discordUserId) === entry) this.remove(entry, false);
-          this.requestFailure(request, this.providerCode(code), stage);
+          this.requestFailure(request, this.providerCode(code), stage, details);
         }
       }
     } finally { this.eraseRequest(request); }
@@ -553,8 +568,17 @@ export class SessionManager {
     const notification = { ...event, turnId: request.id };
     try { void Promise.resolve(request.notify ? request.notify(notification)
       : this.options.notify?.(request.speaker, notification))
-      .catch(() => this.options.metric?.('turn_notification_failed')); }
-    catch { this.options.metric?.('turn_notification_failed'); }
+      .catch(error => this.callbackFailure(request.id, request.inputKind, request.receivedAt, 'notification', error)); }
+    catch (error) { this.callbackFailure(request.id, request.inputKind, request.receivedAt, 'notification', error); }
+  }
+
+  private callbackFailure(incident: string, input_kind: 'text' | 'voice', started: number,
+    failure_scope: 'notification' | 'delivery_callback', error: unknown): void {
+    this.options.metric?.(failure_scope === 'notification' ? 'turn_notification_failed' : 'turn_delivery_callback_failed');
+    this.options.logger?.event('jarvis_turn_callback_failed', 'warn', { ...this.options.playback.diagnosticState,
+      ...exceptionDetails(error), incident, operation: 'agent_turn', input_kind, failure_scope,
+      code: 'TURN_CALLBACK_FAILED', category: 'runtime', stage: failure_scope === 'notification' ? 'command_reply' : 'session_setup',
+      queue_depth: this.queue.length, duration_ms: Math.max(0, Math.round(performance.now() - started)) });
   }
 
   private queueReport(request: TurnRequest, position: number): void {
@@ -713,7 +737,24 @@ export class SessionManager {
       },
       onInterruption: () => this.interrupt(current),
       onClose: () => this.providerClose(current),
-      onError: (code) => this.providerError(current, code),
+      onError: (code, details) => this.providerError(current, code, details),
+      diagnosticContext: () => ({ turn_id: current.incident }),
+      onDiagnostic: (fields) => {
+        const clean = sanitizeDiagnosticFields(fields);
+        const incident = clean.turn_id ?? current.incident;
+        if (!clean.failure_scope && incident === current.incident
+          && this.entries.get(current.speaker.discordUserId) === current && !current.failed && !current.recovering) {
+          current.failureDetails ??= clean;
+        }
+        if (clean.failure_scope === 'adapter_callback') this.options.logger?.event('jarvis_turn_callback_failed', 'warn', {
+          ...clean, incident, operation: 'agent_turn', stage: 'agent_connect',
+          code: 'TURN_CALLBACK_FAILED', category: 'runtime', queue_depth: this.queue.length,
+        });
+        if (clean.failure_scope === 'cleanup') this.options.logger?.event('jarvis_cleanup_failed', 'warn', {
+          ...clean, incident, operation: 'agent_turn', stage: 'agent_connect',
+          code: 'RESOURCE_CLEANUP_FAILED', category: 'runtime', queue_depth: this.queue.length,
+        });
+      },
     };
     current.lifetime = setTimeout(() => {
       if (current.waiting || current.playing) this.fail(current, 'AGENT_SESSION_EXPIRED');
@@ -734,7 +775,8 @@ export class SessionManager {
       this.idle(current);
       return current;
     } catch (error) {
-      this.providerError(current, error instanceof AgentError ? error.code : 'agent_connect_failed');
+      this.providerError(current, error instanceof AgentError ? error.code : 'agent_connect_failed',
+        error instanceof AgentError ? error.details : exceptionDetails(error));
       throw error;
     }
   }
@@ -779,6 +821,7 @@ export class SessionManager {
     entry.responseIds.clear();
     entry.stream = undefined;
     entry.playbackFailure = undefined;
+    entry.failureDetails = undefined;
     entry.ingressEnded = false;
     entry.playbackDone = false;
     entry.recovering = false;
@@ -1042,10 +1085,11 @@ export class SessionManager {
         question, generation: confirmed ? 'confirmed' : 'unconfirmed',
         ...(entry.conversationResponseSafe && entry.conversationResponse
           ? confirmed ? { response: entry.conversationResponse } : { observedResponse: entry.conversationResponse } : {}) };
+      const started = entry.turnStarted;
       try {
         void Promise.resolve(this.options.onTurnDelivered?.(entry.speaker, event))
-          .catch(() => this.options.metric?.('turn_delivery_callback_failed'));
-      } catch { this.options.metric?.('turn_delivery_callback_failed'); }
+          .catch(error => this.callbackFailure(event.turnId, event.inputKind, started, 'delivery_callback', error));
+      } catch (error) { this.callbackFailure(event.turnId, event.inputKind, started, 'delivery_callback', error); }
     }
     entry.conversationQuestion = entry.conversationResponse = undefined;
     entry.conversationTextIds.clear();
@@ -1082,14 +1126,15 @@ export class SessionManager {
 
   private playbackDiagnostic(entry: Entry, fields: DiagnosticFields): void {
     const clean = sanitizeDiagnosticFields(fields);
-    if (clean.code && !entry.playbackFailure) entry.playbackFailure = {
+    if (clean.code && clean.failure_scope !== 'cleanup' && !entry.playbackFailure) entry.playbackFailure = {
       // The terminal summary wraps this failure as PLAYBACK_FAILED. Keep its
       // specific classification even when the upstream native code is unknown.
       ...clean, cause_code: clean.code,
     };
     try {
-      this.options.logger?.event(clean.code ? 'jarvis_playback_failed' : 'jarvis_playback_state',
-        clean.code ? 'error' : 'info', {
+      this.options.logger?.event(clean.failure_scope === 'cleanup' ? 'jarvis_cleanup_failed'
+        : clean.code ? 'jarvis_playback_failed' : 'jarvis_playback_state',
+        clean.failure_scope === 'cleanup' ? 'warn' : clean.code ? 'error' : 'info', {
           ...clean, incident: entry.incident, operation: 'agent_turn', stage: 'playback',
         });
     } catch { /* A diagnostic sink cannot abort playback or replace its primary failure. */ }
@@ -1201,6 +1246,8 @@ export class SessionManager {
       : entry.waiting ? 'agent_response_wait' : 'agent_connect';
     if (event === 'jarvis_agent_turn_error' && entry.failureStage === undefined) entry.failureStage = stage;
     this.options.logger?.event(event, code ? 'error' : 'info', {
+      ...this.options.playback.diagnosticState, ...entry.session?.diagnosticState,
+      ...(code ? entry.failureDetails : {}),
       ...(code === 'PLAYBACK_FAILED' ? entry.playbackFailure : {}),
       incident: entry.incident, operation: 'agent_turn',
       stage: code ? entry.failureStage ?? stage : stage,
@@ -1222,6 +1269,7 @@ export class SessionManager {
       session_reused: entry.sessionReused, speaker_verified: true,
       consent_current: this.options.allowed(entry.speaker, entry.voiceInput),
       queue_depth: this.queue.length,
+      active_sessions: this.entries.size,
       turn_outcome: entry.request?.terminalOutcome,
       turn_delivery: this.delivery(entry),
       ...(entry.request?.dispatchAt === undefined ? {} : {
@@ -1290,12 +1338,13 @@ export class SessionManager {
   }
 
   /** Failed acquisition/context refresh has no provider input or playback to replay. */
-  private requestFailure(request: TurnRequest, code: ErrorCode, stage: 'agent_connect' | 'session_setup' | 'agent_audio_upload'): void {
+  private requestFailure(request: TurnRequest, code: ErrorCode, stage: 'agent_connect' | 'session_setup' | 'agent_audio_upload',
+    details: DiagnosticFields = {}): void {
     if (request.terminalOutcome || request.cancelled || this.active !== request) return;
     request.terminalOutcome = 'failed';
     this.followups.delete(request.speaker.discordUserId);
     this.options.metric?.('questions_failed');
-    const fields: DiagnosticFields = { incident: request.id, operation: 'agent_turn', stage,
+    const fields: DiagnosticFields = { ...this.options.playback.diagnosticState, ...details, incident: request.id, operation: 'agent_turn', stage,
       code, category: 'agent', input_kind: request.inputKind, turn_outcome: 'failed', turn_delivery: 'none',
       duration_ms: Math.max(0, Math.round(performance.now() - request.receivedAt)), queue_depth: this.queue.length };
     this.options.logger?.event('jarvis_agent_turn_failed', 'error', fields);
@@ -1326,16 +1375,22 @@ export class SessionManager {
     this.releaseDetached(request);
   }
 
-  private providerError(entry: Entry, code: string): void {
+  private providerError(entry: Entry, code: string, details: DiagnosticFields = entry.failureDetails ?? {}): void {
     if (this.entries.get(entry.speaker.discordUserId) !== entry) return;
     if (code === 'agent_aborted') { this.remove(entry); return; }
     if (entry.completionReceived && !entry.waiting) {
       entry.providerClosed = true;
       this.options.metric?.('agent_closed_after_completion');
+      this.options.logger?.event('jarvis_agent_late_error', 'warn', { ...this.options.playback.diagnosticState,
+        ...entry.session?.diagnosticState, ...details, incident: entry.incident, operation: 'agent_turn',
+        input_kind: entry.voiceInput ? 'voice' : 'text', stage: 'agent_connect', failure_scope: 'late_event',
+        code: this.providerCode(code), category: 'agent', queue_depth: this.queue.length,
+        duration_ms: Math.max(0, Math.round(performance.now() - entry.turnStarted)) });
       if (!entry.playing) this.remove(entry);
       return;
     }
     if (entry.failed || entry.recovering) return;
+    entry.failureDetails = sanitizeDiagnosticFields(details);
     this.options.metric?.('agent_errors');
     if (code === 'agent_guardrail') this.options.metric?.('agent_guardrail_rejections');
     if (code === 'agent_concurrency_limit') this.options.metric?.('agent_concurrency_rejections');
@@ -1438,9 +1493,29 @@ export class SessionManager {
     entry.conversationTextIds.clear();
     entry.abort.abort();
     for (const timer of [entry.idle, entry.lifetime, entry.deadline, entry.recognitionDeadline]) if (timer) clearTimeout(timer);
-    entry.stream?.cancel();
-    this.options.playback.stopUser(entry.speaker.discordUserId);
-    entry.session?.close();
+    let cleanup_ok = true;
+    const actions: [NonNullable<DiagnosticFields['cleanup_step']>, () => void][] = [
+      ['playback_cancel', () => entry.stream?.cancel()],
+      ['playback_stop', () => this.options.playback.stopUser(entry.speaker.discordUserId)],
+      ['session_close', () => entry.session?.close()],
+    ];
+    for (const [cleanup_step, action] of actions) {
+      try { action(); }
+      catch (error) {
+        cleanup_ok = false;
+        this.options.logger?.event('jarvis_cleanup_failed', 'warn', { ...exceptionDetails(error),
+          incident: entry.incident, operation: 'agent_turn', input_kind: entry.voiceInput ? 'voice' : 'text',
+          stage: 'session_setup', failure_scope: 'cleanup', cleanup_step, cleanup_ok: false,
+          code: 'RESOURCE_CLEANUP_FAILED', category: 'runtime', queue_depth: this.queue.length });
+      }
+    }
+    if (entry.session?.diagnosticState?.cleanup_ok === false) cleanup_ok = false;
+    this.options.logger?.event('jarvis_agent_resources_released', cleanup_ok ? 'info' : 'warn', {
+      ...this.options.playback.diagnosticState, ...entry.session?.diagnosticState,
+      incident: entry.incident, operation: 'agent_turn', stage: 'session_setup', cleanup_ok,
+      active_sessions: this.entries.size, queue_depth: this.queue.length,
+      duration_ms: Math.max(0, Math.round(performance.now() - entry.turnStarted)),
+    });
   }
 
   revoke(userId: string): void {

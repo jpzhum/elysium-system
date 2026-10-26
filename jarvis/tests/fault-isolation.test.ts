@@ -123,13 +123,13 @@ test('four isolation phases preserve one bot, native connection, player, manager
   const dm = vi.fn(async () => ({ edit: vi.fn(async () => undefined) }));
   for (const id of [OWNER, VOICE, BOT]) members.set(id, { id, displayName: 'PRIVATE fixture speaker', guild,
     user: { bot: id === BOT }, voice: { channelId: CHANNEL, channel }, send: dm } as unknown as GuildMember);
-  const command = (name: string, audio = false, userId = OWNER) => {
+  const command = (name: string, audio = false, userId = OWNER, question = 'PRIVATE fixture question') => {
     let deferred = false; let replied = false;
     const replies: string[] = [];
     const send = async (payload: { content: string }): Promise<void> => { replies.push(payload.content); replied = true; };
     const interaction = { inCachedGuild: () => true, guildId: GUILD, guild, user: { id: userId }, member: members.get(userId),
       options: { getSubcommand: () => name, getSubcommandGroup: () => null,
-        getString: (key: string) => key === 'texto' ? 'PRIVATE fixture question' : null,
+        getString: (key: string) => key === 'texto' ? question : null,
         getBoolean: (key: string) => key === 'audio' ? audio : false },
       get deferred() { return deferred; }, get replied() { return replied; }, reply: send, editReply: send, followUp: send,
       deferReply: async () => { deferred = true; } };
@@ -183,6 +183,11 @@ test('four isolation phases preserve one bot, native connection, player, manager
       expect(connection.receiver.subscriptions.size).toBe(0);
       expect(Reflect.get(stable.receiver, 'turns').size).toBe(0);
       expect(Reflect.get(stable.sessions, 'checking').size).toBe(0);
+      const entries = Reflect.get(stable.sessions, 'entries') as Map<string, { upload?: unknown; playing: boolean; pendingTools: number; request?: unknown }>;
+      for (const entry of entries.values()) {
+        expect(entry.upload).toBeUndefined(); expect(entry.playing).toBe(false);
+        expect(entry.pendingTools).toBe(0); expect(entry.request).toBeUndefined();
+      }
       const open = sockets.filter(socket => socket.readyState === 1);
       expect(open.length).toBeLessThanOrEqual(config.JARVIS_MAX_ACTIVE_SESSIONS);
       expect(stable.sessions.activeCount).toBe(open.length);
@@ -217,13 +222,13 @@ test('four isolation phases preserve one bot, native connection, player, manager
       resources.push(play.mock.calls.at(-1)![0]);
       await healthy();
     };
-    const text = async (): Promise<string> => {
-      const ask = command('ask'); await ask.run(); await tick();
+    const text = async (question?: string): Promise<string> => {
+      const ask = command('ask', false, OWNER, question); await ask.run(); await tick();
       const incident = ask.replies.join('\n').match(/Incidente ([A-F0-9]{8})/)?.[1];
       expect(incident).toBeDefined(); return incident!;
     };
     // Phase 1: actual /tone handler, no provider or microphone calls.
-    for (let turn = 0; turn < 10; turn++) {
+    for (let turn = 0; turn < 20; turn++) {
       const before = dispatchedPackets;
       const tone = command('tone'); let done = false;
       const running = tone.run().then(() => { done = true; });
@@ -236,9 +241,9 @@ test('four isolation phases preserve one bot, native connection, player, manager
     expect(hooks.connect).not.toHaveBeenCalled(); expect(stt).not.toHaveBeenCalled(); expect(subscribe).not.toHaveBeenCalled();
     // Phase 2: effective capture gate is closed (no audio consent), same worker.
     await command('consent').run();
-    for (let turn = 0; turn < 10; turn++) {
+    for (let turn = 0; turn < 20; turn++) {
       connection.receiver.speaking.emit('start', OWNER);
-      await answer(await text());
+      await answer(await text(turn < 10 ? 'PRIVATE short fixture question' : `PRIVATE long fixture ${'context '.repeat(180)}`));
     }
     expect(subscribe).not.toHaveBeenCalled(); expect(stt).not.toHaveBeenCalled();
     expect(stable.consent.get(OWNER)?.audio).toBe(false);
@@ -359,6 +364,16 @@ test('four isolation phases preserve one bot, native connection, player, manager
         staleResource.playStream.emit('error', new Error('PRIVATE late resource'));
         player.emit('error', new AudioPlayerError(new Error('PRIVATE late player'), staleResource));
       }
+      if (turn === 7) {
+        // A real input decoder failure during a written question cannot cancel
+        // the output pipeline or claim that written turn's incident.
+        const beforeDecode = logs.length;
+        await capture('decode');
+        const errors = logs.slice(beforeDecode).filter(log => log.event === 'jarvis_voice_receive_error');
+        expect(errors).toHaveLength(1); expect(errors[0]!.incident).not.toBe(incident);
+        expect(errors[0]!.code).toBe('OPUS_DECODE_FAILED');
+        expect(stable.sessions.queueStatus.active).toBe(true);
+      }
       await answer(incident, turn % 2 === 0); integrated.push(incident);
       if (turn === 4) {
         const before = connection.state;
@@ -382,15 +397,21 @@ test('four isolation phases preserve one bot, native connection, player, manager
     expect(integrated).toHaveLength(20); expect(new Set(integrated).size).toBe(20);
     expect(logs.filter(log => log.event === 'jarvis_agent_turn_finished')).toHaveLength(completedBefore + 20);
     expect(logs.filter(log => log.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
-    expect(logs.filter(log => log.event === 'jarvis_voice_receive_error')).toEqual(afterInputErrors);
-    expect(logs.filter(log => log.event === 'jarvis_agent_turn_finished')).toHaveLength(31);
-    expect(logs.filter(log => log.event === 'jarvis_agent_turn_released')).toHaveLength(31);
+    expect(logs.filter(log => log.event === 'jarvis_voice_receive_error')).toHaveLength(afterInputErrors.length + 1);
+    expect(logs.filter(log => log.event === 'jarvis_agent_turn_finished')).toHaveLength(41);
+    expect(logs.filter(log => log.event === 'jarvis_agent_turn_released')).toHaveLength(41);
     for (const incident of integrated) {
       const settlement = logs.find(log => log.incident === incident && log.playback_event === 'settled');
       expect(settlement).toBeDefined();
       expect(settlement!.consumed_packets).toBe(settlement!.encoded_packets);
       expect(logs.some(log => log.incident === incident && log.player_status === 'buffering')).toBe(true);
       expect(logs.some(log => log.incident === incident && log.player_status === 'playing')).toBe(true);
+      const turnLogs = logs.filter(log => log.incident === incident && log.operation === 'agent_turn');
+      expect(turnLogs.every(log => log.incident_id === incident && log.turn_id === incident)).toBe(true);
+      const voiceTurn = turnLogs.some(log => log.input_kind === 'voice');
+      if (voiceTurn) for (const capture_event of ['started', 'completed', 'released']) {
+        expect(logs.some(log => log.incident === incident && log.capture_event === capture_event), `${incident}: ${capture_event}`).toBe(true);
+      }
     }
     expect(dm).not.toHaveBeenCalled();
   } finally {

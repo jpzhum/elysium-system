@@ -104,6 +104,8 @@ export const errorCodes = [
   'AGENT_REQUEST_TIMEOUT', 'AGENT_INPUT_SEND_FAILED', 'AGENT_CONNECT_FAILED',
   'TOOL_UNAVAILABLE', 'TOOL_FAILED', 'TOOL_TIMEOUT', 'TOOL_CANCELLED',
   'PLAYBACK_ENCODER_FAILED', 'PLAYBACK_RESOURCE_ENDED', 'PLAYBACK_RESOURCE_IN_USE',
+  'VOICE_TURN_CALLBACK_FAILED', 'TURN_CALLBACK_FAILED', 'RESOURCE_CLEANUP_FAILED',
+  'WAKE_PROVIDER_FAILED',
   'PLAYBACK_PLAYER_ERROR', 'PLAYBACK_STREAM_FAILED', 'PLAYBACK_PREMATURE_IDLE',
   'PLAYBACK_DEADLINE', 'PLAYBACK_INPUT_FAILED',
   'PLAYBACK_QUEUE_CLOSED', 'PLAYBACK_QUEUE_FULL', 'PLAYBACK_PCM_INVALID', 'PLAYBACK_DURATION_LIMIT',
@@ -130,7 +132,17 @@ export interface DiagnosticFields {
   category?: ErrorCategory;
   code?: ErrorCode;
   cause_code?: ErrorCode;
-  cause_name?: 'Error' | 'TypeError' | 'RangeError' | 'AudioPlayerError' | 'DiagnosticError';
+  cause_name?: 'Error' | 'TypeError' | 'RangeError' | 'AudioPlayerError' | 'DiagnosticError' | 'AgentError';
+  turn_id?: string;
+  incident_id?: string;
+  error_code?: ErrorCode;
+  failure_scope?: 'notification' | 'delivery_callback' | 'cleanup' | 'adapter_callback' | 'late_event';
+  cleanup_step?: 'playback_cancel' | 'playback_stop' | 'session_close' | 'stream_destroy' | 'player_stop' | 'source_cancel' | 'socket_terminate';
+  cleanup_ok?: boolean;
+  capture_event?: 'started' | 'completed' | 'released';
+  websocket_state?: number;
+  http_status?: number;
+  active_sessions?: number;
   opus_error_code?: number;
   playback_stage?: typeof playbackStages[number];
   playback_event?: typeof playbackEvents[number];
@@ -282,6 +294,9 @@ const events = new Set([
   'jarvis_agent_input_prepared', 'jarvis_agent_first_audio',
   'jarvis_agent_turn_released', 'jarvis_agent_turn_cancelled',
   'jarvis_agent_turn_error',
+  'jarvis_turn_callback_failed', 'jarvis_cleanup_failed', 'jarvis_agent_resources_released',
+  'jarvis_voice_capture_state', 'jarvis_turn_created',
+  'jarvis_agent_late_error',
 ]);
 
 export function newIncident(): string { return randomBytes(4).toString('hex').toUpperCase(); }
@@ -308,7 +323,10 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
   for (const [key, options] of [
     ['command', diagnosticCommands], ['command_group', ['context']], ['operation', ['agent_turn', 'identity', 'tool', 'search']], ['stage', diagnosticStages], ['category', errorCategories],
     ['code', errorCodes], ['voice_status', voiceStatuses], ['previous_voice_status', voiceStatuses],
-    ['cause_code', errorCodes], ['cause_name', ['Error', 'TypeError', 'RangeError', 'AudioPlayerError', 'DiagnosticError']],
+    ['cause_code', errorCodes], ['cause_name', ['Error', 'TypeError', 'RangeError', 'AudioPlayerError', 'DiagnosticError', 'AgentError']],
+    ['failure_scope', ['notification', 'delivery_callback', 'cleanup', 'adapter_callback', 'late_event']],
+    ['cleanup_step', ['playback_cancel', 'playback_stop', 'session_close', 'stream_destroy', 'player_stop', 'source_cancel', 'socket_terminate']],
+    ['capture_event', ['started', 'completed', 'released']],
     ['playback_stage', playbackStages], ['player_status', playerStatuses], ['previous_player_status', playerStatuses],
     ['playback_event', playbackEvents],
     ['receive_stage', ['subscribe', 'decoder_setup', 'stream', 'decode']],
@@ -344,7 +362,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
     'search_key_configured', 'wait_for_response', 'participants_available', 'participants_complete',
     'context_injected',
     'resource_ended', 'subscribed', 'capture_active', 'capture_has_pcm', 'capture_has_voice',
-    'resource_started', 'stream_destroyed', 'resource_current',
+    'resource_started', 'stream_destroyed', 'resource_current', 'cleanup_ok',
   ]) {
     const value = diagnosticValue(fields, key);
     if (typeof value === 'boolean') result[key] = value;
@@ -352,6 +370,7 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
   for (const [key, minimum, maximum] of [
     ['duration_ms', 0, 86_400_000], ['stage_duration_ms', 0, 86_400_000], ['timeout_ms', 0, 300_000],
     ['opus_error_code', -7, -1],
+    ['websocket_state', 0, 3], ['active_sessions', 0, 8], ['http_status', 100, 599],
     ['playback_token', 1, 2_147_483_647], ['playback_elapsed_ms', 0, 300_000],
     ['encoded_packets', 0, 15_000], ['consumed_packets', 0, 15_000], ['resource_playback_ms', 0, 300_000],
     ['network_status', 0, 6], ['previous_network_status', 0, 6],
@@ -385,6 +404,8 @@ export function sanitizeDiagnosticFields(fields: unknown): DiagnosticFields {
   }
   const revision = diagnosticValue(fields, 'deployed_revision');
   if (typeof revision === 'string' && /^[a-f0-9]{7,40}$/i.test(revision)) result.deployed_revision = revision.toLowerCase();
+  const turn = diagnosticValue(fields, 'turn_id');
+  if (typeof turn === 'string' && /^[A-F0-9]{8}$/.test(turn)) result.turn_id = turn;
   const encodingMs = diagnosticValue(fields, 'opus_encode_ms');
   if (typeof encodingMs === 'number' && Number.isFinite(encodingMs) && encodingMs >= 0 && encodingMs <= 3_600_000) {
     result.opus_encode_ms = encodingMs;
@@ -396,10 +417,15 @@ export type OperationalEvent = Readonly<DiagnosticFields & { event: string; leve
 
 export class Logger {
   private readonly observers = new Set<(event: OperationalEvent) => void>();
+  private revision?: string;
   constructor(
     private readonly minimum: LogLevel = 'info',
     private readonly write: (line: string) => void = (line) => { process.stdout.write(line); },
   ) {}
+  /** Config supplies this; never infer a deployed revision from local Git. */
+  setDeploymentRevision(revision: DiagnosticFields['deployed_revision']): void {
+    this.revision = sanitizeDiagnosticFields({ deployed_revision: revision }).deployed_revision;
+  }
   /** Status observes the same allowlist even when stdout is filtered to errors. */
   observe(observer: (event: OperationalEvent) => void): () => void {
     this.observers.add(observer);
@@ -410,12 +436,17 @@ export class Logger {
     const incident = typeof suppliedIncident === 'string' && /^[A-F0-9]{8}$/.test(suppliedIncident)
       ? suppliedIncident : newIncident();
     if (!events.has(name) || !['info', 'warn', 'error'].includes(level)) return incident;
-    const record: OperationalEvent = Object.freeze({ event: name, level, incident, ...sanitizeDiagnosticFields(fields) });
+    const clean = sanitizeDiagnosticFields(fields);
+    const correlated = { ...(this.revision ? { deployed_revision: this.revision } : {}), ...clean,
+      incident_id: incident,
+      ...(clean.turn_id || clean.operation === 'agent_turn' || clean.input_kind ? { turn_id: clean.turn_id ?? incident } : {}),
+      ...(clean.code ? { error_code: clean.code } : {}) };
+    const record: OperationalEvent = Object.freeze({ event: name, level, incident, ...correlated });
     for (const observer of this.observers) {
       try { observer(record); } catch { /* Observability cannot interrupt the voice pipeline. */ }
     }
     if (['info', 'warn', 'error'].indexOf(level) >= ['info', 'warn', 'error'].indexOf(this.minimum)) {
-      this.write(`${JSON.stringify({ time: new Date().toISOString(), level, event: name, incident, ...sanitizeDiagnosticFields(fields) })}\n`);
+      this.write(`${JSON.stringify({ time: new Date().toISOString(), level, event: name, incident, ...correlated })}\n`);
     }
     return incident;
   }

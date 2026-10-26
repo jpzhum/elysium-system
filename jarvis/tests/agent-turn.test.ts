@@ -133,6 +133,78 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+test('a text send exception preserves its original class and cause across the generic agent summary', async () => {
+  let fail = true;
+  const h = setup(false, undefined, { prepareSession: (_speaker, session) => {
+    if (fail) { fail = false; session.sendText = () => { throw Object.assign(new TypeError(secret), { code: 'ECONNRESET' }); }; }
+  } });
+  const receipt = await h.ask();
+  expect(h.failed('AGENT_INPUT_SEND_FAILED')).toMatchObject({ incident: receipt.turnId,
+    cause_name: 'TypeError', cause_code: 'ECONNRESET' });
+  await h.ask(); h.audio(20); h.complete(21); await settle();
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_finished')).toHaveLength(1);
+});
+
+test('a rejected Discord notification is diagnosed by its originating turn and never blocks the next one', async () => {
+  const h = setup(false, undefined, { notify: async () => { throw Object.assign(new Error(secret), { code: 50013 }); } });
+  const receipt = await h.ask(); h.audio(); h.complete(); await settle();
+  expect(h.logs).toContainEqual(expect.objectContaining({ event: 'jarvis_turn_callback_failed', incident: receipt.turnId,
+    failure_scope: 'notification', cause_name: 'Error', cause_code: 'DISCORD_MISSING_PERMISSIONS' }));
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  await h.ask(); h.audio(20); h.complete(21); await settle();
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_finished')).toHaveLength(2);
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
+});
+
+test('one failed cancellation action cannot skip remaining cleanup or strand the next turn', async () => {
+  const h = setup(true); const receipt = await h.ask(); h.audio(); await settle();
+  vi.spyOn(h.streams[0]!, 'cancel').mockImplementationOnce(() => { throw new RangeError(secret); });
+  expect(() => h.manager.cancelUser(h.speaker.discordUserId)).not.toThrow();
+  expect(h.logs).toContainEqual(expect.objectContaining({ event: 'jarvis_cleanup_failed', incident: receipt.turnId,
+    failure_scope: 'cleanup', cleanup_step: 'playback_cancel', cleanup_ok: false, cause_name: 'RangeError' }));
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  expect(h.manager.activeCount).toBe(0); expect(h.playback.isPlaying).toBe(false);
+  await h.ask(); h.audio(20); h.complete(21); h.finishPlayback(); await settle();
+  expect(h.logs.filter(line => line.event === 'jarvis_agent_turn_finished')).toHaveLength(1);
+  expect(h.logs.filter(line => line.incident === receipt.turnId && line.event === 'jarvis_agent_turn_released')).toHaveLength(1);
+});
+
+test('a late memory delivery failure keeps the previous incident after a warm session starts another turn', async () => {
+  let rejectDelivery!: (error: Error) => void;
+  const h = setup(false, undefined, { onTurnDelivered: () => new Promise<void>((_resolve, reject) => { rejectDelivery = reject; }) });
+  const previous = await h.ask(); h.text(); h.audio(); h.complete(); await settle();
+  const next = await h.ask(); rejectDelivery(Object.assign(new TypeError(secret), { code: 'EACCES' })); await settle();
+  expect(h.logs.filter(log => log.event === 'jarvis_turn_callback_failed')).toMatchObject([
+    { incident: previous.turnId, failure_scope: 'delivery_callback', cause_name: 'TypeError', cause_code: 'EACCES' },
+  ]);
+  expect(h.logs.filter(log => log.incident === next.turnId && log.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
+  h.audio(20); h.complete(21); await settle();
+  expect(h.manager.queueStatus).toEqual({ waiting: 0, active: false });
+  expect(JSON.stringify(h.logs)).not.toContain(secret);
+});
+
+test('wake failure keeps the capture incident and original transport cause before the agent is opened', async () => {
+  const h = setup(false, undefined, { detectWake: async () => { throw Object.assign(new WakeError('wake_provider_failed'),
+    { details: { cause_name: 'TypeError', cause_code: 'ENOTFOUND' } }); } });
+  await expect(h.manager.voiceTurn(h.speaker, Buffer.alloc(38_400, 5), { incident: 'AABBCCDD', captureMs: 200, endDetectionMs: 0 }))
+    .rejects.toMatchObject({ code: 'wake_provider_failed' });
+  expect(h.logs).toContainEqual(expect.objectContaining({ event: 'jarvis_wake_failed', incident: 'AABBCCDD',
+    code: 'WAKE_PROVIDER_FAILED', cause_name: 'TypeError', cause_code: 'ENOTFOUND' }));
+  expect(h.manager.activeCount).toBe(0);
+  await h.ask(); h.audio(); h.complete(); await settle();
+  expect(h.logs.filter(log => log.event === 'jarvis_agent_turn_finished')).toHaveLength(1);
+});
+
+test('transport failure after completed playback is diagnosed on the old turn without changing its outcome', async () => {
+  const h = setup(); const previous = await h.ask(); h.audio(); h.complete(); await settle();
+  h.socket.emit('error', Object.assign(new TypeError(secret), { code: 'ECONNRESET' })); await settle();
+  expect(h.logs).toContainEqual(expect.objectContaining({ event: 'jarvis_agent_late_error', incident: previous.turnId,
+    cause_name: 'TypeError', cause_code: 'ECONNRESET', code: 'AGENT_TRANSPORT_ERROR', failure_scope: 'late_event' }));
+  expect(h.logs.filter(log => log.event === 'jarvis_agent_turn_failed')).toHaveLength(0);
+  await h.ask(); h.audio(20); h.complete(21); await settle();
+  expect(h.logs.filter(log => log.event === 'jarvis_agent_turn_finished')).toHaveLength(2);
+});
+
 test('a partial answer followed by a transport error has one definitive terminal after local drain', async () => {
   const notify = vi.fn();
   const h = setup(true, undefined, { notify });

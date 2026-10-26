@@ -60,6 +60,60 @@ afterEach(() => {
 });
 
 describe('ElevenAgents adapter (protocol fixtures, not live Gate C)', () => {
+  it('failed close and terminate remain an explicit cleanup failure rather than a false released state', async () => {
+    const h = harness(); const session = await h.connect();
+    const close = vi.spyOn(h.socket, 'close').mockImplementation(() => { throw new Error('PRIVATE close'); });
+    const terminate = vi.spyOn(h.socket, 'terminate').mockImplementation(() => { throw new Error('PRIVATE terminate'); });
+    try {
+      expect(() => session.close()).not.toThrow();
+      expect(session.diagnosticState).toMatchObject({ cleanup_ok: false, websocket_state: 1 });
+      expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+    } finally { close.mockRestore(); terminate.mockRestore(); }
+  });
+  it('a close exception cannot orphan the socket or skip the close callback', async () => {
+    const h = harness(); const diagnostic = vi.fn(); Object.assign(h.callbacks, { onDiagnostic: diagnostic });
+    const session = await h.connect();
+    vi.spyOn(h.socket, 'close').mockImplementationOnce(() => { throw Object.assign(new TypeError('PRIVATE close failure'), { code: 'ECONNRESET' }); });
+    expect(() => session.close()).not.toThrow();
+    expect(h.socket.terminated).toBe(true); expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ failure_scope: 'cleanup', cleanup_step: 'session_close',
+      cleanup_ok: false, cause_name: 'TypeError', cause_code: 'ECONNRESET' }));
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('PRIVATE');
+  });
+  it('a late completion callback rejection cannot close a newer turn on a reused socket', async () => {
+    const h = harness(); let turn = 'AAAABBBB'; let rejectComplete!: (error: Error) => void;
+    const diagnostic = vi.fn();
+    Object.assign(h.callbacks, { diagnosticContext: () => ({ turn_id: turn }), onDiagnostic: diagnostic });
+    h.callbacks.onResponseComplete = () => new Promise<void>((_resolve, reject) => { rejectComplete = reject; });
+    const session = await h.connect();
+    h.socket.message({ type: 'agent_response_complete', agent_response_complete_event: { event_id: 1 } });
+    turn = 'CCCCDDDD'; session.sendText('PRIVATE next question');
+    rejectComplete(new TypeError('PRIVATE previous callback'));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+    expect(h.callbacks.onClose).not.toHaveBeenCalled();
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ turn_id: 'AAAABBBB', cause_name: 'TypeError' }));
+    expect(() => session.sendText('PRIVATE later question')).not.toThrow(); session.close();
+  });
+  it('a TCP resume exception is causal transport evidence rather than a later generic timeout', async () => {
+    const h = harness();
+    let accept!: () => void;
+    const diagnostic = vi.fn(); Object.assign(h.callbacks, { onDiagnostic: diagnostic });
+    let writes = 0;
+    h.callbacks.onAudio = vi.fn(() => writes++ === 0 ? new Promise<void>(resolve => { accept = resolve; }) : undefined);
+    await h.connect();
+    h.socket.resume.mockImplementationOnce(() => { throw Object.assign(new TypeError('PRIVATE socket resume'), { code: 'ECONNRESET' }); });
+    const pcm = Buffer.alloc(180_000, 1).toString('base64');
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: pcm, event_id: 1 } });
+    h.socket.message({ type: 'audio', audio_event: { audio_base_64: pcm, event_id: 2 } });
+    expect(h.socket.pause).toHaveBeenCalledOnce(); accept();
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(h.callbacks.onError).toHaveBeenCalledWith('agent_transport_error');
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ cause_name: 'TypeError', cause_code: 'ECONNRESET' }));
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('PRIVATE');
+    accept(); for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(h.callbacks.onClose).toHaveBeenCalledOnce();
+  });
   it('separates signed URL, WebSocket and audio negotiation with monotonic content-free durations', async () => {
     let now = 1_000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);

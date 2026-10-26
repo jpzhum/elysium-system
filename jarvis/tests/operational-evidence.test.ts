@@ -182,3 +182,16 @@ test('output lifecycle preserves the original sanitized exception separately fro
   expect(evidence.summary()).toContain('confirmados=0');
   evidence.close();
 });
+
+test('cleanup cannot replace the first non-playback exception in an incident diagnosis', () => {
+  const logger = new Logger('error', () => undefined); const evidence = new OperationalEvidence(logger);
+  logger.event('jarvis_agent_turn_error', 'error', { incident: 'AABBCCDD', code: 'AGENT_INPUT_SEND_FAILED',
+    cause_name: 'TypeError', cause_code: 'ECONNRESET', stage: 'agent_audio_upload', websocket_state: 1 });
+  logger.event('jarvis_cleanup_failed', 'warn', { incident: 'AABBCCDD', code: 'RESOURCE_CLEANUP_FAILED',
+    cause_name: 'RangeError', cause_code: 'UNKNOWN', failure_scope: 'cleanup', cleanup_step: 'session_close', cleanup_ok: false });
+  logger.event('jarvis_agent_resources_released', 'warn', { incident: 'AABBCCDD', cleanup_ok: false, websocket_state: 3 });
+  const text = evidence.incidentDetails('AABBCCDD');
+  const first = JSON.parse(text.split('Primeiro erro técnico sanitizado:\n')[1]!.split('\n')[0]!);
+  expect(first).toMatchObject({ code: 'AGENT_INPUT_SEND_FAILED', cause_name: 'TypeError', cause_code: 'ECONNRESET', websocket_state: 1 });
+  expect(text).toContain('"cleanup_ok":false'); expect(text).toContain('session_close'); evidence.close();
+});

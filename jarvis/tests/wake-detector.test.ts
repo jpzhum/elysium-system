@@ -1,6 +1,23 @@
 import { expect, test, vi } from 'vitest';
 import { ElevenWakeDetector, containsWakeWord, isExplicitStopCommand } from '../src/agents/wake-detector.js';
 
+test('wake transport failure preserves its original sanitized cause rather than only a generic wrapper', async () => {
+  const request = vi.fn<typeof fetch>(async () => { throw Object.assign(new TypeError('PRIVATE wake URL'), { code: 'ENOTFOUND' }); });
+  const detector = new ElevenWakeDetector('PRIVATE key', 'Jarvis', 6, vi.fn(), request);
+  const failed = await detector.detect(Buffer.alloc(48_000, 5)).catch((error: unknown) => error);
+  expect(failed).toMatchObject({ code: 'wake_provider_failed', details: { cause_name: 'TypeError', cause_code: 'ENOTFOUND' } });
+  expect(JSON.stringify(failed)).not.toContain('PRIVATE');
+});
+
+test.each([429, 502])('wake HTTP %i is recorded without retaining a provider body or making retries', async status => {
+  const request = vi.fn<typeof fetch>(async () => new Response('PRIVATE provider body', { status }));
+  const detector = new ElevenWakeDetector('PRIVATE key', 'Jarvis', 6, vi.fn(), request);
+  await expect(detector.detect(Buffer.alloc(48_000, 5))).rejects.toMatchObject({
+    code: 'wake_provider_failed', details: { http_status: status },
+  });
+  expect(request).toHaveBeenCalledOnce();
+});
+
 test.each(['Jarvis, ajude', 'Járvis!', 'Djárvis onde vou?', 'Oi JARVIS'])('accepts PT-BR spelling %s', (text) => {
   expect(containsWakeWord(text)).toBe(true);
 });

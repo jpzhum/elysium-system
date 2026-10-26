@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from 'vitest';
 import {
   Logger, Metrics, type DiagnosticFields, type ErrorCategory, type ErrorCode,
 } from '../src/observability/metrics.js';
-import { DiagnosticError, JoinDiagnostics, sanitizeError } from '../src/observability/diagnostics.js';
+import { DiagnosticError, JoinDiagnostics, exceptionDetails, sanitizeError } from '../src/observability/diagnostics.js';
 
 function capture(level: 'info' | 'warn' | 'error' = 'info') {
   const lines: string[] = [];
@@ -19,7 +19,7 @@ describe('bounded structured operational logging', () => {
     const incident = state.logger.event('jarvis_ready');
     expect(incident).toMatch(/^[A-F0-9]{8}$/);
     expect(state.records()[0]).toMatchObject({ event: 'jarvis_ready', level: 'info', incident });
-    expect(Object.keys(state.records()[0]!)).toEqual(['time', 'level', 'event', 'incident']);
+    expect(Object.keys(state.records()[0]!)).toEqual(['time', 'level', 'event', 'incident', 'incident_id']);
   });
 
   test('accepts only reviewed metadata and reuses a validated incident', () => {
@@ -66,11 +66,13 @@ describe('bounded structured operational logging', () => {
       token: secret, signed_url: secret, transcript: secret, audio: Buffer.from(secret),
       user_id: secret, channel_id: secret, message: secret, stack: secret,
       cause: { secret }, error: new Error(secret),
+      turn_id: secret, incident_id: secret, error_code: secret, failure_scope: secret,
+      cleanup_step: secret, cleanup_ok: secret, websocket_state: secret, active_sessions: secret, capture_event: secret,
     } as unknown as DiagnosticFields;
     state.logger.event('jarvis_command_failed', 'error', fields);
     expect(state.lines.join('')).not.toMatch(/PRIVATE_TOKEN|signature|123456789012345678|https|secret/);
     const record = state.records()[0]!;
-    expect(Object.keys(record)).toEqual(['time', 'level', 'event', 'incident']);
+    expect(Object.keys(record)).toEqual(['time', 'level', 'event', 'incident', 'incident_id']);
     expect(record.incident).toMatch(/^[A-F0-9]{8}$/);
   });
 
@@ -83,7 +85,7 @@ describe('bounded structured operational logging', () => {
       rejection_reason: 'wake_speaker_backoff', retry_after_ms: 10_000, stage: 'wake_detection',
     });
     expect(Object.keys(state.records()[0]!)).toEqual([
-      'time', 'level', 'event', 'incident', 'stage', 'rejection_reason', 'retry_after_ms',
+      'time', 'level', 'event', 'incident', 'stage', 'rejection_reason', 'retry_after_ms', 'incident_id',
     ]);
   });
 
@@ -114,7 +116,7 @@ describe('bounded structured operational logging', () => {
   })])('unexpected fields input never reaches JSON', (input) => {
     const state = capture();
     expect(() => state.logger.event('jarvis_ready', 'info', input as DiagnosticFields)).not.toThrow();
-    expect(Object.keys(state.records()[0]!)).toEqual(['time', 'level', 'event', 'incident']);
+    expect(Object.keys(state.records()[0]!)).toEqual(['time', 'level', 'event', 'incident', 'incident_id']);
   });
 
   test('rejects non-finite, fractional, oversized and negative numeric fields', () => {
@@ -124,7 +126,7 @@ describe('bounded structured operational logging', () => {
       websocket_close_code: 5_000, disconnect_reason: 1.5, dave_protocol_version: 65_536,
       diagnostics_version: 8, pending_tools: 129, context_items: 11, context_chars: 2401,
     });
-    expect(Object.keys(state.records()[0]!)).toEqual(['time', 'level', 'event', 'incident']);
+    expect(Object.keys(state.records()[0]!)).toEqual(['time', 'level', 'event', 'incident', 'incident_id']);
   });
 
   test.each(['v22.22.0', '22.22.0-private_token', '22.22.0+signed_url', '22.22.0\nPRIVATE', '022.22.0'])('rejects untrusted version %s', (node_version) => {
@@ -361,5 +363,29 @@ test('queue and local drain diagnostics accept only bounded, reviewed state', ()
     turn_outcome: 'superseded', queue_depth: 2, first_audio_ms: 100 });
   state.logger.event('jarvis_turn_queue_changed', 'info', { queue_depth: 100, queue_position: -1,
     turn_outcome: 'PRIVATE' as 'completed', first_audio_ms: NaN, question_wait_ms: -1 });
-  expect(Object.keys(state.records()[1]!)).toEqual(['time', 'level', 'event', 'incident']);
+  expect(Object.keys(state.records()[1]!)).toEqual(['time', 'level', 'event', 'incident', 'incident_id']);
+});
+
+test('forensic aliases and known deployment metadata are correlated without trusting forged aliases', () => {
+  const state = capture(); state.logger.setDeploymentRevision('A7D7B90');
+  const observe = vi.fn(); state.logger.observe(observe);
+  state.logger.event('jarvis_agent_turn_failed', 'error', { incident: 'AABBCCDD', operation: 'agent_turn',
+    code: 'AGENT_INPUT_SEND_FAILED', cause_code: 'ECONNRESET', cause_name: 'TypeError', websocket_state: 3,
+    ...{ incident_id: 'PRIVATE', error_code: 'PRIVATE', turn_id: 'PRIVATE', websocket_url: 'PRIVATE' },
+  } as unknown as DiagnosticFields);
+  expect(state.records()[0]).toMatchObject({ incident: 'AABBCCDD', incident_id: 'AABBCCDD', turn_id: 'AABBCCDD',
+    code: 'AGENT_INPUT_SEND_FAILED', error_code: 'AGENT_INPUT_SEND_FAILED', deployed_revision: 'a7d7b90', websocket_state: 3 });
+  expect(observe.mock.calls[0]![0]).toMatchObject({ incident_id: 'AABBCCDD', turn_id: 'AABBCCDD' });
+  expect(state.lines.join('')).not.toContain('PRIVATE');
+  state.logger.setDeploymentRevision('PRIVATE'); state.logger.event('jarvis_ready');
+  expect(state.records()[1]).not.toHaveProperty('deployed_revision');
+});
+
+test('nested Node transport causes remain classified without exposing cause objects or invoking getters', () => {
+  const original = new TypeError('PRIVATE signed URL', { cause: Object.assign(new Error('PRIVATE address'), { code: 'ENOTFOUND' }) });
+  expect(exceptionDetails(original)).toEqual({ cause_name: 'TypeError', cause_code: 'ENOTFOUND' });
+  const getter = vi.fn(() => { throw new Error('PRIVATE'); });
+  const unsafe = new Error('PRIVATE'); Object.defineProperty(unsafe, 'cause', { get: getter });
+  expect(exceptionDetails(unsafe)).toEqual({ cause_name: 'Error', cause_code: 'UNKNOWN' });
+  expect(getter).not.toHaveBeenCalled(); expect(JSON.stringify(exceptionDetails(original))).not.toContain('PRIVATE');
 });

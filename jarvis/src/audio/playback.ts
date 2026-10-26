@@ -7,7 +7,7 @@ import {
 } from '@discordjs/voice';
 import OpusScript from 'opusscript';
 import { StreamingPcm } from './streaming-pcm.js';
-import { DiagnosticError, sanitizeError } from '../observability/diagnostics.js';
+import { DiagnosticError, exceptionDetails, sanitizeError } from '../observability/diagnostics.js';
 import { diagnosticValue, sanitizeDiagnosticFields, type DiagnosticFields, type ErrorCode } from '../observability/metrics.js';
 
 export interface PlaybackStream {
@@ -431,10 +431,22 @@ export class PlaybackQueue {
     if (wasActive) this.active = undefined;
     const index = this.waiting.indexOf(item);
     if (index >= 0) this.waiting.splice(index, 1);
-    item.source.cancel();
-    item.stream?.destroy();
-    if (wasActive && error) this.player.stop(true);
-    this.observe(item, { playback_stage: 'player', playback_event: 'settled' });
+    let cleanup_ok = true;
+    const cleanup: [NonNullable<DiagnosticFields['cleanup_step']>, () => void][] = [
+      ['source_cancel', () => item.source.cancel()], ['stream_destroy', () => { item.stream?.destroy(); }],
+      ['player_stop', () => { if (wasActive && error) this.player.stop(true); }],
+    ];
+    for (const [cleanup_step, action] of cleanup) {
+      try { action(); }
+      catch (cause) {
+        cleanup_ok = false;
+        this.observe(item, { ...exceptionDetails(cause), code: 'RESOURCE_CLEANUP_FAILED', category: 'playback',
+          failure_scope: 'cleanup', cleanup_step, cleanup_ok: false });
+        error ??= this.failure(item, cause, 'player', 'RESOURCE_CLEANUP_FAILED', 'Falha ao liberar reprodução.');
+        item.failure = error;
+      }
+    }
+    this.observe(item, { playback_stage: 'player', playback_event: 'settled', cleanup_ok });
     if (error) {
       this.options.onMetric?.(error instanceof PlaybackCancelledError ? 'playback_cancelled' : 'playback_failed', 1);
       item.reject(error);

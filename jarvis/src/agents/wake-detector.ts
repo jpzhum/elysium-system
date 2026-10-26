@@ -1,6 +1,8 @@
 import { convertPcm } from '../audio/pcm-conversion.js';
 import { limitedJson } from '../network/limited-json.js';
 import { containsWakeWord } from '../audio/wakeword.js';
+import { exceptionDetails } from '../observability/diagnostics.js';
+import { sanitizeDiagnosticFields, type DiagnosticFields } from '../observability/metrics.js';
 
 export { containsWakeWord } from '../audio/wakeword.js';
 
@@ -44,11 +46,14 @@ export type WakeObservationEvent = 'wake_requested' | 'wake_accepted' | 'wake_co
   | 'wake_global_rejected' | 'wake_fair_share_rejected' | 'wake_valid';
 
 export class WakeError extends Error {
+  readonly details: Readonly<DiagnosticFields>;
+  incident?: string;
   readonly retryAfterMs?: number;
   readonly rateLimitSource?: WakeRateLimitSource;
   constructor(readonly code: 'wake_queue_full' | 'wake_queue_timeout' | 'wake_rate_limited' | 'wake_provider_failed',
-    retryAfterMs?: number, rateLimitSource: WakeRateLimitSource = 'global_budget') {
+    retryAfterMs?: number, rateLimitSource: WakeRateLimitSource = 'global_budget', details: DiagnosticFields = {}) {
     super(code);
+    this.details = Object.freeze(sanitizeDiagnosticFields(details));
     if (code === 'wake_rate_limited') this.rateLimitSource = rateLimitSource;
     if (typeof retryAfterMs === 'number' && Number.isFinite(retryAfterMs) && retryAfterMs >= 0 && retryAfterMs <= BUDGET_WINDOW_MS) {
       this.retryAfterMs = Math.ceil(retryAfterMs);
@@ -309,7 +314,7 @@ export class ElevenWakeDetector {
       const response = await this.requestAudio(form, combined);
       if (!response.ok) {
         void response.body?.cancel().catch(() => undefined);
-        throw new WakeError('wake_provider_failed');
+        throw new WakeError('wake_provider_failed', undefined, 'global_budget', { http_status: response.status });
       }
       // Content is transient and never logged or shared with other speakers.
       const data = await limitedJson(response, 65_536, combined);
@@ -322,10 +327,10 @@ export class ElevenWakeDetector {
       if (activated) { this.metric('wake_activations'); this.observe(entry.admission?.speaker, 'wake_valid'); }
       return { activated, interrupt: entry.interrupt && typeof text === 'string' &&
         isExplicitStopCommand(text, this.wakeWord) };
-    } catch {
+    } catch (error) {
       if (entry.signal?.aborted) { this.metric('wake_cancelled'); return NOT_ACTIVATED; }
       this.metric('wake_provider_errors');
-      throw new WakeError('wake_provider_failed');
+      throw new WakeError('wake_provider_failed', undefined, 'global_budget', error instanceof WakeError ? error.details : exceptionDetails(error));
     } finally {
       clearTimeout(timer);
       this.metric('wake_stt_request_ms', Math.max(0, performance.now() - requestStarted));

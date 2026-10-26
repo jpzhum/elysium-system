@@ -8,7 +8,7 @@ import { diagnosticCommands, Logger, Metrics, newIncident, type DiagnosticFields
 import { operationalStatus } from '../observability/status.js';
 import { OperationalEvidence, deploymentRevision } from '../observability/operational-evidence.js';
 import { VoiceAdmissionEvidence } from '../observability/voice-admission-evidence.js';
-import { DiagnosticError, JoinDiagnostics, sanitizeError } from '../observability/diagnostics.js';
+import { DiagnosticError, JoinDiagnostics, exceptionDetails, sanitizeError } from '../observability/diagnostics.js';
 import { inspectVoiceRuntime } from '../observability/voice-runtime.js';
 import { authorize, AuthorizationError } from '../policy/authorization.js';
 import { ConsentStore } from '../policy/consent.js';
@@ -56,6 +56,7 @@ export class JarvisBot {
   private readonly search: (game: string, query: string, signal?: AbortSignal) => Promise<GameSearchResult>;
 
   constructor(private readonly config: Config, private readonly logger: Logger) {
+    logger.setDeploymentRevision(config.RENDER_GIT_COMMIT);
     this.evidence = new OperationalEvidence(logger);
     this.voiceEvidence = new VoiceAdmissionEvidence(config.RENDER_GIT_COMMIT);
     this.wake = new ElevenWakeDetector(config.ELEVENLABS_API_KEY ?? '', config.JARVIS_WAKE_WORD,
@@ -264,8 +265,9 @@ export class JarvisBot {
         try {
           await room.playback.play(interaction.user.id, tone, 48_000, true, {
             onDiagnostic: (fields) => {
-              if (fields.code || !playbackSnapshot.code) playbackSnapshot = fields;
-              this.logger.event(fields.code ? 'jarvis_playback_failed' : 'jarvis_playback_state', fields.code ? 'error' : 'info', {
+              if (!playbackSnapshot.code) playbackSnapshot = fields;
+              this.logger.event(fields.failure_scope === 'cleanup' ? 'jarvis_cleanup_failed'
+                : fields.code ? 'jarvis_playback_failed' : 'jarvis_playback_state', fields.failure_scope === 'cleanup' ? 'warn' : fields.code ? 'error' : 'info', {
                 ...fields, incident, command: 'tone', stage: 'playback',
               });
             },
@@ -322,7 +324,7 @@ export class JarvisBot {
           : playbackFailureFields(error);
         if (classification.code === 'UNKNOWN' && playbackSnapshot.code) classification = playbackSnapshot;
         this.logger.event('jarvis_command_failed', 'warn', {
-          ...playbackSnapshot, ...classification, incident, command: safeCommand, command_group: group, stage,
+          ...exceptionDetails(error), ...playbackSnapshot, ...classification, incident, command: safeCommand, command_group: group, stage,
           voice_status: playbackSnapshot.voice_status ?? this.voice.connection?.state.status,
           duration_ms: Math.max(0, Math.round(performance.now() - started)),
         });
@@ -565,6 +567,7 @@ export class JarvisBot {
           catch (error) {
             this.metrics.add('voice_turn_rejected');
             this.logger.event('jarvis_voice_turn_rejected', 'warn', {
+              incident: error instanceof WakeError || error instanceof SessionError ? error.incident ?? timing.incident : timing.incident,
               stage: 'voice_capture', input_kind: 'voice',
               rejection_reason: error instanceof SessionError ? error.reason ?? error.code
                 : error instanceof WakeError ? error.rateLimitSource === 'speaker_backoff' ? 'wake_speaker_backoff'
@@ -572,6 +575,8 @@ export class JarvisBot {
               ...(error instanceof WakeError && error.retryAfterMs !== undefined ? { retry_after_ms: error.retryAfterMs } : {}),
               voice_status: connection!.state.status, queue_depth: room.sessions.queuedCount,
               ...sanitizeError(error),
+              ...(error instanceof WakeError ? error.details : exceptionDetails(error)),
+              ...(error instanceof WakeError && error.code === 'wake_provider_failed' ? { code: 'WAKE_PROVIDER_FAILED', category: 'agent' } as const : {}),
             });
             if (this.room === room && consent.get(id)?.audio) {
               const notice = error instanceof SessionError && error.code === 'limit' ? this.limitNotice(error)
@@ -599,7 +604,9 @@ export class JarvisBot {
             `A fala atingiu o limite de captura (${this.config.JARVIS_MAX_AUDIO_SECONDS_PER_TURN} s) e foi descartada. Faça uma pergunta mais curta ou use /jarvis ask.`,
             this.feedbackDelivery(room, this.context(room, member)));
         }, onMetric: this.metrics.record,
-        onDiagnostic: (fields) => this.logger.event(fields.capture_rejection ? 'jarvis_voice_capture_rejected' : 'jarvis_voice_receive_error', 'warn', fields),
+        onDiagnostic: (fields) => this.logger.event(fields.capture_event ? 'jarvis_voice_capture_state'
+          : fields.capture_rejection ? 'jarvis_voice_capture_rejected' : 'jarvis_voice_receive_error', fields.capture_event ? 'info' : 'warn',
+        { ...room.playback.diagnosticState, queue_depth: room.sessions.queuedCount, ...fields }),
         onState: (state) => this.logger.event('jarvis_voice_receiver_state', 'info', {
           stage: 'receiver_setup', receiver_state: state, voice_status: connection!.state.status,
         }),

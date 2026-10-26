@@ -4,7 +4,7 @@ import {
   type VoiceWebSocket,
 } from "@discordjs/voice";
 import type { VoiceChannel } from "discord.js";
-import { DiagnosticError, sanitizeError, type JoinDiagnostics } from "../observability/diagnostics.js";
+import { DiagnosticError, exceptionDetails, sanitizeError, type JoinDiagnostics } from "../observability/diagnostics.js";
 
 const JOIN_TIMEOUT_MS = 20_000;
 const RECONNECT_TIMEOUT_MS = 25_000;
@@ -145,7 +145,7 @@ function observeConnection(
   };
   const onError = (error: Error): void => {
     const failure = classified(error);
-    observeSafely(() => diagnostics?.event("voice_connection_error", "error", sanitizeError(failure)));
+    observeSafely(() => diagnostics?.event("voice_connection_error", "error", { ...exceptionDetails(error), ...sanitizeError(failure) }));
     onFailure(failure);
   };
   const onState = (previous: VoiceConnectionState, next: VoiceConnectionState): void => {

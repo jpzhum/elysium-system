@@ -25,6 +25,26 @@ function setup() {
   return { queue, player, connection, metrics };
 }
 
+test('a player stop exception cannot leave the old done promise pending or block a new resource', async () => {
+  const { queue, player } = setup(); const diagnostics: DiagnosticFields[] = [];
+  const stream = queue.startStream('a', 16_000, false, { onDiagnostic: fields => { diagnostics.push(fields); } });
+  try {
+    await stream.write(Buffer.alloc(1280)); await tick();
+    vi.spyOn(player, 'stop').mockImplementationOnce(() => { throw new TypeError('PRIVATE stop failure'); });
+    assert.doesNotThrow(() => stream.cancel());
+    await assert.rejects(stream.done);
+    assert.ok(diagnostics.some(fields => fields.failure_scope === 'cleanup' && fields.cleanup_step === 'player_stop'
+      && fields.cleanup_ok === false && fields.cause_name === 'TypeError'));
+    const next = queue.startStream('a', 16_000, false); await next.write(Buffer.alloc(1280)); next.end(); await tick();
+    for (let frame = 0; queue.isPlaying && frame < 30; frame++) {
+      if (Reflect.get(player, 'checkPlayable').call(player)) Reflect.get(player, '_stepPrepare').call(player);
+      await tick();
+    }
+    await next.done; assert.equal(queue.isPlaying, false);
+    assert.doesNotMatch(JSON.stringify(diagnostics), /PRIVATE/);
+  } finally { queue.stop(); }
+});
+
 test('player start exception is preserved instead of becoming cancellation', async () => {
   const { queue, player, metrics } = setup();
   const events: DiagnosticFields[] = [];

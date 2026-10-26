@@ -83,6 +83,17 @@ export function sanitizeError(error: unknown): SafeError {
   return { category: 'unknown', code: 'UNKNOWN' };
 }
 
+/** Preserve technical causality without retaining a message, stack or cause object. */
+export function exceptionDetails(error: unknown): DiagnosticFields {
+  const name = diagnosticValue(error, 'name');
+  const cause_name = error instanceof RangeError ? 'RangeError' : error instanceof TypeError ? 'TypeError'
+    : name === 'DiagnosticError' ? 'DiagnosticError' : name === 'AgentError' ? 'AgentError'
+    : error instanceof Error ? 'Error' : undefined;
+  const outer = sanitizeError(error);
+  const cause = outer.code === 'UNKNOWN' ? sanitizeError(diagnosticValue(error, 'cause')) : outer;
+  return { ...(cause_name ? { cause_name } : {}), cause_code: cause.code };
+}
+
 /** One join attempt, one incident ID and one terminal failure across async boundaries. */
 export class JoinDiagnostics {
   readonly incident = newIncident();
@@ -129,7 +140,7 @@ export class JoinDiagnostics {
     if (!this.failed) {
       this.failed = sanitizeError(error);
       this.event('jarvis_command_failed', 'error', {
-        ...this.failed,
+        ...exceptionDetails(error), ...this.failed,
         stage_duration_ms: Math.min(86_400_000, Math.max(0, Math.round(performance.now() - this.stageStarted))),
       });
     }

@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { VoiceConnectionStatus, type VoiceConnection } from '@discordjs/voice';
 import { afterEach, expect, test, vi } from 'vitest';
-import { VoiceReceiver, type VoiceTurnTiming } from '../src/discord/voice-receiver.js';
+import { VoiceReceiver, type VoiceTurnTiming, type VoiceReceiverOptions } from '../src/discord/voice-receiver.js';
 
 const decode = vi.hoisted(() => vi.fn((packet: Buffer) => Buffer.from(packet)));
 const decoderSetup = vi.hoisted(() => vi.fn());
@@ -52,6 +52,30 @@ function packet(): Buffer {
   for (let offset = 0; offset < pcm.length; offset += 2) pcm.writeInt16LE(8_000, offset);
   return pcm;
 }
+
+test.each(['sync', 'async'])('a %s capture delivery exception retains its cause after PCM cleanup', async kind => {
+  const h = harness(); h.setPlaying(false); h.consent.add('owner');
+  const options = Reflect.get(h.receiver, 'options') as VoiceReceiverOptions;
+  const error = Object.assign(new TypeError('PRIVATE callback payload'), { code: 'ECONNRESET' });
+  const callback = vi.spyOn(options, 'onTurn').mockImplementation(() => {
+    if (kind === 'sync') throw error;
+    return Promise.reject(error);
+  });
+  h.speaking.emit('start', 'owner');
+  const stream = h.streams.get('owner')!;
+  for (let index = 0; index < 10; index++) stream.write(packet());
+  stream.end(); await new Promise<void>(resolve => setImmediate(resolve));
+  expect(h.diagnostic.mock.calls.map(([fields]) => fields)).toContainEqual(expect.objectContaining({
+    code: 'VOICE_TURN_CALLBACK_FAILED', cause_name: 'TypeError', cause_code: 'ECONNRESET',
+    cleanup_ok: true, capture_active: false,
+  }));
+  expect(stream.destroyed).toBe(true); expect(Reflect.get(h.receiver, 'turns').size).toBe(0);
+  expect(JSON.stringify(h.diagnostic.mock.calls)).not.toContain('PRIVATE');
+  callback.mockRestore(); h.speaking.emit('start', 'owner');
+  for (let index = 0; index < 10; index++) h.streams.get('owner')!.write(packet());
+  h.streams.get('owner')!.end(); await new Promise<void>(resolve => setImmediate(resolve));
+  expect(h.delivered).toHaveLength(1); h.receiver.stop();
+});
 
 test('only the backend-authorized owner with individual consent is captured during playback', () => {
   const h = harness();
@@ -263,12 +287,12 @@ test.each([
   const stream = h.streams.get('PRIVATE-speaker-id')!;
   stream.write(packet());
   stream.emit('error', new Error(message));
-  expect(h.diagnostic).toHaveBeenCalledOnce();
-  expect(h.diagnostic).toHaveBeenCalledWith({
+  expect(h.diagnostic.mock.calls.filter(([fields]) => fields.code)).toHaveLength(1);
+  expect(h.diagnostic).toHaveBeenCalledWith(expect.objectContaining({
     incident: expect.stringMatching(/^[0-9A-F]{8}$/), stage: 'voice_capture', receive_stage: 'stream',
     category, code, receiver_state: 'ready', voice_status: 'ready',
     capture_active: true, capture_has_pcm: true, capture_has_voice: true,
-  });
+  }));
   expect(JSON.stringify(h.diagnostic.mock.calls)).not.toContain('PRIVATE');
   expect(h.metric).toHaveBeenCalledWith('voice_receive_errors', 1);
   expect(h.metric).toHaveBeenCalledWith('voice_receive_stream_errors', 1);
