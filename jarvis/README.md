@@ -6,6 +6,11 @@ resposta audível de `/ask` em produção. A revisão V4 de turnos consecutivos,
 fila e voz experimental ainda exige validação real. Consulte
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) antes de operar.
 
+A [auditoria forense](docs/FORENSIC_RELIABILITY_AUDIT.md) registra causas
+reproduzidas, correções de cleanup/callbacks e a correlação da próxima falha.
+Os incidentes históricos e a experiência audível continuam sem aprovação de
+produção; os gates locais não substituem os testes reais do operador.
+
 Novas funcionalidades estão suspensas durante a
 [investigação de isolamento](docs/FAULT_ISOLATION.md). Texto e reprodução precisam
 passar repetidamente no Discord antes de retomar reconhecimento integrado.

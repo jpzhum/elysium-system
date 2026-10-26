@@ -1,4 +1,23 @@
-# Estado da implementação — 25/10/2026
+# Estado da implementação — 26/10/2026
+
+## Operação Zero Silent Failures — auditoria forense
+
+Correções locais `387c2ac` e `df5c743`: preservar causas em wrappers/callbacks,
+cercar erro de callback antigo, concluir cleanup mesmo após exceção e impedir
+Promise de playback pendente. Falhas REST do feedback agora preservam causa e
+incidente antes do fallback. Captura, wake, fila, player e liberação têm IDs
+correlacionados; erro secundário não apaga o primeiro diagnóstico sanitizado.
+
+Gate final: 774 testes aprovados em 40 arquivos, um gate DAVE real ignorado;
+typecheck, lint, build, benchmark e diff check aprovados. O ensaio único mantém
+os componentes por 20 tons, 20 perguntas escritas e 20 turnos integrados. Sem
+alteração de dependências, prazos, voz, agente remoto ou Elysium Python.
+
+**Produção não aprovada.** SHA/configuração Render e causas dos cinco incidentes
+históricos não puderam ser confirmados. Não houve push ou deploy. Inventário de
+erros, provas antes/depois, métricas, custos, coleta, rollback e roteiro A–H:
+[FORENSIC_RELIABILITY_AUDIT.md](docs/FORENSIC_RELIABILITY_AUDIT.md).
+Os resultados das seções anteriores abaixo são históricos.
 
 ## Investigação de isolamento — novas funcionalidades suspensas
 

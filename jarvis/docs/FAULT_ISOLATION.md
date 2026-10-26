@@ -1,5 +1,9 @@
 # Investigação por isolamento — 25/10/2026
 
+Nota de 26/10: a execução descrita abaixo é histórica. O ensaio foi ampliado
+para 20 tons/20 textos na [auditoria forense](FORENSIC_RELIABILITY_AUDIT.md),
+que documenta as correções posteriores e os gates atuais.
+
 Base examinada: `f8b8a5d` (inclui o P0 `7355ba9`). Node 24.19.0, npm 11.17.0,
 dependências já instaladas e fixadas no lockfile. Não houve desenvolvimento de
 funcionalidade, refatoração, troca de dependência, aumento de timeout, push ou
